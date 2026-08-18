@@ -38,7 +38,10 @@ def _instruction_after(opname: str, argval: object) -> int:
 def _instruction_after_strategy_close_call() -> int:
     instructions = list(dis.get_instructions(BackendQueue.close))
     for index, instruction in enumerate(instructions):
-        if instruction.opname in {"LOAD_METHOD", "LOAD_ATTR"} and instruction.argval == "close":
+        if (
+            instruction.opname in {"LOAD_METHOD", "LOAD_ATTR"}
+            and instruction.argval == "close"
+        ):
             if not any(
                 candidate.opname == "LOAD_ATTR" and candidate.argval == "_strategy"
                 for candidate in instructions[max(0, index - 3) : index]
@@ -810,7 +813,9 @@ def test_cleanup_error_is_terminal_for_direct_and_lossy_retry(
 
 
 @pytest.mark.timeout(10)
-def test_opcode_interruption_immediately_after_cleanup_return_is_indeterminate() -> None:
+def test_opcode_interruption_immediately_after_cleanup_return_is_indeterminate() -> (
+    None
+):
     storage = MagicMock()
     storage.retrieve.return_value = None
     strategy = MagicMock()

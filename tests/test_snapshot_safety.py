@@ -15,7 +15,8 @@ import boto3
 import pytest
 
 import scrapy_extension.backends.memcached as memcached_mod
-from scrapy_extension.backends.base import BackendType
+import scrapy_extension.queue.snapshot as snapshot_mod
+from scrapy_extension.backends.base import BackendType, _validate_key_name
 from scrapy_extension.backends.dynamodb import DynamoDBBackend
 from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
 from scrapy_extension.backends.memcached import MemcachedBackend
@@ -36,6 +37,8 @@ from scrapy_extension.settings import (
 
 _KEY = "queue:snapshot:v3:0::1:q"
 _MARKER = "snapshot_private_backend_marker"
+_SENSITIVE_VALID_KEY = f"queue:snapshot:{_MARKER}"
+_SENSITIVE_INVALID_KEY = f"{_MARKER}/invalid"
 
 
 class _ExceptionContextProbe(logging.Handler):
@@ -291,6 +294,152 @@ def test_restore_control_error_clears_state_without_mutating_exception() -> None
     assert interruption.args == ("strategy restore interrupted",)
     assert interruption.metadata == {"sentinel": sentinel}  # type: ignore[attr-defined]
     _assert_package_frame_payloads_cleared(interruption)
+
+
+@pytest.mark.parametrize("operation", ["commit", "read"])
+def test_invalid_sensitive_logical_key_has_static_terminal_error(
+    operation: str,
+) -> None:
+    repository = SnapshotRepository(MagicMock(), max_bytes=64, chunk_bytes=4)
+
+    with pytest.raises(SnapshotRepositoryError) as exc_info:
+        if operation == "commit":
+            repository.commit(_SENSITIVE_INVALID_KEY, b"state")
+        else:
+            repository.read(_SENSITIVE_INVALID_KEY)
+
+    _assert_public_error_graph_isolated(exc_info.value)
+    _assert_package_frame_payloads_cleared(exc_info.value)
+
+
+def test_shared_key_validation_does_not_echo_or_retain_invalid_sensitive_key() -> None:
+    with pytest.raises(ValueError) as exc_info:
+        _validate_key_name(_SENSITIVE_INVALID_KEY, "snapshot logical key")
+
+    assert _MARKER not in str(exc_info.value)
+    assert exc_info.value.__context__ is None
+    _assert_package_frame_payloads_cleared(exc_info.value)
+
+
+@pytest.mark.parametrize("failure_point", ["store", "retrieve", "parser", "checksum"])
+def test_valid_sensitive_repository_key_is_cleared_before_control_propagation(
+    failure_point: str, mocker: Any
+) -> None:
+    interruption = _SnapshotControlFlow(f"{failure_point} interrupted")
+    storage = MagicMock()
+    storage.retrieve.return_value = None
+    repository = SnapshotRepository(storage, max_bytes=64, chunk_bytes=4)
+
+    if failure_point == "store":
+        storage.store.side_effect = interruption
+        invoke = lambda: repository.commit(_SENSITIVE_VALID_KEY, None)
+    elif failure_point == "retrieve":
+        storage.retrieve.side_effect = interruption
+        invoke = lambda: repository.read(_SENSITIVE_VALID_KEY)
+    elif failure_point == "parser":
+        storage.retrieve.return_value = b"manifest"
+        mocker.patch.object(snapshot_mod.json, "loads", side_effect=interruption)
+        invoke = lambda: repository.read(_SENSITIVE_VALID_KEY)
+    else:
+        repository.commit(_SENSITIVE_VALID_KEY, None)
+        manifest = storage.store.call_args.args[1]
+        storage.reset_mock()
+        storage.retrieve.return_value = manifest
+        mocker.patch.object(snapshot_mod.hashlib, "sha256", side_effect=interruption)
+        invoke = lambda: repository.read(_SENSITIVE_VALID_KEY)
+
+    with pytest.raises(_SnapshotControlFlow) as exc_info:
+        invoke()
+
+    assert exc_info.value is interruption
+    _assert_package_frame_payloads_cleared(interruption)
+
+
+@pytest.mark.parametrize("failure_point", ["store", "retrieve", "parser", "checksum"])
+def test_valid_sensitive_repository_key_has_static_ordinary_failure(
+    failure_point: str, mocker: Any
+) -> None:
+    storage = MagicMock()
+    storage.retrieve.return_value = None
+    repository = SnapshotRepository(storage, max_bytes=64, chunk_bytes=4)
+
+    if failure_point == "store":
+        storage.store.side_effect = RuntimeError(_MARKER)
+        invoke = lambda: repository.commit(_SENSITIVE_VALID_KEY, None)
+    elif failure_point == "retrieve":
+        storage.retrieve.side_effect = RuntimeError(_MARKER)
+        invoke = lambda: repository.read(_SENSITIVE_VALID_KEY)
+    elif failure_point == "parser":
+        storage.retrieve.return_value = b"manifest"
+        mocker.patch.object(
+            snapshot_mod.json, "loads", side_effect=RuntimeError(_MARKER)
+        )
+        invoke = lambda: repository.read(_SENSITIVE_VALID_KEY)
+    else:
+        repository.commit(_SENSITIVE_VALID_KEY, None)
+        manifest = storage.store.call_args.args[1]
+        storage.reset_mock()
+        storage.retrieve.return_value = manifest
+        mocker.patch.object(
+            snapshot_mod.hashlib, "sha256", side_effect=RuntimeError(_MARKER)
+        )
+        invoke = lambda: repository.read(_SENSITIVE_VALID_KEY)
+
+    with pytest.raises(SnapshotRepositoryError) as exc_info:
+        invoke()
+
+    _assert_public_error_graph_isolated(exc_info.value)
+    _assert_package_frame_payloads_cleared(exc_info.value)
+
+
+def test_sensitive_legacy_delete_key_is_cleared_before_control_propagation() -> None:
+    interruption = _SnapshotControlFlow("delete interrupted")
+    storage = MagicMock()
+    storage.retrieve.return_value = None
+    storage.delete.side_effect = interruption
+    manager = MagicMock()
+    manager.get_storage_backend.return_value = storage
+    manager.get_queue_backend.return_value = MagicMock()
+    strategy = MagicMock()
+    strategy.snapshot.return_value = b"state"
+    queue = BackendQueue(
+        manager,
+        _MARKER,
+        queue_strategy=strategy,
+        snapshot_max_bytes=64,
+        snapshot_chunk_bytes=4,
+    )
+
+    with pytest.raises(_SnapshotControlFlow) as exc_info:
+        queue.close()
+
+    assert exc_info.value is interruption
+    _assert_package_frame_payloads_cleared(interruption)
+    strategy.close.assert_not_called()
+
+
+def test_sensitive_legacy_delete_ordinary_failure_has_static_log_context() -> None:
+    storage = MagicMock()
+    storage.retrieve.return_value = None
+    storage.delete.side_effect = RuntimeError(_MARKER)
+    manager = MagicMock()
+    manager.get_storage_backend.return_value = storage
+    manager.get_queue_backend.return_value = MagicMock()
+    strategy = MagicMock()
+    strategy.snapshot.return_value = b"state"
+    queue = BackendQueue(
+        manager,
+        _MARKER,
+        queue_strategy=strategy,
+        snapshot_max_bytes=64,
+        snapshot_chunk_bytes=4,
+    )
+
+    with _queue_log_probe() as probe:
+        queue.close()
+
+    _assert_callback_isolated(probe)
+    strategy.close.assert_called_once_with()
 
 
 def test_commit_queue_error_and_log_have_no_backend_exception_graph() -> None:

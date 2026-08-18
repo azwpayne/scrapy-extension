@@ -1341,9 +1341,7 @@ class BackendQueue:
                 )
             raise QueueError("Queue close failed; checkpoint can be retried.")
 
-    def _publish_strategy_cleanup_outcome(
-        self, outcome: str
-    ) -> BaseException | None:
+    def _publish_strategy_cleanup_outcome(self, outcome: str) -> BaseException | None:
         """Replace ``started`` with one terminal outcome despite interruption."""
         interrupted: BaseException | None = None
         while self._strategy_cleanup_state == _STRATEGY_CLEANUP_STARTED:
@@ -1373,8 +1371,7 @@ class BackendQueue:
                 with self._operation_gate:
                     owns_attempt = self._close_owner_token is owner_token
                     cleanup_started = (
-                        self._strategy_cleanup_state
-                        != _STRATEGY_CLEANUP_NOT_STARTED
+                        self._strategy_cleanup_state != _STRATEGY_CLEANUP_NOT_STARTED
                     )
                     if owns_attempt and (succeeded or cleanup_started):
                         # Cleanup cannot safely be replayed once invocation may have
@@ -1474,10 +1471,8 @@ class BackendQueue:
             # cleanup suite begins. Repair that gap to an explicit terminal state
             # before publishing the close attempt.
             if self._strategy_cleanup_state == _STRATEGY_CLEANUP_STARTED:
-                cleanup_publication_failure = (
-                    self._publish_strategy_cleanup_outcome(
-                        _STRATEGY_CLEANUP_INDETERMINATE
-                    )
+                cleanup_publication_failure = self._publish_strategy_cleanup_outcome(
+                    _STRATEGY_CLEANUP_INDETERMINATE
                 )
             # Once this call records ownership, every exit path must publish a
             # terminal result. In particular, tracing/profiling callbacks can
@@ -1515,19 +1510,29 @@ class BackendQueue:
         worker identity. Otherwise v3 length-prefixes both logical components so
         valid ``:`` characters cannot make distinct spider/queue pairs collide.
         """
-        spider_name = getattr(self._spider, "name", None)
-        if self._snapshot_owner is not None:
-            owner = self._snapshot_owner
+        snapshot_key = ""
+        spider_component = ""
+        owner = ""
+        try:
+            spider_name = getattr(self._spider, "name", None)
+            if self._snapshot_owner is not None:
+                owner = self._snapshot_owner
+                spider_component = str(spider_name) if spider_name else ""
+                snapshot_key = (
+                    f"{self._SNAPSHOT_KEY_PREFIX}v2:{len(owner)}:{owner}:"
+                    f"{len(spider_component)}:{spider_component}:{self.queue_name}"
+                )
+                return snapshot_key
             spider_component = str(spider_name) if spider_name else ""
-            return (
-                f"{self._SNAPSHOT_KEY_PREFIX}v2:{len(owner)}:{owner}:"
-                f"{len(spider_component)}:{spider_component}:{self.queue_name}"
+            snapshot_key = (
+                f"{self._SNAPSHOT_KEY_PREFIX}v3:{len(spider_component)}:"
+                f"{spider_component}:{len(self.queue_name)}:{self.queue_name}"
             )
-        spider_component = str(spider_name) if spider_name else ""
-        return (
-            f"{self._SNAPSHOT_KEY_PREFIX}v3:{len(spider_component)}:{spider_component}:"
-            f"{len(self.queue_name)}:{self.queue_name}"
-        )
+            return snapshot_key
+        finally:
+            snapshot_key = ""
+            spider_component = ""
+            owner = ""
 
     def _legacy_snapshot_key(self) -> str | None:
         """Return the only safely attributable pre-v3 key for compatibility.
@@ -1538,17 +1543,33 @@ class BackendQueue:
         unique only when it contains no ``:``. Leave all other legacy values
         untouched rather than loading or deleting another queue's checkpoint.
         """
-        if self._snapshot_owner is not None:
-            return None
-        spider_name = getattr(self._spider, "name", None)
-        if spider_name or ":" in self.queue_name:
-            return None
-        return f"{self._SNAPSHOT_KEY_PREFIX}{self.queue_name}"
+        legacy_key = ""
+        try:
+            if self._snapshot_owner is not None:
+                return None
+            spider_name = getattr(self._spider, "name", None)
+            if spider_name or ":" in self.queue_name:
+                return None
+            legacy_key = f"{self._SNAPSHOT_KEY_PREFIX}{self.queue_name}"
+            return legacy_key
+        finally:
+            legacy_key = ""
 
     def _empty_snapshot_tombstone_key(self) -> str:
         """Build the private marker key for an empty legacy-migration transition."""
-        snapshot_identity = self._snapshot_key().removeprefix(self._SNAPSHOT_KEY_PREFIX)
-        return f"{self._SNAPSHOT_TOMBSTONE_KEY_PREFIX}{snapshot_identity}"
+        snapshot_key = ""
+        snapshot_identity = ""
+        tombstone_key = ""
+        try:
+            snapshot_key = self._snapshot_key()
+            snapshot_identity = snapshot_key.removeprefix(self._SNAPSHOT_KEY_PREFIX)
+            snapshot_key = ""
+            tombstone_key = f"{self._SNAPSHOT_TOMBSTONE_KEY_PREFIX}{snapshot_identity}"
+            return tombstone_key
+        finally:
+            snapshot_key = ""
+            snapshot_identity = ""
+            tombstone_key = ""
 
     def _snapshot_storage(self, *, strict: bool = False) -> Any | None:
         """Resolve snapshot storage, optionally surfacing retryable failures."""
@@ -1594,6 +1615,9 @@ class BackendQueue:
     def _persist_snapshot(self) -> None:
         """Commit a chunked strategy snapshot or raise a redacted retryable error."""
         state: bytes | None = None
+        snapshot_key = ""
+        legacy_key: str | None = None
+        tombstone_key = ""
         try:
             snapshot_failed = False
             try:
@@ -1616,7 +1640,9 @@ class BackendQueue:
             repository = self._snapshot_repository(storage)
             commit_failed = False
             try:
-                repository.commit(self._snapshot_key(), state)
+                snapshot_key = self._snapshot_key()
+                repository.commit(snapshot_key, state)
+                snapshot_key = ""
             except SnapshotRepositoryError:
                 commit_failed = True
             if commit_failed:
@@ -1634,7 +1660,10 @@ class BackendQueue:
             cleanup_failed = False
             try:
                 storage.delete(legacy_key)
-                storage.delete(self._empty_snapshot_tombstone_key())
+                legacy_key = None
+                tombstone_key = self._empty_snapshot_tombstone_key()
+                storage.delete(tombstone_key)
+                tombstone_key = ""
             except Exception:
                 cleanup_failed = True
             if cleanup_failed:
@@ -1644,6 +1673,9 @@ class BackendQueue:
                     pass
         finally:
             state = None
+            snapshot_key = ""
+            legacy_key = None
+            tombstone_key = ""
 
     def _restore_snapshot(self) -> None:
         """Restore a validated v6/v5/v4 manifest or compatible raw value."""
@@ -1654,10 +1686,15 @@ class BackendQueue:
         result = None
         tombstone: object = None
         state: bytes | None = None
+        snapshot_key = ""
+        legacy_key: str | None = None
+        tombstone_key = ""
         try:
             read_failed = False
             try:
-                result = repository.read(self._snapshot_key())
+                snapshot_key = self._snapshot_key()
+                result = repository.read(snapshot_key)
+                snapshot_key = ""
             except SnapshotRepositoryError:
                 read_failed = True
             if read_failed:
@@ -1673,9 +1710,9 @@ class BackendQueue:
                 if legacy_key is not None:
                     tombstone_failed = False
                     try:
-                        tombstone = storage.retrieve(
-                            self._empty_snapshot_tombstone_key()
-                        )
+                        tombstone_key = self._empty_snapshot_tombstone_key()
+                        tombstone = storage.retrieve(tombstone_key)
+                        tombstone_key = ""
                     except Exception:
                         tombstone_failed = True
                     if tombstone_failed:
@@ -1721,3 +1758,6 @@ class BackendQueue:
             result = None
             state = None
             tombstone = None
+            snapshot_key = ""
+            legacy_key = None
+            tombstone_key = ""

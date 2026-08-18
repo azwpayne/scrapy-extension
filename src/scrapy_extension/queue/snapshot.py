@@ -93,54 +93,82 @@ class SnapshotRepository:
         self._chunk_bytes = chunk_bytes
 
     def _validate_logical_key(self, key: str) -> None:
+        invalid = False
         try:
-            _validate_key_name(key, "snapshot logical key")
-        except (TypeError, ValueError):
-            raise SnapshotRepositoryError("Snapshot logical key is invalid.") from None
-        if key.startswith(_CHUNK_KEY_PREFIX):
-            raise SnapshotRepositoryError(
-                "Snapshot logical key uses the reserved chunk namespace."
-            )
-
-        raw_backend_type: object = getattr(self._storage, "backend_type", None)
-        backend_type: BackendType | None = None
-        if isinstance(raw_backend_type, BackendType):
-            backend_type = raw_backend_type
-        elif isinstance(raw_backend_type, str):
             try:
-                backend_type = BackendType(raw_backend_type)
-            except ValueError:
-                pass
-        limit = (
-            None
-            if backend_type is None
-            else _BACKEND_LOGICAL_KEY_LIMITS.get(backend_type)
-        )
-        if limit is not None and len(key.encode("utf-8")) > limit:
-            raise SnapshotRepositoryError(
-                "Snapshot logical key exceeds the storage backend limit."
-            )
+                _validate_key_name(key, "snapshot logical key")
+            except (TypeError, ValueError):
+                invalid = True
+            if not invalid:
+                if key.startswith(_CHUNK_KEY_PREFIX):
+                    raise SnapshotRepositoryError(
+                        "Snapshot logical key uses the reserved chunk namespace."
+                    )
+
+                raw_backend_type: object = getattr(self._storage, "backend_type", None)
+                backend_type: BackendType | None = None
+                if isinstance(raw_backend_type, BackendType):
+                    backend_type = raw_backend_type
+                elif isinstance(raw_backend_type, str):
+                    try:
+                        backend_type = BackendType(raw_backend_type)
+                    except ValueError:
+                        pass
+                limit = (
+                    None
+                    if backend_type is None
+                    else _BACKEND_LOGICAL_KEY_LIMITS.get(backend_type)
+                )
+                if limit is not None and len(key.encode("utf-8")) > limit:
+                    raise SnapshotRepositoryError(
+                        "Snapshot logical key exceeds the storage backend limit."
+                    )
+        finally:
+            key = ""
+        if invalid:
+            # Raise only after the validation ValueError/TypeError and its private
+            # frame have unwound, so the public error has no sensitive context.
+            raise SnapshotRepositoryError("Snapshot logical key is invalid.") from None
 
     @staticmethod
     def _chunk_key(key: str, generation: str, index: int) -> str:
-        identity = json.dumps(
-            [key, generation, index],
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        return f"{_CHUNK_KEY_PREFIX}{hashlib.sha256(identity).hexdigest()}"
+        identity = b""
+        chunk_key = ""
+        try:
+            identity = json.dumps(
+                [key, generation, index],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            chunk_key = f"{_CHUNK_KEY_PREFIX}{hashlib.sha256(identity).hexdigest()}"
+            return chunk_key
+        finally:
+            key = ""
+            generation = ""
+            identity = b""
+            chunk_key = ""
 
     @staticmethod
     def _v4_chunk_key(key: str, generation: str, index: int) -> str:
         """Return the physical chunk key used by the historical v4 format."""
-        return f"{key}:generation:{generation}:chunk:{index}"
+        chunk_key = ""
+        try:
+            chunk_key = f"{key}:generation:{generation}:chunk:{index}"
+            return chunk_key
+        finally:
+            key = ""
+            generation = ""
+            chunk_key = ""
 
     def _retrieve(self, key: str) -> tuple[Any, bool]:
         """Return backend data or a non-sensitive ordinary-failure status."""
         try:
-            return self._storage.retrieve(key), False
-        except Exception:
-            return None, True
+            try:
+                return self._storage.retrieve(key), False
+            except Exception:
+                return None, True
+        finally:
+            key = ""
 
     def _store(self, key: str, value: bytes) -> bool:
         """Store backend data and terminally collapse ordinary failures."""
@@ -151,6 +179,7 @@ class SnapshotRepository:
                 return False
             return True
         finally:
+            key = ""
             value = b""
 
     @staticmethod
@@ -334,6 +363,7 @@ class SnapshotRepository:
         chunk: object = None
         copied_chunk: bytes | None = None
         state: bytes | None = None
+        chunk_key = ""
         try:
             value, retrieve_failed = self._retrieve(key)
             if retrieve_failed:
@@ -418,6 +448,8 @@ class SnapshotRepository:
             chunk = None
             copied_chunk = None
             state = None
+            key = ""
+            chunk_key = ""
             if assembled is not None:
                 assembled.clear()
             assembled = None
@@ -433,6 +465,7 @@ class SnapshotRepository:
             assert result is not None
             return result
         finally:
+            key = ""
             result = None
 
     def _commit_terminal(self, key: str, state: bytes | None) -> str | None:
@@ -442,6 +475,8 @@ class SnapshotRepository:
         chunk = b""
         manifest: _Manifest | None = None
         manifest_bytes = b""
+        generation = ""
+        chunk_key = ""
         state_present = state is not None
         try:
             buffer_error: str | None = None
@@ -468,8 +503,10 @@ class SnapshotRepository:
             for index in range(chunks):
                 start = index * self._chunk_bytes
                 chunk = payload[start : start + self._chunk_bytes]
-                if not self._store(self._chunk_key(key, generation, index), chunk):
+                chunk_key = self._chunk_key(key, generation, index)
+                if not self._store(chunk_key, chunk):
                     return "Snapshot chunk write failed."
+                chunk_key = ""
                 chunk = b""
             manifest = _Manifest(
                 version=_MANIFEST_VERSION,
@@ -489,12 +526,15 @@ class SnapshotRepository:
         except Exception:
             return "Snapshot construction failed."
         finally:
+            key = ""
             state = None
             payload = b""
             copied_payload = None
             chunk = b""
             manifest = None
             manifest_bytes = b""
+            generation = ""
+            chunk_key = ""
 
     def commit(self, key: str, state: bytes | None) -> None:
         """Commit ``state`` by writing all generation chunks before its manifest."""
@@ -503,6 +543,7 @@ class SnapshotRepository:
             self._validate_logical_key(key)
             failure_message = self._commit_terminal(key, state)
         finally:
+            key = ""
             state = None
         if failure_message is not None:
             raise SnapshotRepositoryError(failure_message) from None

@@ -415,19 +415,18 @@ KEY_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9._:-]+$")
 
 
 def _validate_key_name(name: str, field_name: str = "name") -> None:
-    """Validate key/queue/set/index name to prevent injection.
-
-    Args:
-        name: The name to validate.
-        field_name: Field name for error messages.
-
-    Raises:
-        ValueError: If name contains invalid characters.
-    """
-    if not name or not KEY_NAME_PATTERN.match(name):
+    """Validate key/queue/set/index names without echoing caller input."""
+    invalid = False
+    try:
+        invalid = not name or KEY_NAME_PATTERN.match(name) is None
+    finally:
+        # Validation failures are frequently translated at a public boundary.
+        # Do not retain the supplied key in this private traceback frame.
+        name = ""
+    if invalid:
         raise ValueError(
-            f"Invalid {field_name}: {name!r}. "
-            f"Only alphanumeric, dots, underscores, hyphens, and colons allowed."
+            f"Invalid {field_name}. Only alphanumeric, dots, underscores, "
+            "hyphens, and colons allowed."
         )
 
 
