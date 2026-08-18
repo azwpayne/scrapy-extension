@@ -101,7 +101,7 @@ test = [
     "pytest-socket",
     "mypy",
     "bandit[toml]",
-    "hypothesis>=6.165.2,<7",
+    "hypothesis>=6.165.9,<7",
     # Backend deps — tests import backend modules directly, which triggers
     # the module-level lazy-import guard. All backends must be installable
     # for the test suite to collect.
