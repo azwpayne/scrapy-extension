@@ -18,6 +18,27 @@ from scrapy_extension.settings import (
     RedisSettings,
 )
 
+_TLS_LOOPBACK_URLS = (
+    "https://localhost:9200",
+    "https://localhost.:9200",
+    "https://127.0.0.1:9200",
+    "https://[::1]:9200",
+)
+_TLS_REMOTE_HOSTS = (
+    "es.example",
+    "attacker.localhost",
+    "localhost..",
+    "127.1",
+    "0177.0.0.1",
+    "2130706433",
+    "[::ffff:127.0.0.1]",
+    "0.0.0.0",
+    "[::]",
+    "[::1%25lo0]",
+    "192.0.2.1",
+    "[2001:db8::1]",
+)
+
 
 @pytest.mark.parametrize(
     ("factory", "kwargs", "setting_name"),
@@ -97,6 +118,13 @@ def test_verified_remote_tls_settings_are_accepted(
     factory(**kwargs)  # type: ignore[call-arg]
 
 
+@pytest.mark.parametrize("url", _TLS_LOOPBACK_URLS)
+def test_exact_loopback_tls_verification_opt_out_remains_available(url: str) -> None:
+    settings = ElasticSearchSettings(hosts=[url], verify_certs=False)
+
+    assert settings.verify_certs is False
+
+
 @pytest.mark.parametrize(
     ("kwargs", "setting_name"),
     [
@@ -127,6 +155,7 @@ def _assert_marker_absent(error: BaseException, marker: str) -> None:
     assert marker not in str(error)
     assert marker not in repr(error.__dict__)
     assert marker not in rendered
+    assert getattr(error, "setting_value", None) is None
     assert error.__cause__ is None
     assert error.__context__ is None
 
@@ -146,19 +175,22 @@ def test_redis_mutated_remote_tls_opt_out_rejects_before_sdk(mocker) -> None:
     _assert_marker_absent(exc_info.value, marker)
 
 
-def test_elasticsearch_mutated_remote_tls_opt_out_rejects_before_sdk(mocker) -> None:
-    marker = "es-remote-tls-mutation-marker"
+@pytest.mark.parametrize("host", _TLS_REMOTE_HOSTS)
+def test_elasticsearch_mutated_remote_tls_opt_out_rejects_before_sdk(
+    host: str, mocker
+) -> None:
     settings = ElasticSearchSettings(
         hosts=["https://localhost:9200"], verify_certs=False
     )
-    settings.hosts = [f"https://{marker}:9200"]
+    settings.hosts = [f"https://{host}:9200"]
     sdk = mocker.patch("scrapy_extension.backends.elasticsearch.Elasticsearch")
 
     with pytest.raises(ConfigurationError) as exc_info:
         ElasticSearchBackend(settings).connect()
 
+    assert exc_info.value.setting_name == "verify_certs"
     sdk.assert_not_called()
-    _assert_marker_absent(exc_info.value, marker)
+    _assert_marker_absent(exc_info.value, host)
 
 
 def test_pulsar_mutated_remote_tls_opt_out_rejects_before_sdk(mocker) -> None:

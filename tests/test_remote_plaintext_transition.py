@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import traceback
 from typing import Any
 
 import pytest
 
+from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
 from scrapy_extension.exceptions import ConfigurationError
 from scrapy_extension.settings import (
     ElasticSearchSettings,
@@ -14,6 +16,54 @@ from scrapy_extension.settings import (
     PulsarSettings,
     RedisSettings,
     RocketMQSettings,
+)
+from scrapy_extension.settings._transport_security import is_loopback_host
+
+_EXACT_LOOPBACK_HOSTS = (
+    "localhost",
+    "LOCALHOST.",
+    "127.0.0.1",
+    "127.255.255.254",
+    "::1",
+    "0:0:0:0:0:0:0:1",
+    "[::1]",
+    "[0:0:0:0:0:0:0:1]",
+)
+_NON_LOOPBACK_HOSTS = (
+    "attacker.localhost",
+    "localhost.example",
+    "localhost..",
+    ".localhost",
+    "127.1",
+    "0177.0.0.1",
+    "2130706433",
+    "::ffff:127.0.0.1",
+    "[::ffff:127.0.0.1]",
+    "0.0.0.0",
+    "::",
+    "[::]",
+    "127.0.0.1:9200",
+    "[::1]:9200",
+    "::1%lo0",
+    "[::1%25lo0]",
+    "192.0.2.1",
+    "2001:db8::1",
+    "[2001:db8::1]",
+    "not-an-ip[",
+    "",
+)
+_REMOTE_URL_HOSTS = (
+    "attacker.localhost",
+    "localhost..",
+    "127.1",
+    "0177.0.0.1",
+    "2130706433",
+    "[::ffff:127.0.0.1]",
+    "0.0.0.0",
+    "[::]",
+    "[::1%25lo0]",
+    "192.0.2.1",
+    "[2001:db8::1]",
 )
 
 _REMOTE_PLAINTEXT_CASES: list[tuple[str, type[Any], dict[str, object], str]] = [
@@ -54,6 +104,66 @@ _REMOTE_PLAINTEXT_CASES: list[tuple[str, type[Any], dict[str, object], str]] = [
         "SCRAPY_ROCKETMQ_ALLOW_REMOTE_PLAINTEXT",
     ),
 ]
+
+
+def _assert_static_configuration_error(
+    error: ConfigurationError, untrusted_host: str
+) -> None:
+    """Assert policy failures retain no dynamic input or predecessor graph."""
+    assert untrusted_host not in str(error)
+    assert untrusted_host not in repr(error.__dict__)
+    assert untrusted_host not in "".join(traceback.format_exception(error))
+    assert error.setting_value is None
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+@pytest.mark.parametrize("host", _EXACT_LOOPBACK_HOSTS)
+def test_shared_loopback_classifier_accepts_only_exact_literals(host: str) -> None:
+    assert is_loopback_host(host) is True
+
+
+@pytest.mark.parametrize("host", _NON_LOOPBACK_HOSTS)
+def test_shared_loopback_classifier_rejects_nonliteral_and_ambiguous_hosts(
+    host: str,
+) -> None:
+    assert is_loopback_host(host) is False
+
+
+@pytest.mark.parametrize("host", [None, 1, object()])
+def test_shared_loopback_classifier_rejects_non_strings(host: object) -> None:
+    assert is_loopback_host(host) is False
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://localhost:9200",
+        "http://localhost.:9200",
+        "http://127.0.0.1:9200",
+        "http://[::1]:9200",
+    ],
+)
+def test_exact_loopback_plaintext_urls_remain_available(url: str) -> None:
+    settings = ElasticSearchSettings(hosts=[url])
+
+    assert settings.allow_remote_plaintext is False
+
+
+@pytest.mark.parametrize("host", _REMOTE_URL_HOSTS)
+def test_ambiguous_plaintext_host_rejects_before_sdk_with_static_error(
+    host: str, mocker
+) -> None:
+    settings = ElasticSearchSettings()
+    settings.hosts = [f"http://{host}:9200"]
+    sdk = mocker.patch("scrapy_extension.backends.elasticsearch.Elasticsearch")
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        ElasticSearchBackend(settings).connect()
+
+    assert exc_info.value.setting_name == "allow_remote_plaintext"
+    sdk.assert_not_called()
+    _assert_static_configuration_error(exc_info.value, host)
 
 
 @pytest.mark.parametrize(

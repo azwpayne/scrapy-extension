@@ -12,18 +12,35 @@ def is_loopback_host(host: object) -> bool:
 
     This deliberately performs no DNS lookup. ``*.localhost`` remains
     untrusted because its resolution policy is externally controlled; only the
-    exact hostname and literal loopback addresses receive the local-development
-    exception.
+    exact hostname (with at most one trailing dot) and strict literal loopback
+    addresses receive the local-development exception.
     """
     if not isinstance(host, str):
         return False
-    normalized = host.lower().rstrip(".")
-    if normalized == "localhost":
+
+    candidate = host.lower()
+    if candidate in {"localhost", "localhost."}:
         return True
+    if "%" in candidate:
+        # ``ip_address`` accepts IPv6 scope IDs on supported Python versions,
+        # but a scoped address is not the host-only literal this policy expects.
+        return False
+
+    bracketed = candidate.startswith("[") or candidate.endswith("]")
+    if bracketed:
+        if not (candidate.startswith("[") and candidate.endswith("]")):
+            return False
+        candidate = candidate[1:-1]
+
     try:
-        return ip_address(normalized).is_loopback
+        address = ip_address(candidate)
     except ValueError:
         return False
+    if bracketed and address.version != 6:
+        return False
+    if address.version == 6 and address.ipv4_mapped is not None:
+        return False
+    return address.is_loopback and not address.is_unspecified
 
 
 def normalize_allow_remote_plaintext(value: object) -> bool:
