@@ -13,6 +13,8 @@ thresholds are asserted; reported values are baseline evidence only.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import pytest
 from scrapy import Spider
 from scrapy.http import Request
@@ -22,6 +24,7 @@ from scrapy_extension.queue.queue import BackendQueue
 
 _QUEUE_NAME = "bench-push-pop"
 _BENCHMARK_ROUNDS = 5
+_BENCHMARK_SOURCE = "bench"
 
 
 class _InMemoryQueueBackend(QueueBackend):
@@ -92,10 +95,20 @@ def _make_request(idx: int = 0) -> Request:
         method="GET",
         headers={"Accept": "text/html", "User-Agent": "scrapy-extension-bench/1.0"},
         body=f"item={idx}".encode(),
-        meta={"depth": 1, "source": "bench", "retry_times": 0},
+        meta={"depth": 1, "source": _BENCHMARK_SOURCE, "retry_times": 0},
         priority=idx,
         dont_filter=False,
     )
+
+
+def _prepare_push_round(
+    backend: _InMemoryQueueBackend,
+    requests: Sequence[Request],
+) -> None:
+    """Clear prior output and restore mutable routing input outside the caliper."""
+    backend.clear_queue(_QUEUE_NAME)
+    for request in requests:
+        request.meta["source"] = _BENCHMARK_SOURCE
 
 
 @pytest.mark.benchmark
@@ -109,7 +122,7 @@ def test_push_single(
     benchmark.pedantic(
         queue.push,
         args=(request,),
-        setup=lambda: backend.clear_queue(_QUEUE_NAME),
+        setup=lambda: _prepare_push_round(backend, (request,)),
         rounds=_BENCHMARK_ROUNDS,
     )
 
@@ -125,7 +138,7 @@ def test_pop_single(
     request = _make_request()
 
     def prepare_pop() -> None:
-        backend.clear_queue(_QUEUE_NAME)
+        _prepare_push_round(backend, (request,))
         queue.push(request)
 
     result = benchmark.pedantic(
@@ -153,11 +166,32 @@ def test_push_batch_of_10_latency(
 
     benchmark.pedantic(
         push_ten,
-        setup=lambda: backend.clear_queue(_QUEUE_NAME),
+        setup=lambda: _prepare_push_round(backend, requests),
         rounds=_BENCHMARK_ROUNDS,
     )
 
     assert backend.queue_len(_QUEUE_NAME) == 10
+
+
+def test_push_round_setup_restores_source_for_every_batch_member(
+    bench_queue: tuple[BackendQueue, _InMemoryQueueBackend],
+) -> None:
+    """Prove all five push rounds start with equal source-routing state."""
+    queue, backend = bench_queue
+    requests = [_make_request(i) for i in range(10)]
+    source_state_by_round: list[tuple[object, ...]] = []
+
+    for _ in range(_BENCHMARK_ROUNDS):
+        _prepare_push_round(backend, requests)
+        source_state_by_round.append(
+            tuple(request.meta.get("source") for request in requests)
+        )
+        for request in requests:
+            queue.push(request)
+
+    expected_state = (_BENCHMARK_SOURCE,) * len(requests)
+    assert source_state_by_round == [expected_state] * _BENCHMARK_ROUNDS
+    assert all("source" not in request.meta for request in requests)
 
 
 def test_push_pop_roundtrip_is_lossless(
