@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import threading
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
@@ -402,7 +402,76 @@ def test_scheduler_retains_queue_and_managers_until_checkpoint_retry_succeeds() 
 
     scheduler.close("retry")
 
+    assert queue.close.call_count == 2
     assert scheduler._queue is None
+    queue_manager.close.assert_called_once_with()
+    snapshot_manager.close.assert_called_once_with()
+
+
+def test_scheduler_retries_real_backend_queue_only_after_checkpoint_failure() -> None:
+    storage = MagicMock(name="snapshot-storage")
+    storage.retrieve.return_value = None
+    storage.store.side_effect = RuntimeError("checkpoint unavailable")
+    strategy = MagicMock(name="strategy")
+    strategy.snapshot.return_value = b"state"
+    queue = _queue_with_storage(strategy, storage)
+    queue_manager = MagicMock(name="queue-manager")
+    snapshot_manager = MagicMock(name="snapshot-manager")
+    scheduler = BackendScheduler(
+        queue_manager,
+        snapshot_connection_manager=snapshot_manager,
+        owns_snapshot_connection_manager=True,
+    )
+    scheduler._queue = queue
+
+    with pytest.raises(QueueError, match="snapshot commit"):
+        scheduler.close("checkpoint-failed")
+
+    assert queue._checkpoint_complete is False
+    assert scheduler._queue is queue
+    strategy.close.assert_not_called()
+    queue_manager.close.assert_not_called()
+    snapshot_manager.close.assert_not_called()
+
+    storage.store.side_effect = None
+    scheduler.close("checkpoint-retry")
+
+    assert queue._checkpoint_complete is True
+    strategy.close.assert_called_once_with()
+    assert scheduler._queue is None
+    queue_manager.close.assert_called_once_with()
+    snapshot_manager.close.assert_called_once_with()
+
+
+def test_scheduler_cleans_up_after_real_strategy_close_queue_error() -> None:
+    storage = MagicMock(name="snapshot-storage")
+    storage.retrieve.return_value = None
+    strategy = MagicMock(name="strategy")
+    strategy.snapshot.return_value = b"state"
+    strategy.close.side_effect = QueueError("strategy cleanup unavailable")
+    queue = _queue_with_storage(strategy, storage)
+    queue_manager = MagicMock(name="queue-manager")
+    snapshot_manager = MagicMock(name="snapshot-manager")
+    scheduler = BackendScheduler(
+        queue_manager,
+        snapshot_connection_manager=snapshot_manager,
+        owns_snapshot_connection_manager=True,
+    )
+    scheduler._queue = queue
+
+    scheduler.close("cleanup-failed")
+
+    assert queue._checkpoint_complete is True
+    strategy.close.assert_called_once_with()
+    assert scheduler._queue is None
+    queue_manager.close.assert_called_once_with()
+    snapshot_manager.close.assert_called_once_with()
+
+    # Cleanup failures follow the terminal ordinary policy: neither retry nor
+    # abort can revisit a queue whose managers have already been released.
+    scheduler.close("duplicate-close")
+    scheduler.abort("late-abort")
+    strategy.close.assert_called_once_with()
     queue_manager.close.assert_called_once_with()
     snapshot_manager.close.assert_called_once_with()
 
@@ -415,5 +484,9 @@ def test_scheduler_abort_is_an_explicit_lossy_teardown() -> None:
 
     scheduler.abort("operator-selected-lossy-abort")
 
-    queue.close.assert_any_call(lossy=True)
+    assert queue.close.call_args_list == [call(lossy=True), call()]
+    queue_manager.close.assert_called_once_with()
+
+    scheduler.abort("duplicate-abort")
+    assert queue.close.call_args_list == [call(lossy=True), call()]
     queue_manager.close.assert_called_once_with()

@@ -1818,10 +1818,17 @@ class BackendScheduler:
             except BaseException as exc:
                 queue_failure = exc
             if queue_failure is not None:
-                checkpoint_incomplete = isinstance(queue_failure, QueueError) or (
-                    isinstance(self._queue, BackendQueue)
-                    and not self._queue._checkpoint_complete
-                )
+                if isinstance(self._queue, BackendQueue):
+                    # BackendQueue publishes this gate immediately after the
+                    # durable snapshot commit and before strategy.close(). A
+                    # QueueError from the latter is an ordinary cleanup failure,
+                    # not a reason to retain both manager acquires indefinitely.
+                    checkpoint_incomplete = not self._queue._checkpoint_complete
+                else:
+                    # Third-party queue implementations predate the explicit
+                    # checkpoint gate. Preserve their historical QueueError retry
+                    # signal because no stronger completion state is available.
+                    checkpoint_incomplete = isinstance(queue_failure, QueueError)
                 if checkpoint_incomplete:
                     try:
                         logger.error(
