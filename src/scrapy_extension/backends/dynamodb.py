@@ -9,8 +9,8 @@ boto3 resource API (stable):
 - ``boto3.session.Session().resource("dynamodb", region_name=, endpoint_url=, ...)``
 - ``resource.Table(name)`` / ``resource.create_table(...)``
 - ``table.load()`` / ``table.wait_until_exists()``
-- ``table.put_item(Item=)`` / ``get_item(Key=)`` / ``delete_item(Key=, ReturnValues=)``
-- ``table.scan()`` / ``resource.meta.client.batch_write_item(RequestItems=)``
+- ``table.put_item(Item=)`` / ``get_item(Key=)`` / conditional ``delete_item(...)``
+- ``table.scan()`` / conditional ``update_item(...)`` for legacy-row claims
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import logging
 import math
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -38,7 +39,6 @@ except ImportError as e:
     ) from e
 
 from scrapy_extension.backends._redaction import _redact
-from scrapy_extension.backends._retry import compute_full_jitter_backoff
 from scrapy_extension.backends.base import (
     Backend,
     BackendType,
@@ -85,19 +85,20 @@ _DYNAMODB_STORAGE_CLEAR_ERROR = "DynamoDB storage clear failed."
 # Runtime storage operations must therefore surface this code as StorageError.
 _DDB_NOT_FOUND_CODES = frozenset({"ResourceNotFoundException"})
 _DDB_INUSE_CODES = frozenset({"ResourceInUseException"})
+_DDB_CONDITION_FAILED_CODES = frozenset({"ConditionalCheckFailedException"})
 _DDB_MAX_PARTITION_KEY_BYTES = 2_048
 _DDB_MAX_ITEM_BYTES = 400 * 1_024
-_DDB_BATCH_WRITE_LIMIT = 25
-_DDB_BATCH_MAX_ATTEMPTS = 8
-_DDB_BATCH_BACKOFF_BASE_SECONDS = 0.05
-_DYNAMODB_CLEAR_PARTIAL_MESSAGE_PREFIX = "DynamoDB clear is partially complete: "
-_DYNAMODB_CLEAR_PARTIAL_MESSAGE_SUFFIX = (
-    f" delete request(s) remained unprocessed after {_DDB_BATCH_MAX_ATTEMPTS} attempts"
+_DDB_REVISION_ATTRIBUTE = "_scrapy_revision"
+_DDB_REVISION_BYTES = 32
+_DYNAMODB_CLEAR_CONCURRENT_WRITE = (
+    "DynamoDB clear is partially complete: an observed item changed before "
+    "conditional deletion"
 )
 _DYNAMODB_SAFE_STORAGE_MESSAGES: frozenset[str] = frozenset(
     {
         "DynamoDB backend is not connected",
-        "DynamoDB returned a malformed batch-write response; the clear may be "
+        _DYNAMODB_CLEAR_CONCURRENT_WRITE,
+        "DynamoDB returned a malformed legacy-claim response; the clear may be "
         "partially complete",
         "DynamoDB returned a malformed scan response; the clear may be "
         "partially complete",
@@ -192,23 +193,9 @@ def _validate_dynamodb_storage_prefix_argument(
         _validate_key_name(prefix, "prefix")
 
 
-def _is_safe_dynamodb_storage_message(message: str) -> bool:
-    """Allow only the bounded dynamic retry-exhaustion diagnostic."""
-    if not (
-        message.startswith(_DYNAMODB_CLEAR_PARTIAL_MESSAGE_PREFIX)
-        and message.endswith(_DYNAMODB_CLEAR_PARTIAL_MESSAGE_SUFFIX)
-    ):
-        return False
-    count = message[
-        len(_DYNAMODB_CLEAR_PARTIAL_MESSAGE_PREFIX) : -len(
-            _DYNAMODB_CLEAR_PARTIAL_MESSAGE_SUFFIX
-        )
-    ]
-    return (
-        count.isascii()
-        and count.isdecimal()
-        and 1 <= int(count) <= _DDB_BATCH_WRITE_LIMIT
-    )
+def _is_safe_dynamodb_storage_message(_message: str) -> bool:
+    """No dynamic DynamoDB storage diagnostics are public-safe."""
+    return False
 
 
 def _number_size_upper_bound(value: int) -> int:
@@ -219,7 +206,14 @@ def _number_size_upper_bound(value: int) -> int:
 
 def _validate_item_size(key: str, data: bytes, expire_at: int | None) -> None:
     """Reject items beyond DynamoDB's 400 KiB names-plus-values limit."""
-    item_size = len("pk") + len(key.encode("utf-8")) + len("value") + len(data)
+    item_size = (
+        len("pk")
+        + len(key.encode("utf-8"))
+        + len("value")
+        + len(data)
+        + len(_DDB_REVISION_ATTRIBUTE)
+        + _DDB_REVISION_BYTES
+    )
     if expire_at is not None:
         item_size += len("expire_at") + _number_size_upper_bound(expire_at)
     if item_size > _DDB_MAX_ITEM_BYTES:
@@ -245,6 +239,17 @@ def _is_resource_not_found(exc: BaseException) -> bool:
     return err.get("Code") in _DDB_NOT_FOUND_CODES
 
 
+def _is_conditional_check_failed(exc: BaseException) -> bool:
+    """Return True for DynamoDB's non-destructive condition-loss result."""
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return False
+    err = response.get("Error")
+    if not isinstance(err, dict):
+        return False
+    return err.get("Code") in _DDB_CONDITION_FAILED_CODES
+
+
 def _is_resource_in_use(exc: BaseException) -> bool:
     """Return True if ``exc`` is a DynamoDB ``ResourceInUseException``.
 
@@ -265,9 +270,10 @@ def _is_resource_in_use(exc: BaseException) -> bool:
 class DynamoDBBackend(Backend, StorageBackend):
     """DynamoDB storage backend (KV with application-level TTL).
 
-    Stores values under a partition key ``pk``. Items may carry an ``expire_at``
-    epoch attribute; reads treat expired items as missing and delete them. The
-    table is created on connect if it does not exist (PAY_PER_REQUEST).
+    Stores values under a partition key ``pk`` with a fresh opaque
+    ``_scrapy_revision`` on every store. Items may carry an ``expire_at`` epoch
+    attribute; reads treat expired items as missing and delete them. The table is
+    created on connect if it does not exist (PAY_PER_REQUEST).
 
     Attributes:
         config: DynamoDBSettings instance.
@@ -504,64 +510,6 @@ class DynamoDBBackend(Backend, StorageBackend):
         return self._generation_for_operation_locked(operation, key).table
 
     @staticmethod
-    def _validated_unprocessed_deletes(
-        response: Any,
-        table_name: str,
-        submitted: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """Validate and return the exact submitted deletes DynamoDB deferred.
-
-        The Resource client's DynamoDB transformers deserialize
-        ``UnprocessedItems`` back to the same native request shape that was sent.
-        Treat the response as untrusted: only a multiset subset of this attempt's
-        deletes may be retried, so a malformed response can never induce a new
-        deletion.
-        """
-        malformed = StorageError(
-            "DynamoDB returned a malformed batch-write response; the clear may "
-            "be partially complete",
-            operation="clear_storage",
-            key=None,
-        )
-        if not isinstance(response, dict):
-            raise malformed
-        unprocessed = response.get("UnprocessedItems", _MISSING)
-        if not isinstance(unprocessed, dict):
-            raise malformed
-        if any(name != table_name for name in unprocessed):
-            raise malformed
-        raw_pending = unprocessed.get(table_name, [])
-        if not isinstance(raw_pending, list):
-            raise malformed
-        if table_name in unprocessed and not raw_pending:
-            # The service model requires at least one WriteRequest whenever a table
-            # is present; successful completion is represented by an empty map.
-            raise malformed
-
-        remaining = list(submitted)
-        validated: list[dict[str, Any]] = []
-        for request in raw_pending:
-            if not isinstance(request, dict) or set(request) != {"DeleteRequest"}:
-                raise malformed
-            delete = request["DeleteRequest"]
-            if not isinstance(delete, dict) or set(delete) != {"Key"}:
-                raise malformed
-            key = delete["Key"]
-            if (
-                not isinstance(key, dict)
-                or set(key) != {"pk"}
-                or not isinstance(key["pk"], str)
-            ):
-                raise malformed
-            try:
-                match = remaining.index(request)
-            except ValueError:
-                raise malformed from None
-            remaining.pop(match)
-            validated.append(request)
-        return validated
-
-    @staticmethod
     def _validated_scan_page(
         response: Any,
     ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
@@ -594,49 +542,83 @@ class DynamoDBBackend(Backend, StorageBackend):
             raise malformed
         return items, cursor
 
+    @staticmethod
+    def _clear_concurrent_write_error() -> StorageError:
+        """Build the stable partial-result error for a lost revision condition."""
+        return StorageError(
+            _DYNAMODB_CLEAR_CONCURRENT_WRITE,
+            operation="clear_storage",
+            key=None,
+        )
+
     @classmethod
-    def _delete_batch_with_backoff(
+    def _claim_legacy_clear_item(
         cls,
-        client: Any,
-        table_name: str,
-        requests: list[dict[str, Any]],
+        table: Any,
+        item: dict[str, Any],
+        revision: str,
     ) -> None:
-        """Delete one physical batch with bounded unprocessed-item retries."""
-        pending = list(requests)
-        for attempt in range(_DDB_BATCH_MAX_ATTEMPTS):
-            response = client.batch_write_item(
-                RequestItems={table_name: pending},
+        """Attach ``revision`` iff the scanned legacy row is still observable.
+
+        Conditions compare every attribute observed by Scan. ``ALL_OLD`` then
+        catches additions that DynamoDB expressions cannot enumerate: if an
+        external writer replaced the row before the claim, that replacement is
+        retained (with the new revision) and clear reports a partial outcome.
+        """
+        names = {"#revision": _DDB_REVISION_ATTRIBUTE}
+        values: dict[str, Any] = {":revision": revision}
+        conditions = ["attribute_exists(pk)", "attribute_not_exists(#revision)"]
+        for index, (name, value) in enumerate(item.items()):
+            if name in {"pk", _DDB_REVISION_ATTRIBUTE}:
+                continue
+            name_token = f"#item{index}"
+            value_token = f":item{index}"
+            names[name_token] = name
+            values[value_token] = value
+            conditions.append(f"{name_token} = {value_token}")
+        try:
+            response = table.update_item(
+                Key={"pk": item["pk"]},
+                UpdateExpression="SET #revision = :revision",
+                ConditionExpression=" AND ".join(conditions),
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues=values,
+                ReturnValues="ALL_OLD",
             )
-            pending = cls._validated_unprocessed_deletes(response, table_name, pending)
-            if not pending:
-                return
-            if attempt == _DDB_BATCH_MAX_ATTEMPTS - 1:
-                try:
-                    logger.warning(
-                        "DynamoDB clear exhausted %d attempts with %d request(s) still unprocessed",
-                        _DDB_BATCH_MAX_ATTEMPTS,
-                        len(pending),
-                    )
-                except BaseException:
-                    pass
-                raise StorageError(
-                    f"{_DYNAMODB_CLEAR_PARTIAL_MESSAGE_PREFIX}{len(pending)}"
-                    f"{_DYNAMODB_CLEAR_PARTIAL_MESSAGE_SUFFIX}",
-                    operation="clear_storage",
-                    key=None,
-                )
-            delay = compute_full_jitter_backoff(
-                attempt, _DDB_BATCH_BACKOFF_BASE_SECONDS
+        except Exception as exc:
+            if _is_conditional_check_failed(exc):
+                raise cls._clear_concurrent_write_error() from None
+            raise
+        if not isinstance(response, dict) or not isinstance(
+            response.get("Attributes"), dict
+        ):
+            raise StorageError(
+                "DynamoDB returned a malformed legacy-claim response; the clear may "
+                "be partially complete",
+                operation="clear_storage",
+                key=None,
             )
-            try:
-                logger.debug(
-                    "Retrying %d unprocessed DynamoDB clear request(s) after %.3fs",
-                    len(pending),
-                    delay,
-                )
-            except BaseException:
-                pass
-            time.sleep(delay)
+        if response["Attributes"] != item:
+            raise cls._clear_concurrent_write_error()
+
+    @classmethod
+    def _delete_clear_item(cls, table: Any, item: dict[str, Any]) -> None:
+        """Conditionally delete exactly the revision observed (or safely claimed)."""
+        revision = item.get(_DDB_REVISION_ATTRIBUTE, _MISSING)
+        if revision is _MISSING:
+            revision = uuid.uuid4().hex
+            cls._claim_legacy_clear_item(table, item, revision)
+        try:
+            table.delete_item(
+                Key={"pk": item["pk"]},
+                ConditionExpression="#revision = :revision",
+                ExpressionAttributeNames={"#revision": _DDB_REVISION_ATTRIBUTE},
+                ExpressionAttributeValues={":revision": revision},
+            )
+        except Exception as exc:
+            if _is_conditional_check_failed(exc):
+                raise cls._clear_concurrent_write_error() from None
+            raise
 
     @backend_connection_error_boundary(
         "Failed to connect to DynamoDB.",
@@ -896,7 +878,11 @@ class DynamoDBBackend(Backend, StorageBackend):
         """
         _validate_partition_key(key)
         _validate_ttl(ttl)
-        item: dict[str, Any] = {"pk": key, "value": data}
+        item: dict[str, Any] = {
+            "pk": key,
+            "value": data,
+            _DDB_REVISION_ATTRIBUTE: uuid.uuid4().hex,
+        }
         expire_at: int | None = None
         if ttl is not None:
             expire_at = math.ceil(time.time() + ttl)
@@ -1090,14 +1076,12 @@ class DynamoDBBackend(Backend, StorageBackend):
         validator=_validate_dynamodb_storage_prefix_argument,
     )
     def clear_storage(self, prefix: str | None = None) -> None:
-        """Clear observed keys via bounded batch deletes, optionally by prefix.
+        """Clear observed item revisions, optionally restricted by key prefix.
 
-        Each physical batch contains at most 25 deletes and gets at most eight
-        application-level BatchWriteItem submissions with full-jitter backoff for
-        valid ``UnprocessedItems``.
-        Success means every delete observed by this paginated Scan was accepted;
-        it does not prove the table/prefix is empty in the presence of external
-        writers because DynamoDB Scan has no cross-page snapshot isolation.
+        Every delete is conditional on the opaque revision observed by Scan.
+        Legacy rows are first conditionally claimed with a revision. Success means
+        every observed revision was deleted; it does not prove the table/prefix is
+        empty because DynamoDB Scan has no cross-page snapshot isolation.
 
         Args:
             prefix: If provided, only clear keys whose ``pk`` starts with this
@@ -1107,8 +1091,8 @@ class DynamoDBBackend(Backend, StorageBackend):
         Raises:
             ValueError: If prefix contains invalid characters.
             StorageError: On operational, malformed-response, repeated-cursor, or
-                retry-exhaustion failures. Deletion is non-transactional, so the
-                clear may already be partially complete.
+                concurrent-write condition loss. Deletion is non-transactional, so
+                the clear may already be partially complete.
         """
         if prefix is not None:
             _validate_key_name(prefix, "prefix")
@@ -1126,12 +1110,10 @@ class DynamoDBBackend(Backend, StorageBackend):
         # The operation lock is the full clear boundary, not merely a generation
         # snapshot guard. Local storage operations and other clears cannot write into
         # an already-scanned page, and disconnect cannot retire or close this client's
-        # generation during a batch RPC or its retry backoff.
+        # generation during any conditional claim or delete RPC.
         with self._operation_lock:
             generation = self._generation_for_operation_locked("clear_storage", None)
             table = generation.table
-            client = generation.resource.meta.client
-            table_name = generation.snapshot.table_name
             try:
                 # Paginate: a single ``scan`` returns at most ~1 MB per page; without
                 # following ``LastEvaluatedKey`` a large table is silently partial-clear
@@ -1167,15 +1149,8 @@ class DynamoDBBackend(Backend, StorageBackend):
                                 key=None,
                             )
                         seen_cursor_digests.add(cursor_digest)
-                    requests = [
-                        {"DeleteRequest": {"Key": {"pk": item["pk"]}}} for item in items
-                    ]
-                    for offset in range(0, len(requests), _DDB_BATCH_WRITE_LIMIT):
-                        self._delete_batch_with_backoff(
-                            client,
-                            table_name,
-                            requests[offset : offset + _DDB_BATCH_WRITE_LIMIT],
-                        )
+                    for item in items:
+                        self._delete_clear_item(table, item)
                     last_key = next_key
                     if not last_key:
                         break

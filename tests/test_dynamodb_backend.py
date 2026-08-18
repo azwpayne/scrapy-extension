@@ -50,7 +50,6 @@ def _connected(mocker):
     table.table_status = "ACTIVE"
     resource.Table.return_value = table
     table.meta.client = resource.meta.client
-    resource.meta.client.batch_write_item.return_value = {"UnprocessedItems": {}}
     _patch_resource(mocker, return_value=resource)
     b.connect()
     return b, table
@@ -166,8 +165,30 @@ class TestDynamoDBStorageOps:
     def test_store_without_ttl(self, mocker) -> None:
         b, table = _connected(mocker)
         b.store("key1", b"value")
-        args, kwargs = table.put_item.call_args
-        assert kwargs["Item"] == {"pk": "key1", "value": b"value"}
+        _args, kwargs = table.put_item.call_args
+        item = kwargs["Item"]
+        assert item["pk"] == "key1"
+        assert item["value"] == b"value"
+        assert len(item["_scrapy_revision"]) == 32
+        assert set(item) == {"pk", "value", "_scrapy_revision"}
+
+    def test_each_store_writes_a_fresh_opaque_revision(self, mocker) -> None:
+        b, table = _connected(mocker)
+        mocker.patch(
+            "scrapy_extension.backends.dynamodb.uuid.uuid4",
+            side_effect=[
+                mocker.Mock(hex="a" * 32),
+                mocker.Mock(hex="b" * 32),
+            ],
+        )
+
+        b.store("key1", b"first")
+        b.store("key1", b"replacement")
+
+        assert [
+            call.kwargs["Item"]["_scrapy_revision"]
+            for call in table.put_item.call_args_list
+        ] == ["a" * 32, "b" * 32]
 
     def test_store_with_ttl_sets_expire_at(self, mocker) -> None:
         b, table = _connected(mocker)
@@ -176,6 +197,7 @@ class TestDynamoDBStorageOps:
         assert item["pk"] == "key1"
         assert item["value"] == b"value"
         assert "expire_at" in item
+        assert len(item["_scrapy_revision"]) == 32
 
     def test_store_with_ttl_uses_non_early_integer_epoch(self, mocker) -> None:
         b, table = _connected(mocker)
@@ -191,9 +213,8 @@ class TestDynamoDBStorageOps:
 
     def test_store_enforces_complete_400_kib_item_limit_before_io(self, mocker) -> None:
         b, table = _connected(mocker)
-        # Item size is attribute names plus values: ``pk`` (2), key (1),
-        # ``value`` (5), and raw binary bytes. Exactly 400 KiB is accepted.
-        largest_value = b"x" * (400 * 1024 - 2 - 1 - 5)
+        # Item size includes the package revision name and 32-byte opaque value.
+        largest_value = b"x" * (400 * 1024 - 2 - 1 - 5 - len("_scrapy_revision") - 32)
 
         b.store("k", largest_value)
 
@@ -591,44 +612,35 @@ class TestDynamoDBStorageOps:
 
     def test_clear_storage_scans_and_deletes(self, mocker) -> None:
         b, table = _connected(mocker)
-        table.scan.return_value = {"Items": [{"pk": "a"}, {"pk": "b"}]}
+        table.scan.return_value = {
+            "Items": [
+                {"pk": "a", "_scrapy_revision": "a" * 32},
+                {"pk": "b", "_scrapy_revision": "b" * 32},
+            ]
+        }
         b.clear_storage()
-        table.meta.client.batch_write_item.assert_called_once_with(
-            RequestItems={
-                "scrapy-extension": [
-                    {"DeleteRequest": {"Key": {"pk": "a"}}},
-                    {"DeleteRequest": {"Key": {"pk": "b"}}},
-                ]
-            }
-        )
-        table.batch_writer.assert_not_called()
+        assert table.delete_item.call_count == 2
+        assert [
+            call.kwargs["ExpressionAttributeValues"]
+            for call in table.delete_item.call_args_list
+        ] == [{":revision": "a" * 32}, {":revision": "b" * 32}]
+        table.meta.client.batch_write_item.assert_not_called()
 
     def test_clear_storage_deletes_every_scan_page(self, mocker) -> None:
         b, table = _connected(mocker)
         page_cursor = {"pk": "tenant_a:first"}
         table.scan.side_effect = [
             {
-                "Items": [{"pk": "tenant_a:first"}],
+                "Items": [{"pk": "tenant_a:first", "_scrapy_revision": "a" * 32}],
                 "LastEvaluatedKey": page_cursor,
             },
-            {"Items": [{"pk": "tenant_a:second"}]},
+            {"Items": [{"pk": "tenant_a:second", "_scrapy_revision": "b" * 32}]},
         ]
         b.clear_storage(prefix="tenant_a:")
 
-        assert [
-            call.kwargs["RequestItems"]
-            for call in table.meta.client.batch_write_item.call_args_list
-        ] == [
-            {
-                "scrapy-extension": [
-                    {"DeleteRequest": {"Key": {"pk": "tenant_a:first"}}}
-                ]
-            },
-            {
-                "scrapy-extension": [
-                    {"DeleteRequest": {"Key": {"pk": "tenant_a:second"}}}
-                ]
-            },
+        assert [call.kwargs["Key"] for call in table.delete_item.call_args_list] == [
+            {"pk": "tenant_a:first"},
+            {"pk": "tenant_a:second"},
         ]
         assert table.scan.call_count == 2
         assert table.scan.call_args_list[1].kwargs["ExclusiveStartKey"] == page_cursor

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **DynamoDB clears fence every observed row with an opaque per-store revision.**
+  Package writes now reserve `_scrapy_revision`; clear uses conditional
+  `DeleteItem` calls instead of key-only batches, and conditionally claims legacy
+  rows before deleting them. Same-key replacements survive stale clears, which
+  report an explicit possibly-partial `StorageError` on condition loss.
 - **Queue-only stateful strategies can persist clean-close snapshots through
   the configured storage component.** `delay`, `round_robin`, `time_wheel`, and
   `ring_buffer` now use `SCRAPY_STORAGE_BACKEND_*` when their queue backend

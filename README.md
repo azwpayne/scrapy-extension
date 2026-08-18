@@ -508,21 +508,30 @@ instance. Disconnect drains an admitted operation, then closes that
 generation's botocore client. Paginated clears and lazy TTL cleanup remain on
 their issuing table generation.
 
+The item schema is a string partition key `pk`, binary `value`, optional numeric
+`expire_at`, and package-reserved string `_scrapy_revision`. Every `store()`
+creates a fresh opaque 32-character revision, included in the 400 KiB size
+check. Direct table writers that replace package rows must write a fresh opaque
+revision (or remove the old one); copying a stale revision defeats replacement
+detection.
+
 Region and custom endpoint URLs are authoritative backend settings. Ambient
 `AWS_ENDPOINT_URL`, `AWS_ENDPOINT_URL_DYNAMODB`, and shared-config custom
 endpoints are ignored, so they cannot redirect cloud mode around its HTTPS
 guard. Botocore's credential provider chain and normal FIPS/dual-stack endpoint
 selection are unchanged.
 
-`clear_storage()` uses explicit batches of at most 25 deletes. A batch gets at
-most eight application-level BatchWriteItem submissions; only a structurally
-valid `UnprocessedItems` subset is retried with full-jitter backoff. Botocore's
-own retry/timeout layer remains separate, so this is not a wire-attempt or
-wall-clock bound. Exhaustion, malformed service responses, or SDK failures
-raise `StorageError` and may leave a partial clear. The method does not roll
-back accepted deletes. Stop external writers before a deterministic maintenance
-clear: even a successful strongly consistent Scan is not a cross-page snapshot
-and cannot prove the table stayed empty.
+`clear_storage()` issues one conditional `DeleteItem` per observed row, fenced
+on the exact `_scrapy_revision` returned by the strongly consistent Scan. It
+never uses key-only BatchWrite deletes. A legacy row without a revision is
+conditionally claimed with one before deletion; if the row was replaced, the
+replacement is retained and clear raises an explicit partial-result
+`StorageError` rather than reporting false success. SDK failures and malformed
+responses have the same partial-result contract, and accepted earlier deletes
+are not rolled back. Botocore's retry/timeout policy remains the only RPC retry
+layer. Stop external writers before a deterministic maintenance clear: Scan is
+not a cross-page snapshot and a successful clear cannot exclude newly inserted,
+unobserved rows.
 
 `delete()` returns `False` only when `DeleteItem(ALL_OLD)` omits `Attributes`,
 which is AWS's missing-item result. A present old item must contain the exact

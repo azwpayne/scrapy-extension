@@ -736,8 +736,10 @@ that mutates `DynamoDBSettings` after startup must call `disconnect()` and then
 boto3 Session. Shared backend instances serialize all Resource operations,
 including health checks and the complete paginated clear; budget for one
 in-flight operation per generation. Disconnect drains that call and closes the
-underlying botocore client. Local clear/store ordering is now linearized, but
-DynamoDB Scan still has no cross-process snapshot isolation.
+underlying botocore client. Local clear/store ordering is now linearized.
+Package stores also carry an opaque per-write revision so cross-process
+same-key replacements are fenced from stale clear deletes; DynamoDB Scan still
+has no cross-page snapshot isolation for newly inserted keys.
 
 DynamoDB custom endpoints must now be configured with
 `SCRAPY_DYNAMODB_ENDPOINT_URL`. The backend intentionally ignores
@@ -745,17 +747,27 @@ DynamoDB custom endpoints must now be configured with
 endpoints so an ambient URL cannot bypass cloud-mode transport validation.
 Ambient credentials continue to work; only endpoint routing is isolated.
 
-DynamoDB clear no longer delegates persistent `UnprocessedItems` to boto3's
-unbounded `BatchWriter` exit loop. Each 25-item batch now has eight
-application-level BatchWriteItem submissions and bounded full-jitter sleeps. A
-Scan/BatchWrite failure, malformed response, repeated cursor, or exhausted
-batch raises `StorageError(operation="clear_storage", key=None)` instead of
-hanging or claiming success. This is intentionally non-transactional: earlier
-deletes may already be committed, no rollback occurs, and retrying starts a new
-convergent clear. Operators requiring an empty result must stop all external
-writers for the whole operation. Botocore's own retries/timeouts are a separate
-inner budget, so the per-batch limit is not a wire-attempt or global shutdown
-bound.
+DynamoDB package writes now include the reserved `_scrapy_revision` string
+attribute. Its 32-byte opaque value and attribute name count toward the 400 KiB
+item limit, so payloads that sat exactly at the previous maximum must shrink by
+48 bytes. No eager migration is required for existing rows: during clear, a
+legacy row without the attribute is conditionally claimed with a new revision
+before deletion. If another writer replaced that row, the replacement survives
+and clear raises `StorageError(operation="clear_storage", key=None)` as an
+explicit possibly-partial outcome. Applications that write directly to the
+table must generate a fresh opaque revision on each replacement or remove the
+old attribute; preserving a prior revision opts out of replacement detection.
+
+Clear now uses one revision-conditioned `DeleteItem` per observed row. The old
+key-only BatchWrite path and its application-level `UnprocessedItems` retry
+budget were removed because BatchWrite cannot express conditions. Botocore's
+configured retries/timeouts still apply to each claim/delete RPC. A condition
+loss, Scan/claim/delete failure, malformed response, or repeated cursor raises
+the typed partial-result error instead of claiming success. Earlier deletes may
+already be committed, no rollback occurs, and retrying starts a new convergent
+clear. Operators requiring an empty result must still stop all external writers
+for the whole operation because Scan cannot fence newly inserted, unobserved
+keys.
 
 The shared SQS/DynamoDB region check now accepts multi-label region identifiers
 used across AWS partitions, such as `us-gov-west-1`, `us-iso-east-1`, and

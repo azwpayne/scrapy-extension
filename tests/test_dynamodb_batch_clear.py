@@ -1,10 +1,7 @@
-"""Bounded DynamoDB clear batching and retry contracts."""
+"""Revision-fenced DynamoDB clear contracts."""
 
 from __future__ import annotations
 
-import logging
-import subprocess
-import sys
 import threading
 from typing import Any
 
@@ -15,21 +12,20 @@ from scrapy_extension.backends.dynamodb import DynamoDBBackend
 from scrapy_extension.exceptions.base import StorageError
 from scrapy_extension.settings import DynamoDBSettings
 
-_TABLE_NAME = "scrapy-extension"
-_MAX_ATTEMPTS = 8
-_BASE_DELAY = 0.05
+_REVISION = "_scrapy_revision"
+_OLD_REVISION = "0" * 32
+_NEW_REVISION = "1" * 32
 
 
-def _connected(mocker) -> tuple[DynamoDBBackend, Any, Any, Any]:
+def _connected(mocker) -> tuple[DynamoDBBackend, Any, Any]:
     backend = DynamoDBBackend(DynamoDBSettings())
     session = mocker.MagicMock()
     resource = mocker.MagicMock()
     table = mocker.MagicMock()
-    client = resource.meta.client
     table.load.return_value = None
     table.table_status = "ACTIVE"
     resource.Table.return_value = table
-    table.meta.client = client
+    table.meta.client = resource.meta.client
     session.resource.return_value = resource
     mocker.patch.object(
         dynamodb_module.boto3.session,
@@ -37,13 +33,28 @@ def _connected(mocker) -> tuple[DynamoDBBackend, Any, Any, Any]:
         return_value=session,
     )
     backend.connect()
-    return backend, table, client, resource
+    return backend, table, resource
 
 
-def _delete_request(key: str) -> dict[str, Any]:
-    # The Resource client owns AttributeValue transforms; pre-serializing this
-    # would double-encode the key as a DynamoDB Map instead of a String.
-    return {"DeleteRequest": {"Key": {"pk": key}}}
+def _condition_failed() -> Exception:
+    error = Exception("condition exposed secret key material")
+    error.response = {  # type: ignore[attr-defined]
+        "Error": {"Code": "ConditionalCheckFailedException"}
+    }
+    return error
+
+
+def _revision_item(key: str, revision: str = _OLD_REVISION) -> dict[str, Any]:
+    return {"pk": key, "value": b"value", _REVISION: revision}
+
+
+def _assert_revision_delete(call: Any, key: str, revision: Any) -> None:
+    assert call.kwargs == {
+        "Key": {"pk": key},
+        "ConditionExpression": "#revision = :revision",
+        "ExpressionAttributeNames": {"#revision": _REVISION},
+        "ExpressionAttributeValues": {":revision": revision},
+    }
 
 
 def _join(thread: threading.Thread) -> None:
@@ -51,368 +62,200 @@ def _join(thread: threading.Thread) -> None:
     assert not thread.is_alive()
 
 
-def test_clear_chunks_low_level_batch_writes_at_25_items(mocker) -> None:
-    backend, table, client, _resource = _connected(mocker)
-    keys = [f"key-{index}" for index in range(60)]
-    table.scan.return_value = {"Items": [{"pk": key} for key in keys]}
-    client.batch_write_item.return_value = {"UnprocessedItems": {}}
-
-    backend.clear_storage()
-
-    assert client.batch_write_item.call_count == 3
-    batches = [
-        call.kwargs["RequestItems"][_TABLE_NAME]
-        for call in client.batch_write_item.call_args_list
-    ]
-    assert [len(batch) for batch in batches] == [25, 25, 10]
-    assert [request for batch in batches for request in batch] == [
-        _delete_request(key) for key in keys
-    ]
-    table.batch_writer.assert_not_called()
-
-
-def test_real_resource_client_round_trips_native_delete_requests() -> None:
-    """Verify the locked boto3 transformer seam in an unpolluted process."""
-    script = "\n".join(
-        (
-            "from unittest.mock import patch",
-            "import boto3",
-            "from botocore.stub import Stubber",
-            "from scrapy_extension.backends.dynamodb import DynamoDBBackend",
-            "resource = boto3.session.Session().resource(",
-            "  'dynamodb', region_name='us-east-1',",
-            "  endpoint_url='http://localhost:4566',",
-            "  aws_access_key_id='x', aws_secret_access_key='y',",
-            ")",
-            "client = resource.meta.client",
-            "request = {'DeleteRequest': {'Key': {'pk': 'k'}}}",
-            "expected = {'RequestItems': {'table-a': [request]}}",
-            "wire_pending = {'UnprocessedItems': {'table-a': [",
-            "  {'DeleteRequest': {'Key': {'pk': {'S': 'k'}}}}",
-            "]}}",
-            "with Stubber(client) as stubber:",
-            "  stubber.add_response('batch_write_item', wire_pending, expected)",
-            "  stubber.add_response(",
-            "    'batch_write_item', {'UnprocessedItems': {}}, expected",
-            "  )",
-            "  with patch(",
-            "    'scrapy_extension.backends.dynamodb.compute_full_jitter_backoff',",
-            "    return_value=0.0,",
-            "  ), patch('scrapy_extension.backends.dynamodb.time.sleep'):",
-            "    DynamoDBBackend._delete_batch_with_backoff(",
-            "      client, 'table-a', [request]",
-            "    )",
-            "  stubber.assert_no_pending_responses()",
-            "assert request == {'DeleteRequest': {'Key': {'pk': 'k'}}}",
-        )
-    )
-
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=10,
-    )
-
-    assert result.returncode == 0, result.stderr
-
-
-def test_clear_retries_only_unprocessed_items_with_full_jitter(mocker) -> None:
-    backend, table, client, _resource = _connected(mocker)
-    first = _delete_request("first")
-    second = _delete_request("second")
-    timeline: list[str] = []
-    table.scan.return_value = {"Items": [{"pk": "first"}, {"pk": "second"}]}
-    responses = iter(
-        [
-            {"UnprocessedItems": {_TABLE_NAME: [second]}},
-            {"UnprocessedItems": {}},
-        ]
-    )
-
-    def batch_write(**_kwargs: Any) -> dict[str, Any]:
-        timeline.append("write")
-        return next(responses)
-
-    def jitter(attempt: int, base_delay: float) -> float:
-        timeline.append(f"jitter:{attempt}:{base_delay}")
-        return 0.0125
-
-    def record_sleep(delay: float) -> None:
-        timeline.append(f"sleep:{delay}")
-
-    client.batch_write_item.side_effect = batch_write
-    backoff = mocker.patch.object(
-        dynamodb_module,
-        "compute_full_jitter_backoff",
-        side_effect=jitter,
-        create=True,
-    )
-    sleep = mocker.patch.object(dynamodb_module.time, "sleep", side_effect=record_sleep)
-
-    backend.clear_storage()
-
-    assert client.batch_write_item.call_args_list[0].kwargs["RequestItems"] == {
-        _TABLE_NAME: [first, second]
-    }
-    assert client.batch_write_item.call_args_list[1].kwargs["RequestItems"] == {
-        _TABLE_NAME: [second]
-    }
-    backoff.assert_called_once_with(0, _BASE_DELAY)
-    sleep.assert_called_once_with(0.0125)
-    assert timeline == [
-        "write",
-        "jitter:0:0.05",
-        "sleep:0.0125",
-        "write",
-    ]
-
-
-@pytest.mark.parametrize(
-    "diagnostic_error",
-    [RuntimeError("debug failed"), KeyboardInterrupt(), SystemExit()],
-)
-def test_retry_debug_failure_cannot_interrupt_the_next_batch_attempt(
-    mocker, diagnostic_error: BaseException
-) -> None:
-    backend, table, client, _resource = _connected(mocker)
-    request = _delete_request("retry")
-    table.scan.return_value = {"Items": [{"pk": "retry"}]}
-    client.batch_write_item.side_effect = [
-        {"UnprocessedItems": {_TABLE_NAME: [request]}},
-        {"UnprocessedItems": {}},
-    ]
-    mocker.patch.object(
-        dynamodb_module,
-        "compute_full_jitter_backoff",
-        return_value=0.0,
-    )
-    mocker.patch.object(dynamodb_module.time, "sleep")
-    mocker.patch.object(dynamodb_module.logger, "debug", side_effect=diagnostic_error)
-
-    backend.clear_storage()
-
-    assert client.batch_write_item.call_count == 2
-
-
-def test_clear_exhausts_unprocessed_items_with_typed_partial_failure(
-    mocker,
-    caplog,
-) -> None:
-    backend, table, client, _resource = _connected(mocker)
-    request = _delete_request("stuck")
-    table.scan.return_value = {"Items": [{"pk": "stuck"}]}
-    client.batch_write_item.side_effect = [
-        {"UnprocessedItems": {_TABLE_NAME: [request]}} for _ in range(_MAX_ATTEMPTS)
-    ]
-    backoff = mocker.patch.object(
-        dynamodb_module,
-        "compute_full_jitter_backoff",
-        side_effect=[0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07],
-        create=True,
-    )
-    sleep = mocker.patch.object(dynamodb_module.time, "sleep")
-    caplog.set_level(logging.DEBUG, logger="scrapy_extension.backends.dynamodb")
-
-    with pytest.raises(StorageError, match="partially complete") as exc_info:
-        backend.clear_storage()
-
-    assert exc_info.value.operation == "clear_storage"
-    assert exc_info.value.key is None
-    assert client.batch_write_item.call_count == _MAX_ATTEMPTS
-    assert backoff.call_args_list == [
-        mocker.call(attempt, _BASE_DELAY) for attempt in range(_MAX_ATTEMPTS - 1)
-    ]
-    assert sleep.call_args_list == [
-        mocker.call(0.01),
-        mocker.call(0.02),
-        mocker.call(0.03),
-        mocker.call(0.04),
-        mocker.call(0.05),
-        mocker.call(0.06),
-        mocker.call(0.07),
-    ]
-    assert "stuck" not in caplog.text
-
-
-@pytest.mark.parametrize(
-    "diagnostic_error",
-    [RuntimeError("warning failed"), KeyboardInterrupt(), SystemExit()],
-)
-def test_final_retry_warning_cannot_mask_the_typed_partial_failure(
-    mocker, diagnostic_error: BaseException
-) -> None:
-    backend, table, client, _resource = _connected(mocker)
-    request = _delete_request("stuck")
-    table.scan.return_value = {"Items": [{"pk": "stuck"}]}
-    client.batch_write_item.return_value = {
-        "UnprocessedItems": {_TABLE_NAME: [request]}
-    }
-    mocker.patch.object(
-        dynamodb_module,
-        "compute_full_jitter_backoff",
-        return_value=0.0,
-    )
-    mocker.patch.object(dynamodb_module.time, "sleep")
-    mocker.patch.object(
-        dynamodb_module.logger,
-        "warning",
-        side_effect=diagnostic_error,
-    )
-
-    with pytest.raises(StorageError, match="partially complete") as exc_info:
-        backend.clear_storage()
-
-    assert exc_info.value.operation == "clear_storage"
-    assert client.batch_write_item.call_count == _MAX_ATTEMPTS
-
-
-@pytest.mark.parametrize(
-    "response",
-    [
-        None,
-        [],
-        {},
-        {"UnprocessedItems": []},
-        {"UnprocessedItems": {_TABLE_NAME: {}}},
-        {"UnprocessedItems": {_TABLE_NAME: []}},
-        {"UnprocessedItems": {"foreign-table": []}},
-        {"UnprocessedItems": {_TABLE_NAME: [{"PutRequest": {"Item": {"pk": "key"}}}]}},
-        {"UnprocessedItems": {_TABLE_NAME: [_delete_request("not-submitted")]}},
-        {
-            "UnprocessedItems": {
-                _TABLE_NAME: [_delete_request("key"), _delete_request("key")]
-            }
-        },
-    ],
-)
-def test_clear_rejects_malformed_batch_responses(mocker, response: Any) -> None:
-    backend, table, client, _resource = _connected(mocker)
-    table.scan.return_value = {"Items": [{"pk": "key"}]}
-    client.batch_write_item.return_value = response
-    backoff = mocker.patch.object(
-        dynamodb_module,
-        "compute_full_jitter_backoff",
-        create=True,
-    )
-    sleep = mocker.patch.object(dynamodb_module.time, "sleep")
-
-    with pytest.raises(StorageError, match="malformed") as exc_info:
-        backend.clear_storage()
-
-    assert exc_info.value.operation == "clear_storage"
-    assert exc_info.value.key is None
-    assert "partially complete" in str(exc_info.value)
-    client.batch_write_item.assert_called_once()
-    backoff.assert_not_called()
-    sleep.assert_not_called()
-
-
-def test_retry_attempt_index_resets_for_each_physical_batch(mocker) -> None:
-    backend, table, client, _resource = _connected(mocker)
-    keys = [f"key-{index}" for index in range(26)]
-    first_pending = _delete_request(keys[0])
-    second_pending = _delete_request(keys[-1])
-    table.scan.return_value = {"Items": [{"pk": key} for key in keys]}
-    client.batch_write_item.side_effect = [
-        {"UnprocessedItems": {_TABLE_NAME: [first_pending]}},
-        {"UnprocessedItems": {}},
-        {"UnprocessedItems": {_TABLE_NAME: [second_pending]}},
-        {"UnprocessedItems": {}},
-    ]
-    backoff = mocker.patch.object(
-        dynamodb_module,
-        "compute_full_jitter_backoff",
-        return_value=0.0,
-        create=True,
-    )
-    mocker.patch.object(dynamodb_module.time, "sleep")
-
-    backend.clear_storage()
-
-    assert backoff.call_args_list == [
-        mocker.call(0, _BASE_DELAY),
-        mocker.call(0, _BASE_DELAY),
-    ]
-
-
-def test_clear_uses_generation_table_name_after_config_mutation(mocker) -> None:
-    backend, table, client, _resource = _connected(mocker)
-    table.scan.return_value = {"Items": [{"pk": "key"}]}
-    client.batch_write_item.return_value = {"UnprocessedItems": {}}
-    backend.config.table_name = "mutated-after-connect"
-
-    backend.clear_storage()
-
-    assert client.batch_write_item.call_args.kwargs["RequestItems"] == {
-        _TABLE_NAME: [_delete_request("key")]
-    }
-
-
-def test_clear_wraps_batch_write_transport_failure(mocker) -> None:
-    backend, table, client, _resource = _connected(mocker)
-    table.scan.return_value = {"Items": [{"pk": "key"}]}
-    failure = RuntimeError("do-not-leak-key tenant-a: https://user:secret@example.test")
-    client.batch_write_item.side_effect = failure
-    backoff = mocker.patch.object(
-        dynamodb_module,
-        "compute_full_jitter_backoff",
-        create=True,
-    )
-    sleep = mocker.patch.object(dynamodb_module.time, "sleep")
-
-    with pytest.raises(StorageError) as exc_info:
-        backend.clear_storage()
-
-    assert exc_info.value.operation == "clear_storage"
-    assert exc_info.value.__cause__ is None
-    assert exc_info.value.__context__ is None
-    assert "secret" not in str(exc_info.value)
-    assert "example.test" not in str(exc_info.value)
-    assert "do-not-leak-key" not in str(exc_info.value)
-    assert "tenant-a:" not in str(exc_info.value)
-    client.batch_write_item.assert_called_once()
-    backoff.assert_not_called()
-    sleep.assert_not_called()
-
-
-def test_partial_batch_failure_stops_before_later_batches(mocker) -> None:
-    backend, table, client, _resource = _connected(mocker)
-    keys = [f"key-{index}" for index in range(51)]
-    second_batch = [_delete_request(key) for key in keys[25:50]]
+def test_clear_conditions_every_delete_on_exact_observed_revision(mocker) -> None:
+    backend, table, _resource = _connected(mocker)
     table.scan.return_value = {
-        "Items": [{"pk": key} for key in keys],
-        "LastEvaluatedKey": {"pk": "next-page"},
+        "Items": [_revision_item("first"), _revision_item("second", _NEW_REVISION)]
     }
-    client.batch_write_item.side_effect = [
-        {"UnprocessedItems": {}},
-        *[
-            {"UnprocessedItems": {_TABLE_NAME: second_batch}}
-            for _ in range(_MAX_ATTEMPTS)
-        ],
-    ]
-    mocker.patch.object(
-        dynamodb_module,
-        "compute_full_jitter_backoff",
-        return_value=0.0,
-        create=True,
+
+    backend.clear_storage()
+
+    assert table.delete_item.call_count == 2
+    _assert_revision_delete(table.delete_item.call_args_list[0], "first", _OLD_REVISION)
+    _assert_revision_delete(
+        table.delete_item.call_args_list[1], "second", _NEW_REVISION
     )
-    mocker.patch.object(dynamodb_module.time, "sleep")
+    table.meta.client.batch_write_item.assert_not_called()
+
+
+@pytest.mark.parametrize("replacement_has_revision", [True, False])
+def test_external_same_key_replacement_survives_stale_clear(
+    mocker, replacement_has_revision: bool
+) -> None:
+    backend, table, _resource = _connected(mocker)
+    observed = _revision_item("key")
+    replacement = {"pk": "key", "value": b"replacement"}
+    if replacement_has_revision:
+        replacement[_REVISION] = _NEW_REVISION
+    current = observed.copy()
+    table.scan.return_value = {"Items": [observed]}
+
+    def replace_then_delete(**kwargs: Any) -> None:
+        nonlocal current
+        current = replacement.copy()
+        assert kwargs["ExpressionAttributeValues"] == {":revision": _OLD_REVISION}
+        if current.get(_REVISION) != _OLD_REVISION:
+            raise _condition_failed()
+        current = {}
+
+    table.delete_item.side_effect = replace_then_delete
+
+    with pytest.raises(StorageError, match="partially complete") as exc_info:
+        backend.clear_storage()
+
+    assert current == replacement
+    assert exc_info.value.operation == "clear_storage"
+    assert exc_info.value.key is None
+    assert exc_info.value.__cause__ is None
+    assert table.delete_item.call_count == 1
+
+
+def test_legacy_row_is_claimed_before_revision_delete(mocker) -> None:
+    backend, table, _resource = _connected(mocker)
+    legacy = {"pk": "legacy", "value": b"old", "expire_at": 123}
+    table.scan.return_value = {"Items": [legacy]}
+    table.update_item.return_value = {"Attributes": legacy.copy()}
+    mocker.patch.object(
+        dynamodb_module.uuid,
+        "uuid4",
+        return_value=mocker.Mock(hex=_NEW_REVISION),
+    )
+
+    backend.clear_storage()
+
+    table.update_item.assert_called_once_with(
+        Key={"pk": "legacy"},
+        UpdateExpression="SET #revision = :revision",
+        ConditionExpression=(
+            "attribute_exists(pk) AND attribute_not_exists(#revision) "
+            "AND #item1 = :item1 AND #item2 = :item2"
+        ),
+        ExpressionAttributeNames={
+            "#revision": _REVISION,
+            "#item1": "value",
+            "#item2": "expire_at",
+        },
+        ExpressionAttributeValues={
+            ":revision": _NEW_REVISION,
+            ":item1": b"old",
+            ":item2": 123,
+        },
+        ReturnValues="ALL_OLD",
+    )
+    _assert_revision_delete(table.delete_item.call_args, "legacy", _NEW_REVISION)
+
+
+@pytest.mark.parametrize("replacement_has_revision", [True, False])
+def test_replacement_wins_legacy_claim_race_without_delete(
+    mocker, replacement_has_revision: bool
+) -> None:
+    backend, table, _resource = _connected(mocker)
+    legacy = {"pk": "key", "value": b"old"}
+    replacement = {"pk": "key", "value": b"replacement"}
+    if replacement_has_revision:
+        replacement[_REVISION] = _NEW_REVISION
+    current = replacement.copy()
+    table.scan.return_value = {"Items": [legacy]}
+    table.update_item.side_effect = _condition_failed()
 
     with pytest.raises(StorageError, match="partially complete"):
         backend.clear_storage()
 
-    assert client.batch_write_item.call_count == _MAX_ATTEMPTS + 1
-    assert all(
-        call.kwargs["RequestItems"] == {_TABLE_NAME: second_batch}
-        for call in client.batch_write_item.call_args_list[1:]
+    assert current == replacement
+    table.delete_item.assert_not_called()
+    assert table.update_item.call_count == 1
+
+
+def test_legacy_claim_all_old_check_catches_added_external_attribute(mocker) -> None:
+    backend, table, _resource = _connected(mocker)
+    observed = {"pk": "key", "value": b"old"}
+    replacement = {"pk": "key", "value": b"old", "external": "added"}
+    table.scan.return_value = {"Items": [observed]}
+    table.update_item.return_value = {"Attributes": replacement.copy()}
+
+    with pytest.raises(StorageError, match="partially complete"):
+        backend.clear_storage()
+
+    table.delete_item.assert_not_called()
+
+
+def test_direct_replacement_after_legacy_claim_survives_delete(mocker) -> None:
+    backend, table, _resource = _connected(mocker)
+    legacy = {"pk": "key", "value": b"old"}
+    replacement = {"pk": "key", "value": b"external"}
+    current = legacy.copy()
+    table.scan.return_value = {"Items": [legacy]}
+
+    def claim(**kwargs: Any) -> dict[str, Any]:
+        current[_REVISION] = kwargs["ExpressionAttributeValues"][":revision"]
+        return {"Attributes": legacy.copy()}
+
+    def replace_then_delete(**_kwargs: Any) -> None:
+        nonlocal current
+        current = replacement.copy()
+        raise _condition_failed()
+
+    table.update_item.side_effect = claim
+    table.delete_item.side_effect = replace_then_delete
+
+    with pytest.raises(StorageError, match="partially complete"):
+        backend.clear_storage()
+
+    assert current == replacement
+    assert table.update_item.call_count == 1
+    assert table.delete_item.call_count == 1
+
+
+@pytest.mark.parametrize("response", [None, [], {}, {"Attributes": []}])
+def test_malformed_legacy_claim_response_is_partial_failure(
+    mocker, response: Any
+) -> None:
+    backend, table, _resource = _connected(mocker)
+    table.scan.return_value = {"Items": [{"pk": "legacy", "value": b"old"}]}
+    table.update_item.return_value = response
+
+    with pytest.raises(StorageError, match="partially complete") as exc_info:
+        backend.clear_storage()
+
+    assert exc_info.value.operation == "clear_storage"
+    table.delete_item.assert_not_called()
+
+
+@pytest.mark.parametrize("operation", ["claim", "delete"])
+def test_clear_wraps_conditional_rpc_transport_failure(mocker, operation: str) -> None:
+    backend, table, _resource = _connected(mocker)
+    marker = "tenant-secret https://user:password@example.test"
+    failure = RuntimeError(marker)
+    if operation == "claim":
+        legacy = {"pk": "key", "value": b"old"}
+        table.scan.return_value = {"Items": [legacy]}
+        table.update_item.side_effect = failure
+    else:
+        table.scan.return_value = {"Items": [_revision_item("key")]}
+        table.delete_item.side_effect = failure
+
+    with pytest.raises(StorageError) as exc_info:
+        backend.clear_storage()
+
+    assert str(exc_info.value) == (
+        "Failed to clear DynamoDB table; the clear may be partially complete"
     )
-    assert all(
-        _delete_request(keys[-1]) not in call.kwargs["RequestItems"][_TABLE_NAME]
-        for call in client.batch_write_item.call_args_list
-    )
-    assert table.scan.call_count == 1
+    assert marker not in repr(vars(exc_info.value))
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+def test_partial_delete_failure_stops_before_later_observed_items(mocker) -> None:
+    backend, table, _resource = _connected(mocker)
+    table.scan.return_value = {
+        "Items": [_revision_item("first"), _revision_item("second")]
+    }
+    table.delete_item.side_effect = _condition_failed()
+
+    with pytest.raises(StorageError, match="partially complete"):
+        backend.clear_storage()
+
+    assert table.delete_item.call_count == 1
 
 
 @pytest.mark.parametrize(
@@ -427,19 +270,18 @@ def test_partial_batch_failure_stops_before_later_batches(mocker) -> None:
     ],
 )
 def test_clear_rejects_malformed_scan_responses(mocker, response: Any) -> None:
-    backend, table, client, _resource = _connected(mocker)
+    backend, table, _resource = _connected(mocker)
     table.scan.return_value = response
 
-    with pytest.raises(StorageError, match="malformed") as exc_info:
+    with pytest.raises(StorageError, match="malformed"):
         backend.clear_storage()
 
-    assert exc_info.value.operation == "clear_storage"
-    assert exc_info.value.key is None
-    client.batch_write_item.assert_not_called()
+    table.delete_item.assert_not_called()
+    table.update_item.assert_not_called()
 
 
 def test_clear_rejects_non_adjacent_scan_cursor_cycle(mocker) -> None:
-    backend, table, client, _resource = _connected(mocker)
+    backend, table, _resource = _connected(mocker)
     cursor_a = {"pk": "cursor-a"}
     cursor_b = {"pk": "cursor-b"}
     table.scan.side_effect = [
@@ -448,249 +290,95 @@ def test_clear_rejects_non_adjacent_scan_cursor_cycle(mocker) -> None:
         {"Items": [], "LastEvaluatedKey": cursor_a},
     ]
 
-    with pytest.raises(StorageError, match="partially complete") as exc_info:
+    with pytest.raises(StorageError, match="partially complete"):
         backend.clear_storage()
 
-    assert exc_info.value.operation == "clear_storage"
     assert table.scan.call_count == 3
-    client.batch_write_item.assert_not_called()
 
 
-def test_prefix_clear_rejects_out_of_scope_scan_item(mocker) -> None:
-    backend, table, client, _resource = _connected(mocker)
-    table.scan.return_value = {"Items": [{"pk": "tenant-b:victim"}]}
-    sleep = mocker.patch.object(dynamodb_module.time, "sleep")
-
-    with pytest.raises(StorageError, match="out-of-scope") as exc_info:
-        backend.clear_storage(prefix="tenant-a:")
-
-    assert exc_info.value.operation == "clear_storage"
-    assert exc_info.value.key is None
-    client.batch_write_item.assert_not_called()
-    sleep.assert_not_called()
-
-
-def test_prefix_clear_allows_out_of_scope_last_evaluated_key(mocker) -> None:
-    backend, table, client, _resource = _connected(mocker)
+def test_prefix_clear_validates_scope_and_paginates(mocker) -> None:
+    backend, table, _resource = _connected(mocker)
     cursor = {"pk": "tenant-b:cursor"}
     table.scan.side_effect = [
         {
-            "Items": [{"pk": "tenant-a:first"}],
+            "Items": [_revision_item("tenant-a:first")],
             "LastEvaluatedKey": cursor,
         },
-        {"Items": [{"pk": "tenant-a:second"}]},
+        {"Items": [_revision_item("tenant-a:second", _NEW_REVISION)]},
     ]
-    client.batch_write_item.return_value = {"UnprocessedItems": {}}
 
     backend.clear_storage(prefix="tenant-a:")
 
     assert table.scan.call_count == 2
+    assert table.scan.call_args_list[0].kwargs == {
+        "ConsistentRead": True,
+        "FilterExpression": "begins_with(pk, :p)",
+        "ExpressionAttributeValues": {":p": "tenant-a:"},
+    }
     assert table.scan.call_args_list[1].kwargs["ExclusiveStartKey"] == cursor
-    assert client.batch_write_item.call_count == 2
+    assert table.delete_item.call_count == 2
 
 
-def test_clear_skips_batch_api_for_empty_scan_pages(mocker) -> None:
-    backend, table, client, _resource = _connected(mocker)
-    cursor = {"pk": "cursor"}
-    table.scan.side_effect = [
-        {"Items": [], "LastEvaluatedKey": cursor},
-        {"Items": []},
-    ]
+def test_prefix_clear_rejects_out_of_scope_scan_item(mocker) -> None:
+    backend, table, _resource = _connected(mocker)
+    table.scan.return_value = {"Items": [_revision_item("tenant-b:victim")]}
 
-    backend.clear_storage()
+    with pytest.raises(StorageError, match="out-of-scope"):
+        backend.clear_storage(prefix="tenant-a:")
 
-    assert table.scan.call_count == 2
-    client.batch_write_item.assert_not_called()
-    table.batch_writer.assert_not_called()
+    table.delete_item.assert_not_called()
 
 
-def test_disconnect_drains_clear_retry_backoff_before_closing(mocker) -> None:
-    backend, table, client, resource = _connected(mocker)
-    request = _delete_request("key")
+def test_disconnect_drains_conditional_delete_before_closing(mocker) -> None:
+    backend, table, resource = _connected(mocker)
+    table.scan.return_value = {"Items": [_revision_item("key")]}
+    delete_entered = threading.Event()
+    delete_release = threading.Event()
     timeline: list[str] = []
-    table.scan.side_effect = [
-        {"Items": [{"pk": "key"}], "LastEvaluatedKey": {"pk": "page2"}},
-        {"Items": [{"pk": "second"}]},
-    ]
-    responses = iter(
-        [
-            {"UnprocessedItems": {_TABLE_NAME: [request]}},
-            {"UnprocessedItems": {}},
-            {"UnprocessedItems": {}},
-        ]
-    )
 
-    def batch_write(**_kwargs: Any) -> dict[str, Any]:
-        timeline.append("batch")
-        return next(responses)
+    def blocked_delete(**_kwargs: Any) -> None:
+        timeline.append("delete-enter")
+        delete_entered.set()
+        assert delete_release.wait(timeout=5)
+        timeline.append("delete-exit")
 
-    client.batch_write_item.side_effect = batch_write
+    table.delete_item.side_effect = blocked_delete
     resource.meta.client.close.side_effect = lambda: timeline.append("close")
-    mocker.patch.object(
-        dynamodb_module,
-        "compute_full_jitter_backoff",
-        return_value=0.5,
-        create=True,
-    )
-    sleep_entered = threading.Event()
-    sleep_release = threading.Event()
-
-    def blocked_sleep(_delay: float) -> None:
-        timeline.append("sleep-enter")
-        sleep_entered.set()
-        assert sleep_release.wait(timeout=5)
-        timeline.append("sleep-exit")
-
-    mocker.patch.object(dynamodb_module.time, "sleep", side_effect=blocked_sleep)
     errors: list[BaseException] = []
 
-    def run(target) -> None:
+    def run(target: Any) -> None:
         try:
             target()
         except BaseException as exc:
             errors.append(exc)
 
-    clear_thread = threading.Thread(
-        target=lambda: run(backend.clear_storage), name="clear"
-    )
+    clear_thread = threading.Thread(target=lambda: run(backend.clear_storage))
     clear_thread.start()
-    assert sleep_entered.wait(timeout=5)
-
-    disconnect_thread = threading.Thread(
-        target=lambda: run(backend.disconnect), name="disconnect"
-    )
+    assert delete_entered.wait(timeout=5)
+    disconnect_thread = threading.Thread(target=lambda: run(backend.disconnect))
     disconnect_thread.start()
     disconnect_thread.join(timeout=1)
 
     assert disconnect_thread.is_alive()
     resource.meta.client.close.assert_not_called()
 
-    sleep_release.set()
+    delete_release.set()
     _join(clear_thread)
     _join(disconnect_thread)
 
     assert errors == []
-    assert table.scan.call_count == 2
-    assert client.batch_write_item.call_count == 3
-    resource.meta.client.close.assert_called_once_with()
+    assert timeline == ["delete-enter", "delete-exit", "close"]
     assert backend.is_connected() is False
-    assert timeline == [
-        "batch",
-        "sleep-enter",
-        "sleep-exit",
-        "batch",
-        "batch",
-        "close",
-    ]
 
 
-def test_store_waits_for_clear_retry_backoff_boundary(mocker) -> None:
-    backend, table, client, _resource = _connected(mocker)
-    request = _delete_request("clear-key")
-    timeline: list[str] = []
-    table.scan.return_value = {"Items": [{"pk": "clear-key"}]}
-    responses = iter(
-        [
-            {"UnprocessedItems": {_TABLE_NAME: [request]}},
-            {"UnprocessedItems": {}},
-        ]
-    )
-
-    def batch_write(**_kwargs: Any) -> dict[str, Any]:
-        timeline.append("batch")
-        return next(responses)
-
-    client.batch_write_item.side_effect = batch_write
-    table.put_item.side_effect = lambda **_kwargs: timeline.append("store")
-    mocker.patch.object(
-        dynamodb_module,
-        "compute_full_jitter_backoff",
-        return_value=0.5,
-        create=True,
-    )
-    sleep_entered = threading.Event()
-    sleep_release = threading.Event()
-
-    def blocked_sleep(_delay: float) -> None:
-        timeline.append("sleep-enter")
-        sleep_entered.set()
-        assert sleep_release.wait(timeout=5)
-        timeline.append("sleep-exit")
-
-    mocker.patch.object(dynamodb_module.time, "sleep", side_effect=blocked_sleep)
-    errors: list[BaseException] = []
-
-    def run(target) -> None:
-        try:
-            target()
-        except BaseException as exc:
-            errors.append(exc)
-
-    clear_thread = threading.Thread(
-        target=lambda: run(backend.clear_storage), name="clear"
-    )
-    clear_thread.start()
-    assert sleep_entered.wait(timeout=5)
-
-    store_thread = threading.Thread(
-        target=lambda: run(lambda: backend.store("stored-after", b"value")),
-        name="store",
-    )
-    store_thread.start()
-    store_thread.join(timeout=1)
-
-    assert store_thread.is_alive()
-    table.put_item.assert_not_called()
-
-    sleep_release.set()
-    _join(clear_thread)
-    _join(store_thread)
-
-    assert errors == []
-    assert timeline == [
-        "batch",
-        "sleep-enter",
-        "sleep-exit",
-        "batch",
-        "store",
-    ]
-    table.put_item.assert_called_once_with(
-        Item={"pk": "stored-after", "value": b"value"}
-    )
-
-
-@pytest.mark.parametrize("injection_point", ["batch", "jitter", "sleep"])
-def test_clear_propagates_base_exception_and_releases_lock(
-    mocker, injection_point: str
-) -> None:
-    backend, table, client, _resource = _connected(mocker)
-    request = _delete_request("key")
-    table.scan.return_value = {"Items": [{"pk": "key"}]}
-    if injection_point == "batch":
-        client.batch_write_item.side_effect = KeyboardInterrupt
-    else:
-        client.batch_write_item.side_effect = [
-            {"UnprocessedItems": {_TABLE_NAME: [request]}},
-            {"UnprocessedItems": {}},
-        ]
-    mocker.patch.object(
-        dynamodb_module,
-        "compute_full_jitter_backoff",
-        side_effect=(KeyboardInterrupt if injection_point == "jitter" else None),
-        return_value=0.0,
-        create=True,
-    )
-    mocker.patch.object(
-        dynamodb_module.time,
-        "sleep",
-        side_effect=(KeyboardInterrupt if injection_point == "sleep" else None),
-    )
+def test_clear_propagates_base_exception_and_releases_lock(mocker) -> None:
+    backend, table, _resource = _connected(mocker)
+    table.scan.return_value = {"Items": [_revision_item("key")]}
+    table.delete_item.side_effect = KeyboardInterrupt
 
     with pytest.raises(KeyboardInterrupt):
         backend.clear_storage()
 
-    assert client.batch_write_item.call_count == 1
+    table.delete_item.side_effect = None
     backend.store("after-interrupt", b"value")
-    table.put_item.assert_called_once_with(
-        Item={"pk": "after-interrupt", "value": b"value"}
-    )
+    table.put_item.assert_called_once()

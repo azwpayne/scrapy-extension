@@ -1,4 +1,4 @@
-"""DynamoDB ``clear_storage`` is a complete operation boundary."""
+"""DynamoDB ``clear_storage`` remains a complete local operation boundary."""
 
 from __future__ import annotations
 
@@ -9,20 +9,16 @@ from scrapy_extension.backends import dynamodb as dynamodb_module
 from scrapy_extension.backends.dynamodb import DynamoDBBackend
 from scrapy_extension.settings import DynamoDBSettings
 
-_TABLE_NAME = "scrapy-extension"
 
-
-def _connected(mocker) -> tuple[DynamoDBBackend, Any, Any]:
-    """Build a connected backend backed by mocked boto3 resource/table/client."""
+def _connected(mocker) -> tuple[DynamoDBBackend, Any]:
     backend = DynamoDBBackend(DynamoDBSettings())
     session = mocker.MagicMock()
     resource = mocker.MagicMock()
     table = mocker.MagicMock()
-    client = resource.meta.client
     table.load.return_value = None
     table.table_status = "ACTIVE"
     resource.Table.return_value = table
-    table.meta.client = client
+    table.meta.client = resource.meta.client
     session.resource.return_value = resource
     mocker.patch.object(
         dynamodb_module.boto3.session,
@@ -30,13 +26,7 @@ def _connected(mocker) -> tuple[DynamoDBBackend, Any, Any]:
         return_value=session,
     )
     backend.connect()
-    return backend, table, client
-
-
-def _delete_request(key: str) -> dict[str, Any]:
-    # The Resource client owns AttributeValue transforms; keep the native request
-    # shape that _validated_unprocessed_deletes matches against.
-    return {"DeleteRequest": {"Key": {"pk": key}}}
+    return backend, table
 
 
 def _join(thread: threading.Thread) -> None:
@@ -44,60 +34,41 @@ def _join(thread: threading.Thread) -> None:
     assert not thread.is_alive()
 
 
-def _park_first_clear_in_backoff(
-    mocker, table: Any, client: Any
-) -> tuple[threading.Event, threading.Event]:
-    request = _delete_request("clear-key")
-    table.scan.return_value = {"Items": [{"pk": "clear-key"}]}
-    responses = iter(
-        [
-            {"UnprocessedItems": {_TABLE_NAME: [request]}},
-            {"UnprocessedItems": {}},
-            {"UnprocessedItems": {}},
-        ]
-    )
-    client.batch_write_item.side_effect = lambda **_kwargs: next(responses)
-    sleep_entered = threading.Event()
-    sleep_release = threading.Event()
+def _park_clear(table: Any) -> tuple[threading.Event, threading.Event]:
+    table.scan.return_value = {
+        "Items": [{"pk": "clear-key", "_scrapy_revision": "0" * 32}]
+    }
+    delete_entered = threading.Event()
+    delete_release = threading.Event()
 
-    def blocked_sleep(_delay: float) -> None:
-        sleep_entered.set()
-        assert sleep_release.wait(timeout=5)
+    def blocked_delete(**_kwargs: Any) -> None:
+        delete_entered.set()
+        assert delete_release.wait(timeout=5)
 
-    mocker.patch.object(
-        dynamodb_module,
-        "compute_full_jitter_backoff",
-        return_value=0.3,
-        create=True,
-    )
-    mocker.patch.object(dynamodb_module.time, "sleep", side_effect=blocked_sleep)
-    return sleep_entered, sleep_release
+    table.delete_item.side_effect = blocked_delete
+    return delete_entered, delete_release
 
 
-def test_concurrent_retrieve_waits_for_throttled_clear_boundary(mocker) -> None:
-    backend, table, client = _connected(mocker)
-    sleep_entered, sleep_release = _park_first_clear_in_backoff(mocker, table, client)
+def test_concurrent_retrieve_waits_for_conditional_clear_boundary(mocker) -> None:
+    backend, table = _connected(mocker)
+    delete_entered, delete_release = _park_clear(table)
     table.get_item.return_value = {}
     errors: list[BaseException] = []
     retrieve_results: list[object] = []
 
-    def run(target) -> None:
+    def run(target: Any) -> None:
         try:
             target()
         except BaseException as exc:
             errors.append(exc)
 
-    clear_thread = threading.Thread(
-        target=lambda: run(backend.clear_storage), name="clear"
-    )
+    clear_thread = threading.Thread(target=lambda: run(backend.clear_storage))
     clear_thread.start()
-    assert sleep_entered.wait(timeout=5)
-
+    assert delete_entered.wait(timeout=5)
     retrieve_thread = threading.Thread(
         target=lambda: run(
             lambda: retrieve_results.append(backend.retrieve("other-key"))
-        ),
-        name="retrieve",
+        )
     )
     retrieve_thread.start()
     retrieve_thread.join(timeout=1)
@@ -105,18 +76,17 @@ def test_concurrent_retrieve_waits_for_throttled_clear_boundary(mocker) -> None:
     assert retrieve_thread.is_alive()
     table.get_item.assert_not_called()
 
-    sleep_release.set()
+    delete_release.set()
     _join(clear_thread)
     _join(retrieve_thread)
 
-    assert retrieve_results == [None]
     assert errors == []
-    table.get_item.assert_called_once_with(Key={"pk": "other-key"}, ConsistentRead=True)
+    assert retrieve_results == [None]
 
 
-def test_concurrent_clear_waits_for_throttled_clear_boundary(mocker) -> None:
-    backend, table, client = _connected(mocker)
-    sleep_entered, sleep_release = _park_first_clear_in_backoff(mocker, table, client)
+def test_concurrent_clear_waits_for_conditional_clear_boundary(mocker) -> None:
+    backend, table = _connected(mocker)
+    delete_entered, delete_release = _park_clear(table)
     errors: list[BaseException] = []
 
     def run_clear() -> None:
@@ -125,21 +95,20 @@ def test_concurrent_clear_waits_for_throttled_clear_boundary(mocker) -> None:
         except BaseException as exc:
             errors.append(exc)
 
-    first = threading.Thread(target=run_clear, name="clear-1")
+    first = threading.Thread(target=run_clear)
     first.start()
-    assert sleep_entered.wait(timeout=5)
-
-    second = threading.Thread(target=run_clear, name="clear-2")
+    assert delete_entered.wait(timeout=5)
+    second = threading.Thread(target=run_clear)
     second.start()
     second.join(timeout=1)
 
     assert second.is_alive()
     assert table.scan.call_count == 1
 
-    sleep_release.set()
+    delete_release.set()
     _join(first)
     _join(second)
 
     assert errors == []
     assert table.scan.call_count == 2
-    assert client.batch_write_item.call_count == 3
+    assert table.delete_item.call_count == 2

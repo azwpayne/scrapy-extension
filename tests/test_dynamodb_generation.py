@@ -30,7 +30,6 @@ def _resource(mocker: Any, table: Any | None = None) -> tuple[Any, Any]:
     table.table_status = "ACTIVE"
     resource.Table.return_value = table
     table.meta.client = resource.meta.client
-    resource.meta.client.batch_write_item.return_value = {"UnprocessedItems": {}}
     return resource, table
 
 
@@ -886,25 +885,24 @@ def test_paginated_clear_drains_before_generation_rollover(mocker) -> None:
     observed_lock = _ObservedRLock()
     rollover_attempted = observed_lock.observe("rollover")
     backend._operation_lock = observed_lock
-    batch_entered = threading.Event()
-    batch_release = threading.Event()
+    delete_entered = threading.Event()
+    delete_release = threading.Event()
 
-    def blocked_batch_write(**_kwargs: object) -> dict[str, Any]:
-        batch_entered.set()
-        assert batch_release.wait(timeout=5)
-        return {"UnprocessedItems": {}}
+    def blocked_delete(**_kwargs: object) -> None:
+        delete_entered.set()
+        assert delete_release.wait(timeout=5)
 
-    resource_a.meta.client.batch_write_item.side_effect = blocked_batch_write
+    table_a.delete_item.side_effect = blocked_delete
     table_a.scan.side_effect = [
         {
-            "Items": [{"pk": "first"}],
+            "Items": [{"pk": "first", "_scrapy_revision": "a" * 32}],
             "LastEvaluatedKey": {"pk": "first"},
         },
-        {"Items": [{"pk": "second"}]},
+        {"Items": [{"pk": "second", "_scrapy_revision": "b" * 32}]},
     ]
     errors: list[BaseException] = []
     clear_thread = _thread_call(backend.clear_storage, errors, name="clear")
-    assert batch_entered.wait(timeout=5)
+    assert delete_entered.wait(timeout=5)
 
     def rollover() -> None:
         backend.disconnect()
@@ -919,21 +917,18 @@ def test_paginated_clear_drains_before_generation_rollover(mocker) -> None:
     assert factory.call_count == 1
     resource_a.meta.client.close.assert_not_called()
 
-    batch_release.set()
+    delete_release.set()
     _join(clear_thread)
     _join(rollover_thread)
 
     assert errors == []
-    assert [
-        call.kwargs["RequestItems"]
-        for call in resource_a.meta.client.batch_write_item.call_args_list
-    ] == [
-        {"table-a": [{"DeleteRequest": {"Key": {"pk": "first"}}}]},
-        {"table-a": [{"DeleteRequest": {"Key": {"pk": "second"}}}]},
+    assert [call.kwargs["Key"] for call in table_a.delete_item.call_args_list] == [
+        {"pk": "first"},
+        {"pk": "second"},
     ]
     assert table_a.scan.call_count == 2
     resource_a.meta.client.close.assert_called_once_with()
-    resource_b.meta.client.batch_write_item.assert_not_called()
+    table_b.delete_item.assert_not_called()
     table_b.scan.assert_not_called()
     assert factory.call_count == 2
     assert backend.is_connected() is True

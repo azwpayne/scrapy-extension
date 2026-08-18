@@ -39,8 +39,9 @@ class DynamoDBSettings(RedactedBaseSettings):
 
     Configurable via environment variables with the SCRAPY_DYNAMODB_ prefix.
     One table per backend (auto-created on connect if missing); items are keyed
-    by ``pk``. TTL is application-level (an ``expire_at`` attribute checked on
-    read), not the native DynamoDB TTL feature.
+    by ``pk``. Package writes carry a reserved opaque ``_scrapy_revision``
+    attribute used to fence maintenance clears. TTL is application-level (an
+    ``expire_at`` attribute checked on read), not the native DynamoDB TTL feature.
     """
 
     model_config = SettingsConfigDict(

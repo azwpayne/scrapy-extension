@@ -81,7 +81,6 @@ def _backend(mocker: Any) -> tuple[DynamoDBBackend, Any]:
     table.table_status = "ACTIVE"
     resource.Table.return_value = table
     table.meta.client = resource.meta.client
-    resource.meta.client.batch_write_item.return_value = {"UnprocessedItems": {}}
     session = mocker.MagicMock()
     session.resource.return_value = resource
     mocker.patch.object(boto3.session, "Session", return_value=session)
@@ -131,8 +130,10 @@ def _failing_storage_operation(
             ("DynamoDB storage TTL read failed."),
         )
     if method_name == "clear_storage":
-        table.scan.return_value = {"Items": [{"pk": _MARKER}]}
-        table.meta.client.batch_write_item.side_effect = failure
+        table.scan.return_value = {
+            "Items": [{"pk": _MARKER, "value": b"old", "_scrapy_revision": "0" * 32}]
+        }
+        table.delete_item.side_effect = failure
         return (
             lambda: backend.clear_storage(_MARKER),
             "clear_storage",
@@ -163,23 +164,19 @@ def test_direct_dynamodb_storage_operation_rebuilds_private_error_graph(
     _assert_terminal_error_is_redacted(error, _MARKER)
 
 
-def test_direct_dynamodb_clear_rebuilds_nested_batch_failure_graph(
+def test_direct_dynamodb_clear_rebuilds_malformed_legacy_claim_graph(
     mocker: Any,
 ) -> None:
     backend, table = _backend(mocker)
-    table.scan.return_value = {"Items": [{"pk": _MARKER}]}
-    table.meta.client.batch_write_item.return_value = {
-        "UnprocessedItems": {
-            "scrapy-extension": [{"unexpected": _MARKER}],
-        }
-    }
+    table.scan.return_value = {"Items": [{"pk": _MARKER, "value": b"old"}]}
+    table.update_item.return_value = {"unexpected": _MARKER}
 
     with pytest.raises(StorageError) as exc_info:
         backend.clear_storage(_MARKER)
 
     error = exc_info.value
     assert str(error) == (
-        "DynamoDB returned a malformed batch-write response; the clear may be "
+        "DynamoDB returned a malformed legacy-claim response; the clear may be "
         "partially complete"
     )
     assert error.operation == "clear_storage"
@@ -243,8 +240,10 @@ def test_dynamodb_terminal_boundary_preserves_control_flow(
         table.put_item.side_effect = interruption
         operation = lambda: backend.store(_MARKER, _MARKER.encode())
     else:
-        table.scan.return_value = {"Items": [{"pk": _MARKER}]}
-        table.meta.client.batch_write_item.side_effect = interruption
+        table.scan.return_value = {
+            "Items": [{"pk": _MARKER, "value": b"old", "_scrapy_revision": "0" * 32}]
+        }
+        table.delete_item.side_effect = interruption
         operation = lambda: backend.clear_storage(_MARKER)
 
     with pytest.raises(KeyboardInterrupt) as exc_info:
@@ -267,7 +266,8 @@ def test_dynamodb_terminal_boundary_validates_inputs_before_backend_work(
 
     table.put_item.assert_not_called()
     table.scan.assert_not_called()
-    table.meta.client.batch_write_item.assert_not_called()
+    table.delete_item.assert_not_called()
+    table.update_item.assert_not_called()
 
 
 def test_dynamodb_storage_boundary_accepts_public_keyword_data(mocker: Any) -> None:

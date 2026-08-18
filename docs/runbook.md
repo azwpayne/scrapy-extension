@@ -528,10 +528,13 @@ changes with `disconnect()` / `connect()`. Storage calls, health probes, and the
 entire paginated clear are serialized because boto3 Resources are not
 thread-safe. Disconnect waits for an admitted call or table creation before
 closing the botocore client, so the shutdown budget must cover SDK retries and a
-full clear. This linearizes clear against writes made through the same backend
-instance only: DynamoDB Scan does not provide snapshot isolation across other
-processes or clients, so clear remains a best-effort maintenance operation under
-external concurrent writes.
+full clear. This linearizes clear against writes made through the same backend instance.
+Every package `store()` also writes a fresh opaque `_scrapy_revision`, and clear
+conditions each deletion on the exact observed revision. A same-key replacement
+from another process therefore survives a stale clear, which raises a typed
+partial-result error instead of false success. DynamoDB Scan still does not
+provide cross-page snapshot isolation, so newly inserted, unobserved rows can
+remain.
 
 Custom DynamoDB endpoints must be set through the backend's validated endpoint
 setting. Botocore environment variables (`AWS_ENDPOINT_URL` and
@@ -540,18 +543,24 @@ cloud mode therefore cannot be silently redirected to an ambient HTTP target.
 
 For a deterministic DynamoDB maintenance clear, first quiesce every external
 writer, then call `clear_storage()`, and resume writers only after it succeeds.
-The backend sends at most 25 deletes per request and gives each physical batch
-eight application-level BatchWriteItem submissions. Seven full-jitter sleeps
-have a theoretical local maximum of 6.35 seconds per batch, but this is not a
-whole-clear, wire-attempt, or disconnect deadline:
-page/batch count is unbounded, botocore has its own retry and network-timeout
-budget, and the operation lock has no fairness guarantee. The lock intentionally
-covers Scan, BatchWrite, and backoff so local writes cannot interleave between
-partial retries. A typed `StorageError` means the clear may already be partial;
-after fixing the cause, rerun it as a new idempotent convergence pass rather
-than attempting rollback. Never call `disconnect()` re-entrantly from a
-synchronous logging hook or signal handler; schedule teardown on another
-thread.
+The backend sends one conditional `DeleteItem` per observed row; key-only
+BatchWrite cannot express the revision fence and is not used. Botocore owns RPC
+retries and network timeouts, so page/item count and SDK policy determine the
+unbounded whole-clear and disconnect-drain budget. The operation lock covers
+Scan, legacy claims, and deletes so local writes cannot interleave. A condition
+loss, malformed response, or SDK failure raises `StorageError` with an explicit
+possibly-partial contract; after fixing the cause, rerun clear as a new
+idempotent convergence pass rather than attempting rollback. Never call
+`disconnect()` re-entrantly from a synchronous logging hook or signal handler;
+schedule teardown on another thread.
+
+The stored schema reserves `_scrapy_revision` alongside `pk`, `value`, and the
+optional `expire_at`. Direct writers must replace it with a fresh opaque value
+(or omit it and become a legacy row), never preserve an old row's revision.
+Legacy rows need no eager migration: clear conditionally claims each row before
+its fenced delete. A claim race leaves the replacement in place and reports the
+partial outcome; a retained claimed replacement is safe to process on a later
+clear.
 
 A DynamoDB `StorageError` whose public message says the `DeleteItem` response
 was malformed means the deletion result is uncertain: do not reinterpret it as
