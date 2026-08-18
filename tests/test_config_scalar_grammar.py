@@ -1,0 +1,237 @@
+"""Canonical scalar grammar for every bundled settings model."""
+
+from __future__ import annotations
+
+import traceback
+from typing import Any
+
+import pytest
+from pydantic import ValidationError
+
+from scrapy_extension.exceptions import ConfigurationError
+from scrapy_extension.settings import (
+    DynamoDBSettings,
+    ElasticSearchSettings,
+    KafkaSettings,
+    MemcachedSettings,
+    MongoDBSettings,
+    PulsarSettings,
+    RabbitMQSettings,
+    RedisSettings,
+    RocketMQSettings,
+    Settings,
+    SqsSettings,
+)
+
+_BUNDLED_BOOL_FIELDS: tuple[tuple[type[Any], str, str], ...] = (
+    (Settings, "dedup_strict", "SCRAPY_DEDUP_STRICT"),
+    (RedisSettings, "retry_on_timeout", "SCRAPY_REDIS_RETRY_ON_TIMEOUT"),
+    (MongoDBSettings, "journal", "SCRAPY_MONGO_JOURNAL"),
+    (
+        ElasticSearchSettings,
+        "retry_on_timeout",
+        "SCRAPY_ELASTICSEARCH_RETRY_ON_TIMEOUT",
+    ),
+    (MemcachedSettings, "allow_flush_all", "SCRAPY_MEMCACHED_ALLOW_FLUSH_ALL"),
+    (KafkaSettings, "enable_auto_commit", "SCRAPY_KAFKA_ENABLE_AUTO_COMMIT"),
+    (
+        PulsarSettings,
+        "allow_insecure_connection",
+        "SCRAPY_PULSAR_ALLOW_INSECURE_CONNECTION",
+    ),
+    (RabbitMQSettings, "durable", "SCRAPY_RABBITMQ_DURABLE"),
+    (RocketMQSettings, "tls_enabled", "SCRAPY_ROCKETMQ_TLS_ENABLED"),
+    (SqsSettings, "allow_remote_http", "SCRAPY_SQS_ALLOW_REMOTE_HTTP"),
+    (
+        DynamoDBSettings,
+        "allow_unfenced_legacy_clear",
+        "SCRAPY_DYNAMODB_ALLOW_UNFENCED_LEGACY_CLEAR",
+    ),
+)
+
+_BUNDLED_INTEGER_FIELDS: tuple[tuple[type[Any], str, str, int], ...] = (
+    (Settings, "retry_attempts", "SCRAPY_RETRY_ATTEMPTS", 8),
+    (RedisSettings, "db", "SCRAPY_REDIS_DB", 8),
+    (MongoDBSettings, "min_pool_size", "SCRAPY_MONGO_MIN_POOL_SIZE", 8),
+    (
+        ElasticSearchSettings,
+        "max_retries",
+        "SCRAPY_ELASTICSEARCH_MAX_RETRIES",
+        8,
+    ),
+    (MemcachedSettings, "port", "SCRAPY_MEMCACHED_PORT", 11212),
+    (KafkaSettings, "retries", "SCRAPY_KAFKA_RETRIES", 8),
+    (
+        PulsarSettings,
+        "negative_ack_redelivery_delay_ms",
+        "SCRAPY_PULSAR_NEGATIVE_ACK_REDELIVERY_DELAY_MS",
+        8,
+    ),
+    (RabbitMQSettings, "heartbeat", "SCRAPY_RABBITMQ_HEARTBEAT", 8),
+    (RocketMQSettings, "send_timeout", "SCRAPY_ROCKETMQ_SEND_TIMEOUT", 8),
+    (SqsSettings, "visibility_timeout", "SCRAPY_SQS_VISIBILITY_TIMEOUT", 8),
+)
+
+
+def _required_kwargs(settings_type: type[Any]) -> dict[str, object]:
+    if settings_type is RabbitMQSettings:
+        return {"username": "crawler", "password": "secret", "ssl_enabled": True}
+    if settings_type is PulsarSettings:
+        return {"service_url": "pulsar+ssl://localhost:6651"}
+    return {}
+
+
+@pytest.mark.parametrize(
+    "settings_type,field_name,_env_name",
+    _BUNDLED_BOOL_FIELDS,
+    ids=lambda value: value.__name__ if isinstance(value, type) else None,
+)
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        (True, True),
+        (False, False),
+        ("true", True),
+        ("FALSE", False),
+        ("1", True),
+        ("0", False),
+    ],
+)
+def test_bundled_boolean_direct_matrix_accepts_only_canonical_values(
+    settings_type: type[Any],
+    field_name: str,
+    _env_name: str,
+    raw_value: object,
+    expected: bool,
+) -> None:
+    settings = settings_type(
+        **_required_kwargs(settings_type), **{field_name: raw_value}
+    )
+
+    assert getattr(settings, field_name) is expected
+
+
+@pytest.mark.parametrize(
+    "settings_type,field_name,_env_name",
+    _BUNDLED_BOOL_FIELDS,
+    ids=lambda value: value.__name__ if isinstance(value, type) else None,
+)
+@pytest.mark.parametrize("raw_value", [1, 0, "yes", "on", " true ", 1.0, [], {}])
+def test_bundled_boolean_direct_matrix_rejects_ambiguous_values(
+    settings_type: type[Any], field_name: str, _env_name: str, raw_value: object
+) -> None:
+    with pytest.raises(ConfigurationError) as exc_info:
+        settings_type(**_required_kwargs(settings_type), **{field_name: raw_value})
+
+    assert exc_info.value.setting_name == field_name
+    assert exc_info.value.setting_value is None
+
+
+@pytest.mark.parametrize(
+    "settings_type,field_name,env_name",
+    _BUNDLED_BOOL_FIELDS,
+    ids=lambda value: value.__name__ if isinstance(value, type) else None,
+)
+@pytest.mark.parametrize(("raw_value", "expected"), [("TrUe", True), ("0", False)])
+def test_bundled_boolean_environment_matrix_remains_usable(
+    monkeypatch: pytest.MonkeyPatch,
+    settings_type: type[Any],
+    field_name: str,
+    env_name: str,
+    raw_value: str,
+    expected: bool,
+) -> None:
+    monkeypatch.setenv(env_name, raw_value)
+    if settings_type is RabbitMQSettings:
+        monkeypatch.setenv("SCRAPY_RABBITMQ_USERNAME", "crawler")
+        monkeypatch.setenv("SCRAPY_RABBITMQ_PASSWORD", "secret")
+        monkeypatch.setenv("SCRAPY_RABBITMQ_SSL_ENABLED", "true")
+    if settings_type is PulsarSettings:
+        monkeypatch.setenv("SCRAPY_PULSAR_SERVICE_URL", "pulsar+ssl://localhost:6651")
+
+    assert getattr(settings_type(), field_name) is expected
+
+
+@pytest.mark.parametrize(
+    "settings_type,field_name,_env_name,_expected",
+    _BUNDLED_INTEGER_FIELDS,
+    ids=lambda value: value.__name__ if isinstance(value, type) else None,
+)
+@pytest.mark.parametrize(
+    "raw_value", [True, False, 1.0, 0.0, "01", "+1", " 1", "1 ", "1.0", [], {}]
+)
+def test_bundled_integer_direct_matrix_rejects_coercion(
+    settings_type: type[Any],
+    field_name: str,
+    _env_name: str,
+    _expected: int,
+    raw_value: object,
+) -> None:
+    with pytest.raises(ConfigurationError) as exc_info:
+        settings_type(**_required_kwargs(settings_type), **{field_name: raw_value})
+
+    assert exc_info.value.setting_name == field_name
+    assert exc_info.value.setting_value is None
+
+
+@pytest.mark.parametrize(
+    "settings_type,field_name,env_name,expected",
+    _BUNDLED_INTEGER_FIELDS,
+    ids=lambda value: value.__name__ if isinstance(value, type) else None,
+)
+def test_bundled_integer_direct_and_environment_matrix_accepts_canonical_decimal(
+    monkeypatch: pytest.MonkeyPatch,
+    settings_type: type[Any],
+    field_name: str,
+    env_name: str,
+    expected: int,
+) -> None:
+    direct = settings_type(
+        **_required_kwargs(settings_type), **{field_name: str(expected)}
+    )
+    assert getattr(direct, field_name) == expected
+
+    monkeypatch.setenv(env_name, str(expected))
+    if settings_type is RabbitMQSettings:
+        monkeypatch.setenv("SCRAPY_RABBITMQ_USERNAME", "crawler")
+        monkeypatch.setenv("SCRAPY_RABBITMQ_PASSWORD", "secret")
+        monkeypatch.setenv("SCRAPY_RABBITMQ_SSL_ENABLED", "true")
+    assert getattr(settings_type(), field_name) == expected
+
+
+@pytest.mark.parametrize(
+    "settings_type,field_name",
+    [
+        (Settings, "retry_delay"),
+        (RedisSettings, "socket_timeout"),
+        (ElasticSearchSettings, "request_timeout"),
+        (MemcachedSettings, "connect_timeout"),
+    ],
+)
+@pytest.mark.parametrize(
+    "raw_value",
+    [True, False, float("nan"), float("inf"), float("-inf")],
+)
+def test_bundled_float_duration_fields_reject_booleans_and_nonfinite_values(
+    settings_type: type[Any], field_name: str, raw_value: object
+) -> None:
+    with pytest.raises((ConfigurationError, ValidationError)):
+        settings_type(**{field_name: raw_value})
+
+
+def test_documented_negative_integer_text_remains_available() -> None:
+    assert Settings(queue_delay_max_held="-1").queue_delay_max_held == -1
+
+
+def test_scalar_errors_do_not_retain_raw_input() -> None:
+    marker = "scalar-coercion-secret-marker"
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        KafkaSettings(retries=f"1{marker}")
+
+    error = exc_info.value
+    assert marker not in str(error)
+    assert marker not in repr(error.__dict__)
+    assert marker not in "".join(traceback.format_exception(error))
+    assert error.__cause__ is None
+    assert error.__context__ is None

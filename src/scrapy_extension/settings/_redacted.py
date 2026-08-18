@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from importlib import import_module
-from typing import Any
+from typing import Annotated, Any, cast, get_args, get_origin
 
-from pydantic import ValidationError
+from pydantic import ValidationError, model_validator
 from pydantic_core import InitErrorDetails
 from pydantic_settings import BaseSettings, SettingsError
 
@@ -246,10 +247,11 @@ def _redacted_validation_error(
     return ValidationError.from_exception_data("Settings", safe_lines)
 
 
-def _trusted_settings_field_names(instance: BaseSettings) -> frozenset[str]:
-    """Return field names only for the extension's exact bundled models."""
+def _trusted_settings_fields(
+    settings_type: type[BaseSettings],
+) -> Mapping[str, Any] | None:
+    """Return model fields only for the extension's exact bundled models."""
     try:
-        settings_type = type(instance)
         module_name = settings_type.__module__
         qualified_name = settings_type.__qualname__
         if (
@@ -257,16 +259,127 @@ def _trusted_settings_field_names(instance: BaseSettings) -> frozenset[str]:
             or type(qualified_name) is not str
             or (module_name, qualified_name) not in _TRUSTED_SETTINGS_CLASSES
         ):
-            return frozenset()
+            return None
         module = import_module(module_name)
         if getattr(module, qualified_name, None) is not settings_type:
-            return frozenset()
+            return None
         fields = settings_type.model_fields
     except Exception:  # noqa: BLE001 - third-party metadata is not trusted
-        return frozenset()
-    if not isinstance(fields, Mapping):
+        return None
+    return fields if isinstance(fields, Mapping) else None
+
+
+def _trusted_settings_field_names(instance: BaseSettings) -> frozenset[str]:
+    """Return field names only for the extension's exact bundled models."""
+    fields = _trusted_settings_fields(type(instance))
+    if fields is None:
         return frozenset()
     return frozenset(name for name in fields if type(name) is str)
+
+
+def _scalar_annotation_kind(annotation: object) -> tuple[type[object], bool] | None:
+    """Identify exact scalar and optional-scalar annotations, including Annotated."""
+    while get_origin(annotation) is Annotated:
+        annotation = get_args(annotation)[0]
+    if annotation in (bool, int, float):
+        return annotation, False
+    args = get_args(annotation)
+    if len(args) != 2 or type(None) not in args:
+        return None
+    inner = args[0] if args[1] is type(None) else args[1]
+    while get_origin(inner) is Annotated:
+        inner = get_args(inner)[0]
+    if inner in (bool, int, float):
+        return inner, True
+    return None
+
+
+def _canonical_unsigned_decimal(value: str) -> bool:
+    """Return whether text is canonical, unsigned ASCII base-10 notation."""
+    return value == "0" or (
+        bool(value) and "1" <= value[0] <= "9" and value.isascii() and value.isdecimal()
+    )
+
+
+def _canonical_negative_decimal(value: str) -> bool:
+    """Return whether text is canonical negative ASCII base-10 notation."""
+    return (
+        value.startswith("-")
+        and _canonical_unsigned_decimal(value[1:])
+        and value[1] != "0"
+    )
+
+
+def _canonical_float_text(value: str) -> bool:
+    """Return whether text is unambiguous finite unsigned decimal notation."""
+    integer, separator, fraction = value.partition(".")
+    return _canonical_unsigned_decimal(integer) and (
+        not separator
+        or (bool(fraction) and fraction.isascii() and fraction.isdecimal())
+    )
+
+
+_NEGATIVE_TEXT_FIELDS: frozenset[tuple[str, str, str]] = frozenset(
+    {
+        (
+            "scrapy_extension.settings.base",
+            "Settings",
+            "queue_delay_max_held",
+        )
+    }
+)
+
+
+def _normalize_bundled_scalar(
+    settings_type: type[BaseSettings],
+    field_name: str,
+    annotation: object,
+    value: object,
+) -> object:
+    """Normalize one exact bundled scalar without Pydantic's permissive coercions."""
+    scalar = _scalar_annotation_kind(annotation)
+    if scalar is None:
+        return value
+    scalar_type, optional = scalar
+    if value is None and optional:
+        return None
+    if scalar_type is bool:
+        if type(value) is bool:
+            return value
+        if type(value) is str:
+            normalized = value.lower()
+            if normalized in {"true", "1"}:
+                return True
+            if normalized in {"false", "0"}:
+                return False
+    elif scalar_type is int:
+        if type(value) is int:
+            return value
+        if type(value) is str:
+            negative_allowed = (
+                settings_type.__module__,
+                settings_type.__qualname__,
+                field_name,
+            ) in _NEGATIVE_TEXT_FIELDS
+            if _canonical_unsigned_decimal(value) or (
+                negative_allowed and _canonical_negative_decimal(value)
+            ):
+                return int(value)
+    elif scalar_type is float:
+        if type(value) in (int, float):
+            normalized_float = float(cast("int | float", value))
+            if math.isfinite(normalized_float):
+                return normalized_float
+        elif type(value) is str and _canonical_float_text(value):
+            normalized_float = float(value)
+            if math.isfinite(normalized_float):
+                return normalized_float
+    if scalar_type is float:
+        raise ValueError("Bundled floating-point setting has an invalid value.")
+    raise ConfigurationError(
+        "Bundled scalar setting has an invalid value.",
+        setting_name=field_name,
+    )
 
 
 class RedactedBaseSettings(BaseSettings):
@@ -277,6 +390,31 @@ class RedactedBaseSettings(BaseSettings):
     This boundary rebuilds any Pydantic validation failure with verified field
     locations and ``input=None`` after the original handler exits.
     """
+
+    @model_validator(mode="before")
+    @classmethod
+    def _enforce_bundled_scalar_grammar(cls, values: object) -> object:
+        """Apply exact scalar coercion only to the package's bundled models."""
+        fields = _trusted_settings_fields(cls)
+        if fields is None or not isinstance(values, Mapping):
+            return values
+        normalized = dict(values)
+        for field_name, field in fields.items():
+            if (
+                type(field_name) is str
+                and field_name in normalized
+                and not (
+                    cls.__module__ == "scrapy_extension.settings.memcached"
+                    and field_name in {"connect_timeout", "socket_timeout"}
+                )
+            ):
+                normalized[field_name] = _normalize_bundled_scalar(
+                    cls,
+                    field_name,
+                    getattr(field, "annotation", None),
+                    normalized[field_name],
+                )
+        return normalized
 
     def __init__(self, **values: Any) -> None:
         validation_error: ValidationError | None = None
