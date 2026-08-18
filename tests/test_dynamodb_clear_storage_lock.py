@@ -1,18 +1,4 @@
-"""U2: DynamoDB ``clear_storage`` must not hold ``_operation_lock`` across backoff.
-
-Defect (SPEC U2, 2026-07-23 post-hardening frontier): ``clear_storage`` acquired
-``_operation_lock`` and held it across the entire paginated scan +
-``_delete_batch_with_backoff`` loop. That same lock serializes
-``store``/``retrieve``/``delete``/``exists``/``ttl`` and ``disconnect`` -- so a
-throttled clear (``UnprocessedItems`` + full-jitter backoff sleep) froze the
-whole storage pipeline and stalled shutdown.
-
-Contract after fix (mirrors ``connectors.py`` release-lock-before-slow-work):
-the lock guards only the state reads (generation snapshot + each scan page);
-each ``_delete_batch_with_backoff`` call (the slow network I/O + ``time.sleep``)
-runs OUTSIDE the lock. A concurrent ``retrieve()`` must therefore complete
-promptly while the clear is parked in its backoff sleep.
-"""
+"""DynamoDB ``clear_storage`` is a complete operation boundary."""
 
 from __future__ import annotations
 
@@ -58,31 +44,24 @@ def _join(thread: threading.Thread) -> None:
     assert not thread.is_alive()
 
 
-def test_concurrent_retrieve_is_not_blocked_by_throttled_clear_backoff(
-    mocker,
-) -> None:
-    """retrieve() must complete while clear_storage is parked in backoff sleep.
-
-    RED on current code: clear holds ``_operation_lock`` across the backoff
-    ``time.sleep``, so the concurrent retrieve blocks on the lock for the whole
-    sleep window. GREEN after fix: the lock is released around the slow
-    ``_delete_batch_with_backoff`` call, so retrieve slips through promptly.
-    """
-    backend, table, client = _connected(mocker)
+def _park_first_clear_in_backoff(
+    mocker, table: Any, client: Any
+) -> tuple[threading.Event, threading.Event]:
     request = _delete_request("clear-key")
-    # One scanned item; its first batch_write comes back Unprocessed, which drives
-    # _delete_batch_with_backoff into its full-jitter backoff sleep.
     table.scan.return_value = {"Items": [{"pk": "clear-key"}]}
-    client.batch_write_item.return_value = {
-        "UnprocessedItems": {_TABLE_NAME: [request]}
-    }
-    table.get_item.return_value = {}  # retrieve("other-key") -> missing -> None
+    responses = iter(
+        [
+            {"UnprocessedItems": {_TABLE_NAME: [request]}},
+            {"UnprocessedItems": {}},
+            {"UnprocessedItems": {}},
+        ]
+    )
+    client.batch_write_item.side_effect = lambda **_kwargs: next(responses)
     sleep_entered = threading.Event()
     sleep_release = threading.Event()
 
     def blocked_sleep(_delay: float) -> None:
         sleep_entered.set()
-        # Park the clear in its backoff sleep until the test releases it.
         assert sleep_release.wait(timeout=5)
 
     mocker.patch.object(
@@ -92,9 +71,53 @@ def test_concurrent_retrieve_is_not_blocked_by_throttled_clear_backoff(
         create=True,
     )
     mocker.patch.object(dynamodb_module.time, "sleep", side_effect=blocked_sleep)
+    return sleep_entered, sleep_release
 
+
+def test_concurrent_retrieve_waits_for_throttled_clear_boundary(mocker) -> None:
+    backend, table, client = _connected(mocker)
+    sleep_entered, sleep_release = _park_first_clear_in_backoff(mocker, table, client)
+    table.get_item.return_value = {}
     errors: list[BaseException] = []
     retrieve_results: list[object] = []
+
+    def run(target) -> None:
+        try:
+            target()
+        except BaseException as exc:
+            errors.append(exc)
+
+    clear_thread = threading.Thread(
+        target=lambda: run(backend.clear_storage), name="clear"
+    )
+    clear_thread.start()
+    assert sleep_entered.wait(timeout=5)
+
+    retrieve_thread = threading.Thread(
+        target=lambda: run(
+            lambda: retrieve_results.append(backend.retrieve("other-key"))
+        ),
+        name="retrieve",
+    )
+    retrieve_thread.start()
+    retrieve_thread.join(timeout=1)
+
+    assert retrieve_thread.is_alive()
+    table.get_item.assert_not_called()
+
+    sleep_release.set()
+    _join(clear_thread)
+    _join(retrieve_thread)
+
+    assert retrieve_results == [None]
+    assert errors == []
+    table.get_item.assert_called_once_with(Key={"pk": "other-key"}, ConsistentRead=True)
+
+
+def test_concurrent_clear_waits_for_throttled_clear_boundary(mocker) -> None:
+    backend, table, client = _connected(mocker)
+    sleep_entered, sleep_release = _park_first_clear_in_backoff(mocker, table, client)
+    errors: list[BaseException] = []
 
     def run_clear() -> None:
         try:
@@ -102,35 +125,21 @@ def test_concurrent_retrieve_is_not_blocked_by_throttled_clear_backoff(
         except BaseException as exc:
             errors.append(exc)
 
-    clear_thread = threading.Thread(target=run_clear, name="clear")
-    clear_thread.start()
-    # Wait until the clear is parked in its backoff sleep (holding the lock on the
-    # old code; not holding it after the fix).
+    first = threading.Thread(target=run_clear, name="clear-1")
+    first.start()
     assert sleep_entered.wait(timeout=5)
 
-    def run_retrieve() -> None:
-        try:
-            retrieve_results.append(backend.retrieve("other-key"))
-        except BaseException as exc:
-            errors.append(exc)
+    second = threading.Thread(target=run_clear, name="clear-2")
+    second.start()
+    second.join(timeout=1)
 
-    retrieve_thread = threading.Thread(target=run_retrieve, name="retrieve")
-    retrieve_thread.start()
-    # Short deadline: a mocked get_item is microseconds; if retrieve is still
-    # alive after this window it is blocked on _operation_lock.
-    retrieve_thread.join(timeout=1.0)
-    retrieve_blocked = retrieve_thread.is_alive()
+    assert second.is_alive()
+    assert table.scan.call_count == 1
 
-    # Release the clear so both threads can finish cleanly before assertions.
-    client.batch_write_item.return_value = {"UnprocessedItems": {}}
     sleep_release.set()
-    _join(clear_thread)
-    _join(retrieve_thread)
+    _join(first)
+    _join(second)
 
-    assert not retrieve_blocked, (
-        "retrieve() was blocked while clear_storage was parked in its backoff "
-        "sleep -- _operation_lock is still held across the slow batch_write"
-    )
-    assert retrieve_results == [None]
     assert errors == []
-    table.get_item.assert_called_once_with(Key={"pk": "other-key"}, ConsistentRead=True)
+    assert table.scan.call_count == 2
+    assert client.batch_write_item.call_count == 3

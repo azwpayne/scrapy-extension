@@ -877,21 +877,15 @@ def test_lazy_ttl_reap_stays_on_issuing_generation(
     assert factory.call_count == 2
 
 
-def test_paginated_clear_pins_batches_to_issuing_generation_and_aborts_on_rollover(
-    mocker,
-) -> None:
-    # U2: clear_storage snapshots the issuing generation under the lock and
-    # references only that snapshot for every batch_write (never
-    # self._generation), so a mid-clear disconnect/reconnect cannot mix a stale
-    # scan with a fresh table. The slow batch_write runs OUTSIDE the lock; a
-    # rollover that publishes a new generation mid-batch is detected on the next
-    # epoch re-validation and the clear aborts gracefully without ever touching
-    # the fresh table.
+def test_paginated_clear_drains_before_generation_rollover(mocker) -> None:
     backend = _backend(table_name="table-a")
     resource_a, table_a = _resource(mocker)
     resource_b, table_b = _resource(mocker)
     _, factory = _patch_resource(mocker, side_effect=[resource_a, resource_b])
     backend.connect()
+    observed_lock = _ObservedRLock()
+    rollover_attempted = observed_lock.observe("rollover")
+    backend._operation_lock = observed_lock
     batch_entered = threading.Event()
     batch_release = threading.Event()
 
@@ -900,12 +894,14 @@ def test_paginated_clear_pins_batches_to_issuing_generation_and_aborts_on_rollov
         assert batch_release.wait(timeout=5)
         return {"UnprocessedItems": {}}
 
-    # The in-flight page-1 batch is pinned to the issuing generation's client.
     resource_a.meta.client.batch_write_item.side_effect = blocked_batch_write
-    table_a.scan.return_value = {
-        "Items": [{"pk": "first"}],
-        "LastEvaluatedKey": {"pk": "first"},
-    }
+    table_a.scan.side_effect = [
+        {
+            "Items": [{"pk": "first"}],
+            "LastEvaluatedKey": {"pk": "first"},
+        },
+        {"Items": [{"pk": "second"}]},
+    ]
     errors: list[BaseException] = []
     clear_thread = _thread_call(backend.clear_storage, errors, name="clear")
     assert batch_entered.wait(timeout=5)
@@ -916,27 +912,28 @@ def test_paginated_clear_pins_batches_to_issuing_generation_and_aborts_on_rollov
         backend.connect()
 
     rollover_thread = _thread_call(rollover, errors, name="rollover")
-    rollover_thread.join(timeout=5)
-    rolled_over = not rollover_thread.is_alive()
-    # While the clear's batch_write is parked (lock released), the rollover has
-    # already published table-b. The clear's in-flight batch must still target
-    # table-a exclusively -- no cross-generation mixing.
-    b_batches_while_clear_inflight = resource_b.meta.client.batch_write_item.call_count
+    assert rollover_attempted.wait(timeout=5)
+    rollover_thread.join(timeout=1)
+
+    assert rollover_thread.is_alive()
+    assert factory.call_count == 1
+    resource_a.meta.client.close.assert_not_called()
+
     batch_release.set()
     _join(clear_thread)
+    _join(rollover_thread)
 
-    assert rolled_over
-    assert b_batches_while_clear_inflight == 0
     assert errors == []
-    # The completed batch used resource_a's client / table-a name only.
     assert [
         call.kwargs["RequestItems"]
         for call in resource_a.meta.client.batch_write_item.call_args_list
-    ] == [{"table-a": [{"DeleteRequest": {"Key": {"pk": "first"}}}]}]
-    resource_b.meta.client.batch_write_item.assert_not_called()
-    # The clear re-validated the epoch after the batch and aborted page 2.
-    assert table_a.scan.call_count == 1
-    table_b.scan.assert_not_called()
-    table_b.batch_writer.assert_not_called()
-    assert factory.call_count == 2
+    ] == [
+        {"table-a": [{"DeleteRequest": {"Key": {"pk": "first"}}}]},
+        {"table-a": [{"DeleteRequest": {"Key": {"pk": "second"}}}]},
+    ]
+    assert table_a.scan.call_count == 2
     resource_a.meta.client.close.assert_called_once_with()
+    resource_b.meta.client.batch_write_item.assert_not_called()
+    table_b.scan.assert_not_called()
+    assert factory.call_count == 2
+    assert backend.is_connected() is True
