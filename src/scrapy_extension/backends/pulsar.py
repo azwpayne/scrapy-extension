@@ -708,21 +708,22 @@ class PulsarBackend(Backend, QueueBackend):
                     self._lifecycle_generation += 1
                     handles = [*consumers.values(), *producers.values(), client]
 
-        close_errors, close_timeout_count = self._run_bounded_close_tasks(*handles)
+        teardown_deadline = monotonic() + max(0.0, self._receive_shutdown_timeout)
+        close_errors, close_timeout_count = self._run_bounded_close_tasks(
+            *handles, deadline=teardown_deadline
+        )
         # A driver close must never replace the connection failure currently being
         # handled. The normal failure path logs after this helper returns.
         cleanup_failure_count = len(close_errors) + close_timeout_count
         for retirement in abort_retirements:
-            if not retirement.completed.wait(
-                max(0.0, self._receive_shutdown_timeout)
-            ):
+            if not retirement.completed.wait(max(0.0, teardown_deadline - monotonic())):
                 cleanup_failure_count += 1
                 self._log_close_shutdown_timeout()
         for pump in pumps:
             worker = pump.worker
             if worker is not None and worker is not current_thread():
                 try:
-                    worker.join(self._receive_shutdown_timeout)
+                    worker.join(max(0.0, teardown_deadline - monotonic()))
                     if worker.is_alive():
                         self._log_receive_shutdown_timeout()
                 except BaseException:
@@ -780,15 +781,19 @@ class PulsarBackend(Backend, QueueBackend):
         handles = [*consumers.values(), *producers.values()]
         if client is not None:
             handles.append(client)
+        # Detached handle closes, topic retirements, and receive-pump joins spend
+        # one teardown budget. Multiple stuck topics cannot multiply the configured
+        # shutdown timeout.
+        teardown_deadline = monotonic() + max(0.0, self._receive_shutdown_timeout)
         close_error: BaseException | None = None
         try:
             # Consumers are first so close() interrupts any blocked sync receive.
-            self._close_detached_handles(*handles)
+            self._close_detached_handles(*handles, deadline=teardown_deadline)
         except BaseException as error:
             close_error = error
 
         for retirement in disconnect_retirements:
-            if not retirement.completed.wait(max(0.0, self._receive_shutdown_timeout)):
+            if not retirement.completed.wait(max(0.0, teardown_deadline - monotonic())):
                 self._log_close_shutdown_timeout()
 
         join_error: BaseException | None = None
@@ -796,7 +801,7 @@ class PulsarBackend(Backend, QueueBackend):
             worker = pump.worker
             if worker is not None and worker is not current_thread():
                 try:
-                    worker.join(self._receive_shutdown_timeout)
+                    worker.join(max(0.0, teardown_deadline - monotonic()))
                     if worker.is_alive():
                         self._log_receive_shutdown_timeout()
                 except BaseException as error:
@@ -852,7 +857,7 @@ class PulsarBackend(Backend, QueueBackend):
             pass
 
     def _run_bounded_close_tasks(
-        self, *handles: Any
+        self, *handles: Any, deadline: float | None = None
     ) -> tuple[list[BaseException], int]:
         """Close detached SDK handles concurrently within one finite join budget.
 
@@ -884,7 +889,8 @@ class PulsarBackend(Backend, QueueBackend):
             else:
                 started.append(task)
 
-        deadline = monotonic() + max(0.0, self._receive_shutdown_timeout)
+        if deadline is None:
+            deadline = monotonic() + max(0.0, self._receive_shutdown_timeout)
         for task in started:
             close_worker = task.worker
             if close_worker is None:
@@ -907,9 +913,13 @@ class PulsarBackend(Backend, QueueBackend):
             self._log_close_shutdown_timeout()
         return errors, timeout_count
 
-    def _close_detached_handles(self, *handles: Any) -> None:
+    def _close_detached_handles(
+        self, *handles: Any, deadline: float | None = None
+    ) -> None:
         """Close every detached handle, retaining the first control exception."""
-        errors, _timeout_count = self._run_bounded_close_tasks(*handles)
+        errors, _timeout_count = self._run_bounded_close_tasks(
+            *handles, deadline=deadline
+        )
         primary_error: BaseException | None = None
         for error in errors:
             if isinstance(error, Exception):

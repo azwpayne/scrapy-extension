@@ -978,6 +978,55 @@ def test_disconnect_is_bounded_when_sdk_close_never_returns(mocker: Any) -> None
     assert backend._consumers == {}
 
 
+@pytest.mark.parametrize(
+    "teardown",
+    ["disconnect", "failed-connect-abort"],
+)
+def test_multi_topic_stuck_teardown_shares_one_deadline(
+    mocker: Any, teardown: str
+) -> None:
+    """Three stuck retirements and pump joins spend one shutdown timeout."""
+    release_close = Event()
+    close_started = [Event(), Event(), Event()]
+    consumers = [_ControllableConsumer() for _ in close_started]
+    for index, consumer in enumerate(consumers):
+        real_close = consumer.close
+
+        def blocked_close(index: int = index, real_close: Any = real_close) -> None:
+            close_started[index].set()
+            release_close.wait(timeout=2.0)
+            real_close()
+
+        consumer.close = blocked_close  # type: ignore[method-assign]
+
+    backend = _connected_backend(mocker, consumers)
+    backend._receive_shutdown_timeout = 0.1
+    pumps = []
+    for index, consumer in enumerate(consumers):
+        assert backend.pop(f"shared-deadline-{index}", timeout=0) is None
+        pumps.append(backend._receive_pumps[f"scrapy-shared-deadline-{index}"])
+        assert consumer.receive_started.wait(timeout=0.5)
+
+    started = monotonic()
+    if teardown == "disconnect":
+        backend.disconnect()
+    else:
+        client = backend._client
+        generation = backend._lifecycle_generation
+        backend._abort_failed_connect(client, generation)
+    elapsed = monotonic() - started
+
+    assert elapsed >= 0.07
+    assert elapsed < 0.25
+    assert all(event.is_set() for event in close_started)
+    assert backend._client is None
+    assert len(backend._consumer_retirements) == 3
+
+    release_close.set()
+    assert all(pump.stopped.wait(timeout=0.5) for pump in pumps)
+    assert _wait_until(lambda: backend._consumer_retirements == {})
+
+
 def test_disconnect_drops_unreturned_buffer_and_reconnect_fences_generation(
     mocker: Any,
 ) -> None:
