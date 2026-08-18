@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import math
 
 import pytest
@@ -110,6 +111,52 @@ class TestBloomMembershipFilterSizing:
 
         with pytest.raises(ValueError, match=r"2 bytes.*1-byte memory budget"):
             BloomMembershipFilter(capacity=1, error_rate=0.0442)
+
+    def test_high_error_capacity_can_exceed_budget_bits(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A high target FPR can need fewer vector bits than item slots."""
+        monkeypatch.setattr(bloom_filter_module, "_MAX_FILTER_BYTES", 1)
+
+        flt = BloomMembershipFilter(capacity=8, error_rate=0.9)
+
+        assert flt.num_bits == 4
+        assert len(flt._bits) == 1
+
+    def test_real_budget_accepts_large_high_error_capacity(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Sizing above max_bits remains valid when its vector fits 128 MiB."""
+        requested_sizes: list[int] = []
+
+        def record_allocation(size: int) -> bytearray:
+            requested_sizes.append(size)
+            return builtins.bytearray()
+
+        monkeypatch.setattr(
+            bloom_filter_module, "bytearray", record_allocation, raising=False
+        )
+        max_bits = bloom_filter_module._MAX_FILTER_BYTES * 8
+
+        flt = BloomMembershipFilter(capacity=2 * max_bits, error_rate=0.9)
+
+        expected_bytes = (flt.num_bits + 7) >> 3
+        assert requested_sizes == [expected_bytes]
+        assert bloom_filter_module._MAX_FILTER_BYTES // 2 < expected_bytes
+        assert expected_bytes <= bloom_filter_module._MAX_FILTER_BYTES
+
+    def test_hostile_huge_capacity_is_rejected_before_allocation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def fail_allocation(_size: int) -> bytearray:
+            raise AssertionError("bytearray allocation was attempted")
+
+        monkeypatch.setattr(
+            bloom_filter_module, "bytearray", fail_allocation, raising=False
+        )
+
+        with pytest.raises(ValueError, match="memory budget"):
+            BloomMembershipFilter(capacity=10**100_000, error_rate=0.9)
 
     @pytest.mark.parametrize(
         ("capacity", "error_rate"), [(1, 0.9), (2, 0.5), (3, 0.1), (20, 0.01)]

@@ -81,11 +81,21 @@ class BloomMembershipFilter(MembershipFilter):
         # Capping k does not relax the requested bound: m grows as necessary.
         k = min(_MAX_HASHES, max(1, round(-math.log2(error_rate))))
         max_bits = _MAX_FILTER_BYTES * 8
-        # Every viable vector has m > n. This cheap integer-only check handles
-        # arbitrarily large Python ints without first converting them to float.
-        if capacity >= max_bits:
-            self._raise_allocation_error(capacity + 1)
         target_root = math.exp(math.log(error_rate) / k)
+
+        # Bound capacity before any operation could coerce a hostile-size int to
+        # float. For every m <= max_bits,
+        #
+        #   (1 - k/m) ** n <= exp(-k*n/max_bits).
+        #
+        # Consequently no vector within the budget can meet the target once n
+        # exceeds -max_bits*log(1 - p**(1/k))/k. Round that multiplier up and
+        # add one whole max_bits interval so floating-point rounding can only
+        # make this precheck more permissive, never reject a viable vector.
+        capacity_intervals = math.ceil(-math.log1p(-target_root) / k) + 1
+        if capacity > max_bits * capacity_intervals:
+            self._raise_allocation_error(max_bits + 1)
+
         denominator = -math.expm1(math.log1p(-target_root) / capacity)
         m = max(k + 1, math.ceil(k / denominator))
         self._check_allocation(m)
