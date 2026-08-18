@@ -273,6 +273,9 @@ addopts = [
     "--tb=short",
     "--disable-socket",
 ]
+strict_markers = true
+timeout = 60
+timeout_method = "thread"
 filterwarnings = [
     "error::UserWarning", # 将警告视为错误
     # Remote plaintext compatibility warnings are exercised explicitly in
@@ -291,16 +294,13 @@ filterwarnings = [
     "ignore::DeprecationWarning:pkg_resources.*",
 ]
 markers = [
-    "unit: 纯单元测试（无IO，<10ms）",
-    "integration: 集成测试（含数据库/HTTP）",
-    "e2e: 端到端测试（完整用户流程）",
-    "slow: 执行时间>1s的测试",
-    "flaky: 已知不稳定的测试（需重试）",
-    "security: 安全相关测试",
-    "mutation: 变异测试筛选",
-    "benchmark: 性能基准测试",
-    "snapshot: 快照测试",
-    "property: Hypothesis属性测试",
+    # `unit` and `e2e` are descriptive labels on selected contracts, not
+    # complete tiers. CI selects the complete broker tier by integration mark
+    # and treats everything else as the socket-blocked default suite.
+    "unit: descriptive label on selected isolated tests; not a complete tier",
+    "integration: complete live-broker tier under tests/integration",
+    "e2e: descriptive label on selected end-to-end contracts; not a complete tier",
+    "benchmark: opt-in pytest-benchmark measurements",
 ]
 [tool.coverage.run]
 source = ["src"]
@@ -317,7 +317,9 @@ concurrency = ["thread", "multiprocessing"]
 
 [tool.coverage.report]
 precision = 2
-fail_under = 95
+# CI reads coverage.json and independently gates statement and branch rates;
+# coverage.py's combined percentage would hide which contract regressed.
+fail_under = 0
 exclude_lines = [
     "pragma: no cover",
     "def __repr__",

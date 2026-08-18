@@ -1053,14 +1053,15 @@ uv run pytest
 # Run specific backend tests
 uv run pytest tests/test_mongodb_backend.py
 
-# Run with coverage report
-uv run pytest --cov=scrapy_extension --cov-report=term-missing
+# Run with the same machine-readable coverage data used by CI
+uv run pytest --cov=scrapy_extension --cov-report=term-missing \
+  --cov-report=json:coverage.json
 
 # Run full matrix (all Python versions)
 uv run poe test
 ```
 
-Test infrastructure includes pytest-xdist (parallel), pytest-randomly (randomized order), pytest-mock, pytest-cov (coverage with `fail_under = 95`), and pytest-socket (unit tests run with sockets disabled by default). Ruff, strict Mypy, and Bandit run as direct read-only gates through `uv run poe check`, rather than as pytest plugins. Live integration tests require `SCRAPY_TEST_INTEGRATION=1`, the applicable backend environment variables, and `--force-enable-socket`.
+Test infrastructure includes pytest-xdist (parallel), pytest-randomly (randomized order), pytest-mock, pytest-cov, pytest-timeout, and pytest-socket (the default suite runs with sockets disabled). CI emits `coverage.json` and independently requires at least 95% statement coverage and 91% branch coverage; it does not report a misleading blended floor. Ruff, strict Mypy, and Bandit run as direct read-only gates through `uv run poe check`, rather than as pytest plugins. Live integration tests require `SCRAPY_TEST_INTEGRATION=1`, the applicable backend environment variables, and `--force-enable-socket`.
 
 ## License
 

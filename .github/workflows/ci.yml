@@ -247,11 +247,27 @@ jobs:
           assert all(getattr(scrapy_extension, name) for name in optional_exports)
           PY
           done
-      - name: Unit tests with coverage (integration deselected)
+      - name: Unit tests with statement and branch coverage (integration deselected)
         if: matrix.python-version == '3.10'
-        run: >
-          uv run --no-sync pytest -m "not integration" --tb=short -q
-          --cov=scrapy_extension --cov-report=term-missing
+        shell: bash
+        run: |
+          uv run --no-sync pytest -m "not integration" --tb=short -q \
+            --cov=scrapy_extension --cov-report=term-missing \
+            --cov-report=json:coverage.json
+          uv run --no-sync python - <<'PY'
+          import json
+          from pathlib import Path
+
+          totals = json.loads(Path("coverage.json").read_text(encoding="utf-8"))["totals"]
+          statement_rate = 100 * totals["covered_lines"] / totals["num_statements"]
+          branch_rate = 100 * totals["covered_branches"] / totals["num_branches"]
+          statement_floor = 95.0
+          branch_floor = 91.0
+          print(f"statement coverage: {statement_rate:.2f}% (floor {statement_floor:.2f}%)")
+          print(f"branch coverage: {branch_rate:.2f}% (floor {branch_floor:.2f}%)")
+          assert statement_rate >= statement_floor, "statement coverage floor failed"
+          assert branch_rate >= branch_floor, "branch coverage floor failed"
+          PY
       - name: Unit tests (integration deselected)
         if: matrix.python-version != '3.10'
         run: uv run --no-sync pytest -m "not integration" --tb=short -q

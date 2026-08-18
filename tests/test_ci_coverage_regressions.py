@@ -180,6 +180,33 @@ def test_ci_smoke_installs_and_imports_both_release_artifacts() -> None:
     assert "--no-deps" not in smoke_block.split("- name:", 1)[0]
 
 
+def test_ci_gates_statement_and_branch_coverage_independently() -> None:
+    """Coverage JSON must expose an honest branch floor, not one blended total."""
+    repository_root = Path(__file__).resolve().parents[1]
+    workflow = yaml.safe_load(
+        (repository_root / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    coverage_step = next(
+        step
+        for step in workflow["jobs"]["unit-tests"]["steps"]
+        if step.get("name")
+        == "Unit tests with statement and branch coverage (integration deselected)"
+    )
+    run = coverage_step["run"]
+
+    assert "--cov-report=json:coverage.json" in run
+    assert 'totals["covered_lines"] / totals["num_statements"]' in run
+    assert 'totals["covered_branches"] / totals["num_branches"]' in run
+    assert "statement_floor = 95.0" in run
+    assert "branch_floor = 91.0" in run
+
+    with (repository_root / "pyproject.toml").open("rb") as stream:
+        pyproject = tomllib.load(stream)
+    assert pyproject["tool"]["coverage"]["report"]["fail_under"] == 0
+
+
 def test_ci_artifact_smoke_installs_all_extras_and_root_exports() -> None:
     """R45: every release artifact must prove its optional surface installs."""
     workflow = (

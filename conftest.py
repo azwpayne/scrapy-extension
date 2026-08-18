@@ -61,6 +61,13 @@ def pytest_collection_modifyitems(
     # consistent contract.
     import os
 
+    integration_items = [item for item in items if "integration" in item.keywords]
+    # Live SDK calls and cold broker startup need more headroom than the
+    # socket-blocked default suite, while remaining bounded. The item marker
+    # explicitly overrides pytest-timeout's repository default.
+    for item in integration_items:
+        item.add_marker(pytest.mark.timeout(120))
+
     if not os.environ.get("SCRAPY_TEST_INTEGRATION"):
         skip_integration = pytest.mark.skip(
             reason=(
@@ -68,6 +75,5 @@ def pytest_collection_modifyitems(
                 "per-backend SCRAPY_TEST_<BACKEND>_URL) to run tests/integration/*"
             ),
         )
-        for item in items:
-            if "integration" in item.keywords:
-                item.add_marker(skip_integration)
+        for item in integration_items:
+            item.add_marker(skip_integration)
