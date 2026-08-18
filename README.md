@@ -710,9 +710,9 @@ Three strategy layers sit above the backend interfaces, selected via Scrapy sett
 | `set` (default) | yes | yes | yes | `SetBackend`-backed; byte-identical to prior behavior |
 | `memory` | yes | no | yes | in-process, optional LRU cap (`SCRAPY_DEDUP_MEMORY_MAXSIZE`) |
 | `bloom` | no (FP) | no | no | pure-stdlib bit-vector; `SCRAPY_DEDUP_BLOOM_CAPACITY` / `_ERROR_RATE` |
-| `cuckoo` | no (FP) | no | yes | pure-stdlib; `SCRAPY_DEDUP_CUCKOO_CAPACITY` / `_ERROR_RATE` |
+| `cuckoo` | no (FP) | no | no (clear only) | pure-stdlib; `SCRAPY_DEDUP_CUCKOO_CAPACITY` / `_ERROR_RATE` |
 
-Probabilistic filters never produce false negatives; in-memory filters are per-process (single-worker). Use `set` for multi-worker exact dedup.
+Probabilistic filters never produce false negatives; in-memory filters are per-process (single-worker). Use `set` for multi-worker exact dedup. If item-level removal is required, choose the exact `memory` or `set` strategy; Cuckoo supports only `clear()` for a whole-filter reset.
 
 The default `set` strategy requires a set-capable backend. Queue-only backends
 can use a local `memory`, `bloom`, or `cuckoo` filter, but those filters do not

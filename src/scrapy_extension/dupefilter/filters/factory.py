@@ -40,8 +40,8 @@ class DedupeStrategy(str, Enum):
     Attributes:
         SET: Exact, cross-worker, backend-backed (default).
         MEMORY: Exact, in-process, optional LRU cap.
-        BLOOM: Probabilistic, in-process, no deletion.
-        CUCKOO: Probabilistic, in-process, supports deletion.
+        BLOOM: Probabilistic, in-process, no item removal.
+        CUCKOO: Probabilistic, in-process, no item removal; clear only.
     """
 
     SET = "set"

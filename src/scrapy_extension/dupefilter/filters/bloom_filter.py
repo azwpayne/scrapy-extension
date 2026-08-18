@@ -1,9 +1,10 @@
 """Stdlib Bloom-filter membership strategy (subsystem ①).
 
 Probabilistic, in-process, space-efficient. Never produces false negatives;
-false-positive rate is bounded by ``error_rate`` at ``capacity`` items. Does
-not support deletion — use the cuckoo strategy for that. State is per-process,
-not shared across workers.
+false-positive rate is bounded by ``error_rate`` at ``capacity`` items. Neither
+Bloom nor Cuckoo supports item-level removal; use the exact memory or set
+strategy when that is required. Cuckoo supports only a whole-filter ``clear()``.
+State is per-process, not shared across workers.
 """
 
 from __future__ import annotations

@@ -24,7 +24,10 @@ required.
 | `set` (default) | Exact cross-worker stored membership; crash-safe at-least-once enqueue. | — |
 | `memory` | Single-worker, in-process, optional LRU cap. | `SCRAPY_DEDUP_MEMORY_MAXSIZE` (default 1,000,000) |
 | `bloom` | Single-worker, large cardinality, tolerates false positives. Never false-negatives. | `SCRAPY_DEDUP_BLOOM_CAPACITY`, `SCRAPY_DEDUP_BLOOM_ERROR_RATE` |
-| `cuckoo` | Single-worker, large cardinality, needs deletion. Never false-negatives. | `SCRAPY_DEDUP_CUCKOO_CAPACITY`, `SCRAPY_DEDUP_CUCKOO_ERROR_RATE` |
+| `cuckoo` | Single-worker, large cardinality, tolerates false positives; whole-filter clear only. Never false-negatives. | `SCRAPY_DEDUP_CUCKOO_CAPACITY`, `SCRAPY_DEDUP_CUCKOO_ERROR_RATE` |
+
+If item-level removal is required, choose the exact `memory` or `set` strategy.
+Cuckoo supports only `clear()` for a whole-filter reset.
 
 ```python
 # settings.py
