@@ -337,6 +337,41 @@ class TestBackendPipelineFromCrawler:
         with pytest.raises(RuntimeError, match="has no spider"):
             pipeline.open_spider()
 
+    def test_factory_rollback_forces_manager_release_after_strategy_failure(
+        self, mocker
+    ) -> None:
+        """A crawler factory failure owns no durable items and cannot leak its acquire."""
+        manager = mocker.MagicMock()
+        strategy = mocker.MagicMock()
+        pipeline = BackendPipeline(
+            connection_manager=manager,
+            storage_strategy=strategy,
+        )
+        original_marker = "crawler-wiring-private-marker"
+        strategy_marker = "strategy-cleanup-private-marker"
+        manager_marker = "manager-cleanup-private-marker"
+        original_error = KeyboardInterrupt(original_marker)
+        manager.set_monitor.side_effect = original_error
+        strategy.close.side_effect = RuntimeError(strategy_marker)
+        manager.close.side_effect = RuntimeError(manager_marker)
+        mocker.patch.object(BackendPipeline, "from_settings", return_value=pipeline)
+        crawler = mocker.MagicMock()
+
+        with _capture_diagnostics(
+            "scrapy_extension.pipeline.pipeline",
+            level=logging.ERROR,
+        ) as handler:
+            with pytest.raises(KeyboardInterrupt) as exc_info:
+                BackendPipeline.from_crawler(crawler)
+
+        assert exc_info.value is original_error
+        for marker in (original_marker, strategy_marker, manager_marker):
+            _assert_handler_records_are_redacted(handler, marker)
+        strategy.close.assert_called_once_with()
+        manager.close.assert_called_once_with()
+        assert pipeline._closed is True
+        assert pipeline._manager_released is True
+
 
 class TestBackendPipelineOpenSpider:
     """Test BackendPipeline.open_spider method."""
@@ -649,39 +684,33 @@ class TestBackendPipelineCloseSpider:
         assert pipeline._closed is True
         assert pipeline._manager_released is True
 
-    def test_close_spider_releases_connection_on_flush_failure(
+    def test_close_spider_strategy_failure_is_retryable_before_manager_release(
         self, mock_connection_manager, mocker
     ):
-        """Teardown invariant: connection_manager.close() runs even when the final flush raises."""
-        pipeline = BackendPipeline(connection_manager=mock_connection_manager)
-        pipeline.storage_strategy = mocker.Mock()
-        pipeline.storage_strategy.close.side_effect = RuntimeError("flush failed")
+        """A failed durability barrier retains manager ownership for one retry."""
+        strategy = mocker.Mock()
+        strategy.close.side_effect = [RuntimeError("flush failed"), None]
+        pipeline = BackendPipeline(
+            connection_manager=mock_connection_manager,
+            storage_strategy=strategy,
+        )
         mock_spider = mocker.Mock()
         mock_spider.name = "test_spider"
 
         with pytest.raises(RuntimeError, match="flush failed"):
             pipeline.close_spider(mock_spider)
 
+        assert pipeline._closed is False
+        assert pipeline._manager_released is False
+        mock_connection_manager.close.assert_not_called()
+
+        pipeline.close_spider(mock_spider)
+        pipeline.close_spider(mock_spider)
+
+        assert strategy.close.call_count == 2
         mock_connection_manager.close.assert_called_once_with()
-
-    def test_close_spider_flush_error_not_masked_by_connection_close(
-        self, mock_connection_manager, mocker, caplog
-    ):
-        """If both close() calls raise, the original flush error propagates; the connection-close error is logged, not swallowed."""
-        import logging
-
-        pipeline = BackendPipeline(connection_manager=mock_connection_manager)
-        pipeline.storage_strategy = mocker.Mock()
-        pipeline.storage_strategy.close.side_effect = RuntimeError("flush failed")
-        mock_connection_manager.close.side_effect = ConnectionError("close failed")
-        mock_spider = mocker.Mock()
-        mock_spider.name = "test_spider"
-
-        with caplog.at_level(logging.ERROR):
-            with pytest.raises(RuntimeError, match="flush failed"):
-                pipeline.close_spider(mock_spider)
-
-        assert "connection_manager.close() failed" in caplog.text
+        assert pipeline._closed is True
+        assert pipeline._manager_released is True
 
     def test_duplicate_close_closes_strategy_and_manager_once(
         self, mock_connection_manager, mocker
@@ -1984,15 +2013,7 @@ class TestBackendPipelineCloseBaseException:
     def test_close_locked_reraises_baseexception_when_no_primary_error(
         self, mocker
     ) -> None:
-        """A Ctrl+C during connection_manager.close() (after the strategy flush
-        succeeded) must propagate, not be swallowed.
-
-        Pre-R20-B the manager close was wrapped in 'except BaseException:
-        logger.exception(...)' with no raise, so a KeyboardInterrupt during the
-        blocking backend disconnect was silently discarded — the operator could not
-        break a hung shutdown. Mirror the dupefilter primary_error pattern: when
-        manager close is the ONLY failure, re-raise it.
-        """
+        """An uncertain manager release is terminal and never decremented twice."""
         manager = mocker.MagicMock()
         manager.close.side_effect = KeyboardInterrupt
         strategy = mocker.MagicMock()  # close() is a no-op (succeeds)
@@ -2003,14 +2024,17 @@ class TestBackendPipelineCloseBaseException:
         with pytest.raises(KeyboardInterrupt):
             pipeline._close_locked()
 
+        pipeline._close_locked()
+
         strategy.close.assert_called_once()
         manager.close.assert_called_once()
+        assert pipeline._closed is True
+        assert pipeline._manager_released is True
 
-    def test_close_locked_preserves_strategy_error_over_manager_baseexception(
+    def test_close_locked_strategy_error_defers_manager_baseexception(
         self, mocker
     ) -> None:
-        """A strategy close error is the primary_error; a BaseException from the
-        later manager close must not mask it."""
+        """A failed strategy barrier must not enter manager teardown."""
         manager = mocker.MagicMock()
         manager.close.side_effect = SystemExit
         strategy = mocker.MagicMock()
@@ -2019,55 +2043,13 @@ class TestBackendPipelineCloseBaseException:
             connection_manager=manager, storage_strategy=strategy
         )
 
-        # The strategy RuntimeError is the primary error; the manager SystemExit is logged, not raised.
         with pytest.raises(RuntimeError, match="flush failed"):
             pipeline._close_locked()
 
         strategy.close.assert_called_once()
-        manager.close.assert_called_once()
-
-    def test_close_locked_secondary_manager_diagnostic_has_no_active_exception(
-        self, mocker
-    ) -> None:
-        """A handler cannot recover the secondary teardown failure.
-
-        The primary strategy failure must still win, and manager teardown must run
-        after it.  The distinct markers ensure the logging record and handler
-        context expose neither failure from the secondary diagnostic path.
-        """
-        primary_marker = "round50-pipeline-primary-close-marker"
-        secondary_marker = "round50-pipeline-secondary-close-marker"
-        call_order: list[str] = []
-        manager = mocker.MagicMock()
-        strategy = mocker.MagicMock()
-
-        def fail_strategy_close() -> None:
-            call_order.append("strategy")
-            raise RuntimeError(primary_marker)
-
-        def fail_manager_close() -> None:
-            call_order.append("manager")
-            raise SystemExit(secondary_marker)
-
-        strategy.close.side_effect = fail_strategy_close
-        manager.close.side_effect = fail_manager_close
-        pipeline = BackendPipeline(
-            connection_manager=manager, storage_strategy=strategy
-        )
-
-        with _capture_diagnostics(
-            "scrapy_extension.pipeline.pipeline",
-            level=logging.ERROR,
-        ) as handler:
-            with pytest.raises(RuntimeError, match=primary_marker) as exc_info:
-                pipeline._close_locked()
-
-        assert str(exc_info.value) == primary_marker
-        assert call_order == ["strategy", "manager"]
-        _assert_handler_records_are_redacted(handler, secondary_marker)
-        assert all(
-            primary_marker not in record.getMessage() for record in handler.records
-        )
+        manager.close.assert_not_called()
+        assert pipeline._closed is False
+        assert pipeline._manager_released is False
 
 
 def test_from_crawler_wires_monitor_into_connection_manager(mocker) -> None:

@@ -277,7 +277,7 @@ class BatchedStorageStrategy(StorageStrategy):
         The exact backend from every ``store`` call travels with that entry through
         explicit, threshold, age, close, and retry drains. No-op when empty.
         """
-        self._flush()
+        self._flush(raise_on_lock_timeout=True)
 
     def close(self) -> None:
         """Flush remaining buffered items, then release resources.
@@ -316,7 +316,7 @@ class BatchedStorageStrategy(StorageStrategy):
                 try:
                     logger.warning(
                         "batched-storage-age-flush did not exit within %.1fs; "
-                        "buffered items may be lost",
+                        "close remains retryable",
                         _CLOSE_DRAIN_DEADLINE_S,
                     )
                 except BaseException:
@@ -351,11 +351,17 @@ class BatchedStorageStrategy(StorageStrategy):
             try:
                 logger.warning(
                     "batched-storage close drain lock not acquired within %.1fs; "
-                    "buffered items may be lost",
+                    "close remains retryable",
                     _CLOSE_DRAIN_DEADLINE_S,
                 )
             except BaseException:
                 pass
+            if primary_error is None:
+                primary_error = StorageError(
+                    _BATCHED_STORAGE_FLUSH_FAILURE_MESSAGE,
+                    operation="store",
+                    key=None,
+                )
         else:
             try:
                 try:
@@ -378,10 +384,22 @@ class BatchedStorageStrategy(StorageStrategy):
             finally:
                 self._flush_lock.release()
 
+        # Normal return is a durability barrier, not a best-effort attempt. Keep
+        # ``_closed`` and ``_stop`` asserted after failure to reject new admissions,
+        # while a later close() retries the unchanged tail and worker termination.
+        flusher = self._flusher
+        flusher_alive = flusher is not None and flusher.is_alive()
+        if primary_error is None and (self.pending != 0 or flusher_alive):
+            primary_error = StorageError(
+                _BATCHED_STORAGE_FLUSH_FAILURE_MESSAGE,
+                operation="store",
+                key=None,
+            )
+
         if primary_error is not None:
             raise primary_error
 
-    def _flush(self) -> None:
+    def _flush(self, *, raise_on_lock_timeout: bool = False) -> None:
         """Drain the buffer to each entry's backend in insertion order.
 
         At-least-once under partial failure: the buffer is snapshotted and cleared
@@ -401,27 +419,32 @@ class BatchedStorageStrategy(StorageStrategy):
 
         R22-B: the ``_flush_lock`` acquisition is *bounded* by
         ``_FLUSH_LOCK_TIMEOUT_S``. If the age-flusher (or any concurrent holder) is
-        wedged mid-``store()`` against an unresponsive backend, the public
-        :meth:`flush` path skips with a warning instead of blocking forever. The
-        close path has a distinct, longer ``_CLOSE_DRAIN_DEADLINE_S`` because it
-        must drain any tail left by a slow-but-healthy transaction before releasing
-        backend resources; it serializes that final drain directly rather than
-        weakening public flush's anti-hang bound.
+        wedged mid-``store()`` against an unresponsive backend, public
+        :meth:`flush` raises a fixed :class:`StorageError` instead of falsely
+        reporting success or blocking forever; pending work remains owned by the
+        strategy. Internal threshold/age attempts remain best-effort. The close path
+        has a distinct, longer ``_CLOSE_DRAIN_DEADLINE_S`` because it must drain any
+        tail left by a slow-but-healthy transaction before releasing backend
+        resources; it serializes that final drain directly.
         """
         acquired = self._flush_lock.acquire(timeout=_FLUSH_LOCK_TIMEOUT_S)
         if not acquired:
-            # The bounded-acquire result is already the public outcome. Logging this
-            # best-effort diagnostic must not turn a responsive skip into a failed
-            # flush when a custom logging handler raises, including control errors.
+            # Logging is diagnostic only: a handler failure cannot replace the fixed,
+            # typed public result or expose buffered key/value/backend details.
             try:
                 logger.warning(
-                    "batched-storage flush lock not acquired within %.1fs; skipping "
-                    "(a flush is in flight against an unresponsive backend — in-flight "
-                    "items may be lost)",
+                    "batched-storage flush lock not acquired within %.1fs; "
+                    "pending work retained",
                     _FLUSH_LOCK_TIMEOUT_S,
                 )
             except BaseException:
                 pass
+            if raise_on_lock_timeout:
+                raise StorageError(
+                    _BATCHED_STORAGE_FLUSH_FAILURE_MESSAGE,
+                    operation="store",
+                    key=None,
+                )
             return
         try:
             self._flush_serialized()

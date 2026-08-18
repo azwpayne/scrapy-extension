@@ -135,11 +135,13 @@ class TestBatchedStorageStrategy:
             SystemExit("logging exited"),
         ],
     )
-    def test_flush_lock_timeout_diagnostic_cannot_raise(
+    def test_flush_lock_timeout_raises_fixed_error_and_retains_pending(
         self, mocker, diagnostic_error: BaseException
     ) -> None:
-        """R120: a lock-timeout warning cannot change the skip-and-return result."""
+        """A public flush timeout is a typed failure, never false success."""
+        backend = mocker.Mock()
         strat = BatchedStorageStrategy()
+        strat.store(backend, "secret-key", b"secret-value")
         strat._flush_lock = mocker.Mock()
         strat._flush_lock.acquire.return_value = False
         warning = mocker.patch.object(
@@ -148,8 +150,15 @@ class TestBatchedStorageStrategy:
             side_effect=diagnostic_error,
         )
 
-        strat.flush()
+        with pytest.raises(StorageError) as exc_info:
+            strat.flush()
 
+        assert type(exc_info.value) is StorageError
+        assert str(exc_info.value) == "Batched storage flush failed."
+        assert exc_info.value.operation == "store"
+        assert exc_info.value.key is None
+        assert strat.pending == 1
+        backend.store.assert_not_called()
         strat._flush_lock.acquire.assert_called_once_with(
             timeout=batched_module._FLUSH_LOCK_TIMEOUT_S
         )
@@ -167,6 +176,84 @@ class TestBatchedStorageStrategy:
         backend = mocker.Mock()
         strat = BatchedStorageStrategy(threshold=1)
         strat.store(backend, "k1", b"v1")  # flush
+        strat.close()
+        assert backend.store.call_count == 1
+
+    def test_close_lock_timeout_retains_pending_for_later_retry(
+        self, monkeypatch, mocker
+    ) -> None:
+        monkeypatch.setattr(batched_module, "_CLOSE_DRAIN_DEADLINE_S", 0.01)
+        backend = mocker.Mock()
+        strat = BatchedStorageStrategy(threshold=100)
+        strat.store(backend, "k1", b"v1")
+        strat._flush_lock.acquire()
+
+        try:
+            with pytest.raises(StorageError, match="Batched storage flush failed"):
+                strat.close()
+        finally:
+            strat._flush_lock.release()
+
+        assert strat.pending == 1
+        backend.store.assert_not_called()
+
+        strat.close()
+
+        backend.store.assert_called_once_with("k1", b"v1", ttl=None)
+        assert strat.pending == 0
+
+    def test_close_backend_failure_retains_tail_for_later_retry(self, mocker) -> None:
+        backend = mocker.Mock()
+        backend.store.side_effect = [
+            RuntimeError("backend unavailable"),
+            RuntimeError("backend unavailable"),
+            None,
+            None,
+        ]
+        strat = BatchedStorageStrategy(threshold=100)
+        strat.store(backend, "k1", b"v1")
+        strat.store(backend, "k2", b"v2")
+
+        with pytest.raises(RuntimeError, match="backend unavailable"):
+            strat.close()
+
+        assert strat.pending == 2
+
+        strat.close()
+
+        assert [call.args[0] for call in backend.store.call_args_list] == [
+            "k1",
+            "k1",
+            "k1",
+            "k2",
+        ]
+        assert strat.pending == 0
+
+    def test_close_live_flusher_is_failure_until_later_retry(
+        self, monkeypatch, mocker
+    ) -> None:
+        monkeypatch.setattr(batched_module, "_CLOSE_DRAIN_DEADLINE_S", 0.01)
+        backend = mocker.Mock()
+        strat = BatchedStorageStrategy(threshold=100)
+        strat.store(backend, "k1", b"v1")
+        flusher_stopped = threading.Event()
+
+        class _StubFlusher:
+            def is_alive(self) -> bool:
+                return not flusher_stopped.is_set()
+
+            def join(self, timeout: float | None = None) -> None:
+                flusher_stopped.wait(timeout=timeout)
+
+        strat._flusher = _StubFlusher()
+
+        with pytest.raises(StorageError, match="Batched storage flush failed"):
+            strat.close()
+
+        assert strat.pending == 0
+        backend.store.assert_called_once_with("k1", b"v1", ttl=None)
+
+        flusher_stopped.set()
         strat.close()
         assert backend.store.call_count == 1
 
@@ -1594,10 +1681,10 @@ class TestBatchedStorageFlusherTOCTOU:
 
         Pre-fix, the post-join ``self.flush()`` re-entered ``with
         self._flush_lock:`` and blocked indefinitely — the 5s join timeout was
-        theater and ``close_spider`` hung until SIGKILL. The durable fix (option a)
-        bounds the ``_flush_lock`` acquisition itself, so both ``close()`` and the
-        public ``flush()`` skip-and-log instead of hanging. This pins that close()
-        returns within a bounded window while the flusher still holds the lock.
+        theater and ``close_spider`` hung until SIGKILL. The bounded acquisition
+        keeps close finite, but a timed-out durability barrier must raise rather
+        than report false success. This pins that close() fails within a bounded
+        window while retaining ownership for a later retry.
         """
         from scrapy_extension.storage.strategies import batched as batched_mod
 
@@ -1646,7 +1733,13 @@ class TestBatchedStorageFlusherTOCTOU:
                 "close() hung: the post-drain flush() blocked on _flush_lock held by "
                 "the wedged age-flusher instead of bounding the acquisition (R22-B/R23-A)"
             )
-            assert close_errors == []
+            assert len(close_errors) == 1
+            assert type(close_errors[0]) is StorageError
+            assert str(close_errors[0]) == "Batched storage flush failed."
         finally:
             release_store.set()
             close_thread.join(timeout=2.0)
+
+        strat.close()
+        assert strat.pending == 0
+        assert strat._flusher is not None and not strat._flusher.is_alive()

@@ -386,6 +386,7 @@ class BackendPipeline:
         """
         pipeline = cls.from_settings(crawler.settings)
         pipeline._crawler = crawler
+        factory_failure: BaseException | None = None
         try:
             # Default-on observability — mirrors the dupefilter wiring. Only override
             # when no explicit monitor was provided (operators passing a custom monitor
@@ -406,24 +407,31 @@ class BackendPipeline:
             # multi-backend deployments (queue≠storage). All component monitors wrap
             # the same crawler.stats, so counters aggregate across managers.
             pipeline.connection_manager.set_monitor(pipeline._monitor)
+        except BaseException as exc:
+            factory_failure = exc
+
+        if factory_failure is None:
             return pipeline
+
+        # The pipeline was never published and therefore admitted no durable work.
+        # Run rollback after the factory exception suite has unwound so cleanup and
+        # diagnostics cannot inspect or replace that original failure.
+        cleanup_failed = False
+        try:
+            pipeline._close_after_factory_failure()
         except BaseException:
-            try:
-                pipeline._close_after_factory_failure()
-            except BaseException:
-                try:
-                    logger.exception(
-                        "Failed to close pipeline after crawler factory failure"
-                    )
-                except BaseException:
-                    # Diagnostics must not replace the crawler factory failure.
-                    pass
-            raise
+            cleanup_failed = True
+        if cleanup_failed:
+            _emit_diagnostic(
+                logger.error,
+                "Failed to close pipeline after crawler factory failure",
+            )
+        raise factory_failure
 
     def _close_after_factory_failure(self) -> None:
-        """Close a constructed pipeline when ``from_crawler`` cannot return it."""
+        """Close an unpublished pipeline when ``from_crawler`` cannot return it."""
         with self._lifecycle_lock:
-            self._close_locked()
+            self._close_locked(force_manager_release=True)
 
     def _resolve_spider(self, spider: Spider | None) -> Spider:
         """Resolve old explicit-spider and new crawler-owned Scrapy calls."""
@@ -480,7 +488,9 @@ class BackendPipeline:
             if open_failure is not None:
                 cleanup_failed = False
                 try:
-                    self._close_locked()
+                    # No item can enter before open succeeds while this lock is held.
+                    # Force-release the manager even if strategy rollback is broken.
+                    self._close_locked(force_manager_release=True)
                 except BaseException:
                     cleanup_failed = True
                 if cleanup_failed:
@@ -533,55 +543,54 @@ class BackendPipeline:
                 # name only feeds the diagnostic log below; mirror the
                 # log-handler guard so a resolution failure cannot skip it.
                 spider = None
+            self._close_locked()
             try:
                 if spider is not None:
                     logger.info("Pipeline closed for spider %s", spider.name)
             except BaseException:
-                # This is diagnostic-only and runs before _close_locked() establishes
-                # the resource-release invariant.  A logging handler must therefore
-                # not be able to skip strategy draining or manager teardown.
+                # This is diagnostic-only and follows the durability barrier and
+                # manager release, so a handler cannot alter lifecycle state.
                 pass
-            self._close_locked()
 
-    def _close_locked(self) -> None:
-        """Release one pipeline lifecycle while ``_lifecycle_lock`` is held."""
+    def _close_locked(self, *, force_manager_release: bool = False) -> None:
+        """Release one pipeline lifecycle while ``_lifecycle_lock`` is held.
+
+        Normal close keeps manager ownership when strategy cleanup fails, allowing
+        a later call to retry the durability barrier. Unpublished open/factory
+        rollback has admitted no items, so ``force_manager_release`` prevents a
+        broken strategy cleanup from leaking the manager acquire.
+        """
         if self._closed:
             return
-        self._closed = True
-        self._opened = False
-        self._opened_spider = None
-        # R20-B: track the primary error so a BaseException from the manager close
-        # is never masked by the strategy error (and vice-versa), AND so a Ctrl+C /
-        # SystemExit during the (blocking) connection_manager.close() — when the
-        # strategy flush already succeeded — propagates instead of being swallowed.
-        # Mirror the dupefilter primary_error pattern (dupefilter.py, PR #63 sibling).
+
         primary_error: BaseException | None = None
-        secondary_manager_close_failed = False
         try:
             self.storage_strategy.close()
         except BaseException as exc:
+            if not force_manager_release:
+                # A normal close failure may retain an unchanged batched retry tail.
+                # Do not publish terminal state or release its backend capability.
+                raise
             primary_error = exc
-        finally:
-            # Teardown invariant: release the backend connection even if the final
-            # flush raised (batched partial-flush, backend error). Without this, a
-            # failed close leaks one socket/fd per spider-close-under-error on
-            # long-running Scrapyd deploys.
-            if not self._manager_released:
-                self._manager_released = True
-                try:
-                    self.connection_manager.close()
-                except BaseException as exc:
-                    # Never mask the strategy flush/open/factory error (primary_error).
-                    # When manager close is the only failure — including a Ctrl+C during a
-                    # hung disconnect — propagate it instead of swallowing.
-                    if primary_error is None:
-                        primary_error = exc
-                    else:
-                        # The primary strategy error wins, but wait until this ``except``
-                        # suite has exited before reporting the secondary manager failure.
-                        # A synchronous custom logging handler can otherwise inspect the
-                        # raw manager exception through ``sys.exc_info()``.
-                        secondary_manager_close_failed = True
+
+        # Either the durability barrier succeeded or this unpublished lifecycle is
+        # being forcibly rolled back. Manager release is now terminal. Mark the
+        # attempt before calling extension code because a BaseException may occur
+        # after its refcount was decremented; retrying would risk a double release.
+        self._closed = True
+        self._opened = False
+        self._opened_spider = None
+        secondary_manager_close_failed = False
+        if not self._manager_released:
+            self._manager_released = True
+            try:
+                self.connection_manager.close()
+            except BaseException as exc:
+                if primary_error is None:
+                    primary_error = exc
+                else:
+                    secondary_manager_close_failed = True
+
         if secondary_manager_close_failed:
             _emit_diagnostic(
                 logger.error,
