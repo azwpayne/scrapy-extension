@@ -29,6 +29,7 @@ import math
 import re
 import threading
 import time
+import warnings
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -63,7 +64,11 @@ from scrapy_extension.exceptions._redaction import (
     configuration_error_boundary,
     queue_operation_error_boundary,
 )
-from scrapy_extension.settings import SqsMode, SqsSettings
+from scrapy_extension.settings import (
+    SqsMode,
+    SqsQueueNameGeneration,
+    SqsSettings,
+)
 from scrapy_extension.settings._aws import (
     _AWS_SAFE_CONFIGURATION_MESSAGES,
     validate_aws_credentials,
@@ -77,6 +82,7 @@ _SQS_CONFIGURATION_SETTING_NAMES: frozenset[str] = frozenset(SqsSettings.model_f
 _SQS_SAFE_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
     {
         "Unsupported SQS mode.",
+        "Unsupported SQS queue-name generation.",
         "queue_name_prefix must be a string.",
         "visibility_timeout must be an integer between 1 and 43200.",
     }
@@ -104,6 +110,8 @@ _SQS_PURGE_WINDOW_SECONDS = 60.0
 
 # Standard queue names accept only these characters and at most 80 of them.
 _SQS_QUEUE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+_V2_QUEUE_NAME_PREFIX = "scrapyext-v2-"
+_V2_QUEUE_NAME_DOMAIN = b"scrapy-extension:sqs:physical-queue:v2\x00"
 
 # MessageBody is capped at 1 MiB. This backend base64-encodes the raw bytes;
 # because 1 MiB is divisible by four, the largest encodable input is exactly
@@ -134,18 +142,51 @@ def _is_queue_missing(exc: BaseException) -> bool:
     return isinstance(error, dict) and error.get("Code") in _QUEUE_MISSING_CODES
 
 
-def _physical_queue_name(prefix: str, queue_name: str) -> str:
-    """Return an unchanged valid SQS name or a stable portable mapping."""
-    candidate = f"{prefix}{queue_name}"
-    if _SQS_QUEUE_NAME_PATTERN.fullmatch(candidate):
-        return candidate
-    digest = hashlib.blake2s(digest_size=16)
-    digest.update(b"scrapy-extension-sqs-v1")
+def _length_prefixed_digest(
+    domain: bytes, prefix: str, queue_name: str, *, digest_size: int
+) -> str:
+    """Hash a domain-separated, unambiguous UTF-8 tuple."""
+    digest = hashlib.blake2s(digest_size=digest_size)
+    digest.update(domain)
     for part in (prefix, queue_name):
         encoded = part.encode("utf-8")
         digest.update(len(encoded).to_bytes(8, "big"))
         digest.update(encoded)
-    return f"scrapyext-q-{digest.hexdigest()}"
+    return digest.hexdigest()
+
+
+def _physical_queue_name(
+    prefix: str,
+    queue_name: str,
+    generation: SqsQueueNameGeneration,
+) -> str:
+    """Map one logical identity to a validated SQS Standard queue name.
+
+    ``v2`` hashes every length-prefixed ``(prefix, queue_name)`` tuple into one
+    reserved output namespace. ``legacy_v1`` exactly preserves the historical
+    direct-or-hash behavior so operators can explicitly drain existing queues.
+    The caller selects one generation; this function never dual-reads.
+    """
+    if generation is SqsQueueNameGeneration.V2:
+        digest = _length_prefixed_digest(
+            _V2_QUEUE_NAME_DOMAIN, prefix, queue_name, digest_size=20
+        )
+        physical_name = f"{_V2_QUEUE_NAME_PREFIX}{digest}"
+    elif generation is SqsQueueNameGeneration.LEGACY_V1:
+        candidate = f"{prefix}{queue_name}"
+        if _SQS_QUEUE_NAME_PATTERN.fullmatch(candidate):
+            physical_name = candidate
+        else:
+            physical_name = (
+                "scrapyext-q-"
+                f"{_length_prefixed_digest(b'scrapy-extension-sqs-v1', prefix, queue_name, digest_size=16)}"
+            )
+    else:  # pragma: no cover - connection snapshot validates the public setting
+        raise ValueError("Unsupported SQS queue-name generation.")
+
+    if _SQS_QUEUE_NAME_PATTERN.fullmatch(physical_name) is None:
+        raise ValueError("Generated SQS queue name is invalid.")
+    return physical_name
 
 
 # R14-E: cap on the diagnostic in-flight ack-token set. Each unacked pop
@@ -319,6 +360,7 @@ class _SqsConnectionSnapshot:
     region_name: str
     endpoint_url: str | None
     queue_name_prefix: str
+    queue_name_generation: SqsQueueNameGeneration
     visibility_timeout: int
 
 
@@ -341,8 +383,10 @@ class _SqsClientGeneration:
 class SqsBackend(Backend, QueueBackend):
     """SQS backend (queue-only) with Standard-queue work semantics.
 
-    Each queue maps to an SQS queue named ``<prefix><queue_name>``. Push base64-
-    encodes the item into MessageBody; pop decodes it and tracks the receipt
+    Each logical queue maps through the selected physical-name generation. The
+    default v2 mapping hashes the complete prefix/name tuple into one namespace;
+    deprecated legacy_v1 mode exists only for explicit old-queue drains. Push
+    base64-encodes the item into MessageBody; pop decodes it and tracks the receipt
     handle for ack. queue_len sums visible, in-flight, and delayed messages;
     clear_queue purges.
 
@@ -373,6 +417,16 @@ class SqsBackend(Backend, QueueBackend):
 
     def __init__(self, config: SqsSettings) -> None:
         self.config = config
+        if config.queue_name_generation is SqsQueueNameGeneration.LEGACY_V1:
+            warnings.warn(
+                (
+                    "SQS legacy_v1 physical queue-name mapping is deprecated and "
+                    "must be used only to drain existing queues before an atomic "
+                    "worker switch to v2."
+                ),
+                FutureWarning,
+                stacklevel=1,
+            )
         self._connect_lock = threading.Lock()
         self._generation_condition = threading.Condition()
         self._generation: _SqsClientGeneration | None = None
@@ -406,6 +460,7 @@ class SqsBackend(Backend, QueueBackend):
         access_key = self.config.aws_access_key_id
         secret_key = self.config.aws_secret_access_key
         queue_name_prefix = self.config.queue_name_prefix
+        queue_name_generation = self.config.queue_name_generation
         visibility_timeout = self.config.visibility_timeout
         if not isinstance(mode, SqsMode):
             raise ConfigurationError(
@@ -425,6 +480,12 @@ class SqsBackend(Backend, QueueBackend):
                 setting_name="queue_name_prefix",
                 setting_value=None,
             )
+        if not isinstance(queue_name_generation, SqsQueueNameGeneration):
+            raise ConfigurationError(
+                "Unsupported SQS queue-name generation.",
+                setting_name="queue_name_generation",
+                setting_value=None,
+            )
         if (
             isinstance(visibility_timeout, bool)
             or not isinstance(visibility_timeout, int)
@@ -440,6 +501,7 @@ class SqsBackend(Backend, QueueBackend):
             region_name=region_name,
             endpoint_url=endpoint_url,
             queue_name_prefix=queue_name_prefix,
+            queue_name_generation=queue_name_generation,
             visibility_timeout=visibility_timeout,
         )
         kwargs: dict[str, Any] = {
@@ -673,7 +735,9 @@ class SqsBackend(Backend, QueueBackend):
                 if cached is not None:
                     return cached
             name = _physical_queue_name(
-                generation.snapshot.queue_name_prefix, queue_name
+                generation.snapshot.queue_name_prefix,
+                queue_name,
+                generation.snapshot.queue_name_generation,
             )
             try:
                 resp = generation.client.get_queue_url(QueueName=name)

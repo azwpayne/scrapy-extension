@@ -74,7 +74,11 @@ if TYPE_CHECKING:
     from scrapy_extension.settings.rabbitmq import RabbitMQMode, RabbitMQSettings
     from scrapy_extension.settings.redis import RedisMode, RedisSettings
     from scrapy_extension.settings.rocketmq import RocketMQMode, RocketMQSettings
-    from scrapy_extension.settings.sqs import SqsMode, SqsSettings
+    from scrapy_extension.settings.sqs import (
+        SqsMode,
+        SqsQueueNameGeneration,
+        SqsSettings,
+    )
 
 try:
     __version__ = _pkg_version("scrapy-extension")
@@ -127,6 +131,10 @@ _OPTIONAL_IMPORTS: dict[str, tuple[str, str]] = {
     "RocketMQMode": ("scrapy_extension.settings.rocketmq", "RocketMQMode"),
     "RocketMQSettings": ("scrapy_extension.settings.rocketmq", "RocketMQSettings"),
     "SqsMode": ("scrapy_extension.settings.sqs", "SqsMode"),
+    "SqsQueueNameGeneration": (
+        "scrapy_extension.settings.sqs",
+        "SqsQueueNameGeneration",
+    ),
     "SqsSettings": ("scrapy_extension.settings.sqs", "SqsSettings"),
 }
 
@@ -161,6 +169,7 @@ _BACKEND_EXTRAS: dict[str, str] = {
     "RocketMQSettings": "rocketmq",
     "SqsBackend": "sqs",
     "SqsMode": "sqs",
+    "SqsQueueNameGeneration": "sqs",
     "SqsSettings": "sqs",
 }
 
@@ -324,6 +333,7 @@ __all__ = [
     "Settings",
     "SqsBackend",
     "SqsMode",
+    "SqsQueueNameGeneration",
     "SqsSettings",
     "StorageBackend",
     "StorageBackpressureError",

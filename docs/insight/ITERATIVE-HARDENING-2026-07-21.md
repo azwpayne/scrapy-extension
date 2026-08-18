@@ -408,11 +408,11 @@ speculative work.
   stable AWS-compatible names without changing already-valid names, and enforce
   the 786,432-byte raw payload ceiling imposed by base64 inside the 1 MiB SQS
   message limit before issuing network calls.
-- [ ] **BACKEND-05B — injective SQS physical ownership.** Prevent an invalid
+- [x] **BACKEND-05B — injective SQS physical ownership.** Prevent an invalid
   logical name's hashed form from aliasing a valid logical name preserved under
-  the same prefix. Bind a versioned complete logical identity to the physical
-  queue and fail closed on a conflicting owner before pop, clear, or depth can
-  cross queue boundaries.
+  the same prefix. Bind a versioned complete logical identity to one physical
+  output namespace, with an explicit legacy generation available only for
+  controlled drains.
 - [x] **BACKEND-06 — Memcached confirmed mutations.** Disable pymemcache's
   default noreply mode so storage mutation success is based on a parsed server
   response rather than an unconfirmed socket write.
@@ -925,6 +925,21 @@ typed `QueueError` with queue/operation context before queue URL resolution or
 send I/O. All five regressions passed on Python 3.10 and 3.14, 268 related
 SQS/spider/fan-out tests passed, and the full suite passed 3,005 tests with 44
 documented skips. Ruff, strict mypy, and patch integrity remained green.
+
+### I15d — SQS versioned physical ownership
+
+The legacy direct-or-hash mapping admitted two boundary collisions: concatenated
+prefix/name pairs could share a direct queue, and a valid direct logical name
+could equal another logical name's hash output. The v2 default now hashes every
+length-prefixed `(prefix, logical_name)` identity into one domain-separated
+`scrapyext-v2-*` namespace. Golden vectors and Hypothesis properties freeze the
+mapping, the 53-character SQS name boundary, and the known collision fixes.
+
+`queue_name_generation` is frozen with each connected client generation. The
+explicit deprecated `legacy_v1` value reproduces the prior wire mapping only for
+stop-producers/drain/switch migrations; there is no dual-read path. The focused
+322-test slice, full 5,257-item suite (5,208 passed, 49 documented skips), Ruff,
+and strict mypy remained green on Python 3.10.
 
 ### I14a — single-consumer manager scope across spiders
 

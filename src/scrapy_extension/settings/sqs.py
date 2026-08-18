@@ -34,6 +34,18 @@ class SqsMode(str, Enum):
     CLOUD = "cloud"
 
 
+class SqsQueueNameGeneration(str, Enum):
+    """Physical queue-name mapping generations.
+
+    Attributes:
+        V2: Collision-resistant mapping for all new deployments (default).
+        LEGACY_V1: Deprecated compatibility mode used only to drain v1 queues.
+    """
+
+    V2 = "v2"
+    LEGACY_V1 = "legacy_v1"
+
+
 class SqsSettings(RedactedBaseSettings):
     """Amazon SQS settings (queue-only MQ backend).
 
@@ -69,6 +81,14 @@ class SqsSettings(RedactedBaseSettings):
     )
     queue_name_prefix: str = Field(
         default="scrapy-", description="Prefix applied to queue names"
+    )
+    queue_name_generation: SqsQueueNameGeneration = Field(
+        default=SqsQueueNameGeneration.V2,
+        description=(
+            "Physical queue-name mapping generation. Use v2 for production; "
+            "legacy_v1 is deprecated and exists only to drain old queues."
+        ),
+        json_schema_extra={"deprecated_values": ["legacy_v1"]},
     )
     visibility_timeout: int = Field(
         default=300,

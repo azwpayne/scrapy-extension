@@ -5,9 +5,9 @@ from __future__ import annotations
 import boto3
 import pytest
 
-from scrapy_extension.backends.sqs import SqsBackend
+from scrapy_extension.backends.sqs import SqsBackend, _physical_queue_name
 from scrapy_extension.exceptions import ConfigurationError, QueueError
-from scrapy_extension.settings import SqsSettings
+from scrapy_extension.settings import SqsQueueNameGeneration, SqsSettings
 
 
 class _SqsClientError(Exception):
@@ -66,7 +66,9 @@ class TestSqsErrorPaths:
         client.create_queue.return_value = {"QueueUrl": "https://sqs/new"}
         # Only a genuine missing-queue response permits a create side effect.
         b.push("qnew", b"x")
-        client.create_queue.assert_called_once_with(QueueName="scrapy-qnew")
+        client.create_queue.assert_called_once_with(
+            QueueName=_physical_queue_name("scrapy-", "qnew", SqsQueueNameGeneration.V2)
+        )
 
     def test_queue_url_operational_failure_does_not_create(self, mocker) -> None:
         b, client = _connected(mocker)

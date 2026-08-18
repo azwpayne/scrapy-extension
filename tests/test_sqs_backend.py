@@ -24,11 +24,23 @@ from scrapy_extension.exceptions import (
     ConfigurationError,
     QueueError,
 )
-from scrapy_extension.settings import SqsMode, SqsSettings
+from scrapy_extension.settings import (
+    SqsMode,
+    SqsQueueNameGeneration,
+    SqsSettings,
+)
 
 
 def _make_backend(**overrides) -> SqsBackend:
     return SqsBackend(SqsSettings(**overrides))
+
+
+def _physical_name(
+    prefix: str,
+    logical_name: str,
+    generation: SqsQueueNameGeneration = SqsQueueNameGeneration.V2,
+) -> str:
+    return sqs_mod._physical_queue_name(prefix, logical_name, generation)
 
 
 def _patch_client(mocker, *, return_value=None, side_effect=None):
@@ -87,6 +99,7 @@ class TestSqsBackendType:
         assert s.mode is SqsMode.STANDALONE
         assert s.region_name == "us-east-1"
         assert s.queue_name_prefix == "scrapy-"
+        assert s.queue_name_generation is SqsQueueNameGeneration.V2
         assert s.visibility_timeout == 300
 
     @pytest.mark.parametrize("timeout", [0, 43_201])
@@ -552,7 +565,9 @@ class TestSqsConnect:
         assert client_factory.call_count == 1
         session_factory.assert_called_once_with()
         assert b._client is client_a
-        client_a.get_queue_url.assert_called_once_with(QueueName="scrapy-q")
+        client_a.get_queue_url.assert_called_once_with(
+            QueueName=_physical_name("scrapy-", "q")
+        )
         assert client_a.send_message.call_count == 2
         client_b.send_message.assert_not_called()
 
@@ -562,12 +577,15 @@ class TestSqsConnect:
         b, client = _connected(mocker)
         client.receive_message.return_value = {}
         b.config.queue_name_prefix = "mutated-"
+        b.config.queue_name_generation = SqsQueueNameGeneration.LEGACY_V1
         b.config.visibility_timeout = 1
 
         b.push("q", b"payload")
         assert b.pop("q") is None
 
-        client.get_queue_url.assert_called_once_with(QueueName="scrapy-q")
+        client.get_queue_url.assert_called_once_with(
+            QueueName=_physical_name("scrapy-", "q")
+        )
         assert client.receive_message.call_args.kwargs["VisibilityTimeout"] == 300
 
         b.disconnect()
@@ -782,7 +800,7 @@ class TestSqsConnect:
         errors: list[BaseException] = []
 
         def resolve(*, QueueName):  # noqa: N803 - boto3 keyword
-            if QueueName == "scrapy-qA":
+            if QueueName == _physical_name("scrapy-", "qA"):
                 q_a_lookup_entered.set()
                 assert release_q_a_lookup.wait(timeout=2.0)
                 return {"QueueUrl": "https://sqs/qA"}
@@ -846,7 +864,9 @@ class TestSqsPushPop:
     def test_push_resolves_url_and_sends_b64(self, mocker) -> None:
         b, client = _connected(mocker)
         b.push("queue1", b"payload")
-        client.get_queue_url.assert_called_once_with(QueueName="scrapy-queue1")
+        client.get_queue_url.assert_called_once_with(
+            QueueName=_physical_name("scrapy-", "queue1")
+        )
         args, kwargs = client.send_message.call_args
         assert kwargs["QueueUrl"] == "https://sqs/test"
         # MessageBody is base64 of the payload
@@ -858,7 +878,9 @@ class TestSqsPushPop:
         b, client = _connected(mocker)
         b.push("queue1", b"a")
         b.push("queue1", b"b")
-        client.get_queue_url.assert_called_once_with(QueueName="scrapy-queue1")
+        client.get_queue_url.assert_called_once_with(
+            QueueName=_physical_name("scrapy-", "queue1")
+        )
 
     def test_push_maps_colon_logical_name_to_stable_aws_name(self, mocker) -> None:
         first, first_client = _connected(mocker)
@@ -880,8 +902,14 @@ class TestSqsPushPop:
 
         second_client.get_queue_url.assert_called_once_with(QueueName=physical_name)
 
-    def test_push_preserves_already_valid_80_character_name(self, mocker) -> None:
-        b = _make_backend(queue_name_prefix="")
+    def test_legacy_drain_preserves_already_valid_80_character_name(
+        self, mocker
+    ) -> None:
+        with pytest.warns(FutureWarning, match="legacy_v1"):
+            b = _make_backend(
+                queue_name_prefix="",
+                queue_name_generation=SqsQueueNameGeneration.LEGACY_V1,
+            )
         client = mocker.MagicMock()
         client.get_queue_url.return_value = {"QueueUrl": "https://sqs/test"}
         _patch_client(mocker, return_value=client)
@@ -1458,11 +1486,16 @@ def _connected_multi_queue(mocker, urls: dict[str, str]):
     b = _make_backend()
     client = mocker.MagicMock()
 
+    physical_urls = {
+        _physical_name("scrapy-", logical_name): url
+        for logical_name, url in urls.items()
+    }
+
     def _get_queue_url(*, QueueName):  # noqa: N803 — boto3 kwarg name
-        for qname, url in urls.items():
-            if QueueName.endswith(qname):
-                return {"QueueUrl": url}
-        raise RuntimeError(f"unexpected QueueName={QueueName!r}")
+        try:
+            return {"QueueUrl": physical_urls[QueueName]}
+        except KeyError as error:
+            raise RuntimeError(f"unexpected QueueName={QueueName!r}") from error
 
     client.get_queue_url.side_effect = _get_queue_url
     _patch_client(mocker, return_value=client)
@@ -2211,6 +2244,21 @@ class TestSqsHalfCredentialGuard:
             backend.connect()
 
         assert exc_info.value.setting_name == "region_name"
+        session_factory.assert_not_called()
+
+    def test_connect_rejects_mutated_queue_name_generation(self, mocker) -> None:
+        backend = _make_backend()
+        backend.config.queue_name_generation = "future"  # type: ignore[assignment]
+        session_factory, _client_factory = _patch_client(
+            mocker, return_value=mocker.MagicMock()
+        )
+
+        with pytest.raises(ConfigurationError) as exc_info:
+            backend.connect()
+
+        assert str(exc_info.value) == "Unsupported SQS queue-name generation."
+        assert exc_info.value.setting_name == "queue_name_generation"
+        assert exc_info.value.setting_value is None
         session_factory.assert_not_called()
 
 

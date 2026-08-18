@@ -605,16 +605,47 @@ so callers must retain its returned token. Direct callers must not interpret a
 concurrent no-op as a second broker outcome.
 
 SQS no longer treats repeated `connect()` as an implicit client replacement.
-A live connection is idempotent, and endpoint, region, queue prefix, visibility
-timeout, QueueUrl caches, and receipt tokens remain fixed to that generation.
-Code that mutates `SqsSettings` after startup must explicitly call
-`disconnect()` and then `connect()` before expecting new values. Disconnect is
-now a drain barrier: operations admitted first finish on the old client, while
-operations arriving after teardown begins raise `QueueError`. A receipt token
-from the retired client becomes stale and is never acknowledged through the
-replacement; SQS visibility timeout/redrive provides its at-least-once retry.
-Allow shutdown enough time for an admitted long poll, SDK retry, or 60-second
-purge barrier.
+A live connection is idempotent, and endpoint, region, queue prefix, physical
+queue-name generation, visibility timeout, QueueUrl caches, and receipt tokens
+remain fixed to that generation. Code that mutates `SqsSettings` after startup
+must explicitly call `disconnect()` and then `connect()` before expecting new
+values. Disconnect is now a drain barrier: operations admitted first finish on
+the old client, while operations arriving after teardown begins raise
+`QueueError`. A receipt token from the retired client becomes stale and is never
+acknowledged through the replacement; SQS visibility timeout/redrive provides
+its at-least-once retry. Allow shutdown enough time for an admitted long poll,
+SDK retry, or 60-second purge barrier.
+
+### SQS physical queue-name v2 migration
+
+`SCRAPY_SQS_QUEUE_NAME_GENERATION` now defaults to `v2`. V2 hashes every
+length-prefixed `(queue_name_prefix, logical_queue_name)` tuple into the single
+`scrapyext-v2-*` namespace. This removes both prefix-boundary aliases and the
+legacy direct-name-versus-hashed-name collision. The output is always a valid
+53-character SQS Standard queue name. Message bodies, receipt handles, and the
+rest of the SQS wire behavior are unchanged.
+
+V2 deliberately does **not** auto-read the old queue. Existing deployments must
+migrate without concurrent generations:
+
+1. **Stop all producers** that can write the affected logical queues. Keep their
+   configuration recorded; do not start v2 producers yet.
+2. Start only drain workers with
+   `SCRAPY_SQS_QUEUE_NAME_GENERATION=legacy_v1`. This deprecated mode reproduces
+   the previous direct-or-hash mapping exactly. Drain every old physical queue,
+   including invisible/delayed messages and any dead-letter/redrive workflow,
+   until the broker and application agree that no work remains. Do not run v2
+   workers or producers during this drain.
+3. Stop the legacy workers. Change producers and workers to
+   `SCRAPY_SQS_QUEUE_NAME_GENERATION=v2` (or remove the setting to use the safe
+   default), then **atomically switch the whole worker group**. Resume producers
+   only after all active workers select v2.
+
+A mixed `legacy_v1`/`v2` fleet splits one logical queue across two physical
+queues; the backend will not dual-read or reconcile them. Rollback therefore
+uses the same boundary in reverse: stop producers and workers, drain the active
+v2 queue with v2 workers, and only then atomically restore legacy workers. Never
+use `legacy_v1` for a new deployment.
 
 SQS `clear_queue()` now blocks the target physical queue for at least 60 seconds
 after PurgeQueue returns. AWS documents that the asynchronous purge can delete

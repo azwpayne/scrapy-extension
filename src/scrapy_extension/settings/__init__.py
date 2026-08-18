@@ -17,7 +17,11 @@ from scrapy_extension.settings.pulsar import PulsarMode, PulsarSettings
 from scrapy_extension.settings.rabbitmq import RabbitMQMode, RabbitMQSettings
 from scrapy_extension.settings.redis import RedisMode, RedisSettings
 from scrapy_extension.settings.rocketmq import RocketMQMode, RocketMQSettings
-from scrapy_extension.settings.sqs import SqsMode, SqsSettings
+from scrapy_extension.settings.sqs import (
+    SqsMode,
+    SqsQueueNameGeneration,
+    SqsSettings,
+)
 
 __all__ = [
     "DynamoDBMode",
@@ -40,5 +44,6 @@ __all__ = [
     "RocketMQSettings",
     "Settings",
     "SqsMode",
+    "SqsQueueNameGeneration",
     "SqsSettings",
 ]
