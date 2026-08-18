@@ -186,7 +186,10 @@ _BUNDLED_DESCRIPTORS: dict[str, BackendDescriptor] = {
 # ---------------------------------------------------------------------------
 
 _registry_cache: dict[str, BackendDescriptor] | None = None
-_registry_lock = threading.RLock()
+_registry_lock = threading.Lock()
+_registry_condition = threading.Condition(_registry_lock)
+_registry_discovery_owner: int | None = None
+_registry_discovery_in_progress = False
 
 
 def _discover_entry_points() -> dict[str, BackendDescriptor]:
@@ -354,27 +357,57 @@ def get_registry() -> dict[str, BackendDescriptor]:
     log. Logging cannot be promoted into an exception by Python's warnings
     filters, preserving the bundled-availability invariant.
 
+    Discovery is single-flight. Concurrent callers wait for the active owner,
+    while a registration callback that recursively requests the registry fails
+    immediately instead of observing a partially built table or recursing.
+
     Returns:
         A fresh dict mapping backend-type string → :class:`BackendDescriptor`.
     """
     global _registry_cache
-    with _registry_lock:
-        if _registry_cache is None:
-            bundled = dict(_BUNDLED_DESCRIPTORS)
-            discovered = _discover_entry_points()
-            for name, descriptor in discovered.items():
-                if name in bundled:
-                    # Bundled-wins precedence: the bundled descriptor stays; the
-                    # 3rd-party shadow is dropped. Log so operators notice without making
-                    # registry availability depend on their Python warning filters.
-                    _log_diagnostic(
-                        logger.warning,
-                        "Third-party backend entry-point shadows a bundled backend; "
-                        "bundled backend wins.",
-                    )
-                    continue
-                bundled[name] = descriptor
-            _registry_cache = bundled
+    global _registry_discovery_in_progress
+    global _registry_discovery_owner
+
+    owner = threading.get_ident()
+    with _registry_condition:
+        while _registry_cache is None and _registry_discovery_in_progress:
+            if _registry_discovery_owner == owner:
+                raise RuntimeError(
+                    "Backend registry discovery is already in progress on this thread."
+                )
+            _registry_condition.wait()
+        if _registry_cache is not None:
+            return dict(_registry_cache)
+        _registry_discovery_in_progress = True
+        _registry_discovery_owner = owner
+
+    try:
+        bundled = dict(_BUNDLED_DESCRIPTORS)
+        discovered = _discover_entry_points()
+        for name, descriptor in discovered.items():
+            if name in bundled:
+                # Bundled-wins precedence: the bundled descriptor stays; the
+                # 3rd-party shadow is dropped. Log so operators notice without making
+                # registry availability depend on their Python warning filters.
+                _log_diagnostic(
+                    logger.warning,
+                    "Third-party backend entry-point shadows a bundled backend; "
+                    "bundled backend wins.",
+                )
+                continue
+            bundled[name] = descriptor
+    except BaseException:
+        with _registry_condition:
+            _registry_discovery_owner = None
+            _registry_discovery_in_progress = False
+            _registry_condition.notify_all()
+        raise
+
+    with _registry_condition:
+        _registry_cache = bundled
+        _registry_discovery_owner = None
+        _registry_discovery_in_progress = False
+        _registry_condition.notify_all()
         return dict(_registry_cache)
 
 
@@ -446,5 +479,12 @@ def _reset_registry_cache() -> None:
     via ``monkeypatch`` is re-discovered.
     """
     global _registry_cache
-    with _registry_lock:
+    owner = threading.get_ident()
+    with _registry_condition:
+        while _registry_discovery_in_progress:
+            if _registry_discovery_owner == owner:
+                raise RuntimeError(
+                    "Backend registry discovery cannot be reset by its owner."
+                )
+            _registry_condition.wait()
         _registry_cache = None

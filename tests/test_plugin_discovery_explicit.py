@@ -37,6 +37,66 @@ print("imports-ok")
     assert result.stdout.strip() == "imports-ok"
 
 
+def test_reentrant_registration_callback_is_bounded_without_partial_cache(
+    monkeypatch,
+) -> None:
+    registration_calls = 0
+
+    class _EntryPoint:
+        name = "recursive"
+
+        @staticmethod
+        def load():
+            def register():
+                nonlocal registration_calls
+                registration_calls += 1
+                registry.get_registry()
+                raise AssertionError("recursive registry request unexpectedly returned")
+
+            return register
+
+    monkeypatch.setattr(
+        registry.importlib.metadata,
+        "entry_points",
+        lambda *, group: [_EntryPoint()],
+    )
+    registry._reset_registry_cache()
+
+    discovered = registry.get_registry()
+
+    assert registration_calls == 1
+    assert "redis" in discovered
+    assert "recursive" not in discovered
+    assert registry._registry_cache is not None
+    assert "recursive" not in registry._registry_cache
+
+
+def test_discovery_owner_state_resets_after_control_flow_failure(monkeypatch) -> None:
+    calls = 0
+
+    def entry_points(*, group: str):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise KeyboardInterrupt("private discovery failure")
+        return []
+
+    monkeypatch.setattr(registry.importlib.metadata, "entry_points", entry_points)
+    registry._reset_registry_cache()
+
+    try:
+        registry.get_registry()
+    except KeyboardInterrupt:
+        pass
+    else:
+        raise AssertionError("control-flow failure unexpectedly suppressed")
+
+    assert registry._registry_discovery_owner is None
+    assert registry._registry_discovery_in_progress is False
+    assert "redis" in registry.get_registry()
+    assert calls == 2
+
+
 def test_concurrent_registry_discovery_is_single_flight(monkeypatch) -> None:
     calls = 0
     calls_lock = threading.Lock()
