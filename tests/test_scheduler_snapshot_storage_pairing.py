@@ -216,8 +216,8 @@ def test_scheduler_closes_queue_then_owned_snapshot_manager_then_queue_manager(
     queue_manager.close.assert_called_once_with()
 
 
-def test_queue_close_interruption_still_releases_owned_snapshot_manager(mocker) -> None:
-    """A control-flow interruption during checkpointing cannot pin its acquire."""
+def test_untyped_queue_close_interruption_still_releases_owned_managers(mocker) -> None:
+    """A plain mock interruption is not classified as a checkpoint failure."""
     queue_manager = mocker.MagicMock(name="queue-manager")
     snapshot_manager = mocker.MagicMock(name="snapshot-manager")
     queue = mocker.MagicMock(name="queue")

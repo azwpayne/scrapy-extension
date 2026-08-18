@@ -131,7 +131,7 @@ class BackendQueue:
         wall_clock: Callable[[], float] = time.time,
         snapshot_owner: str | None = None,
         snapshot_connection_manager: ConnectionManager | None = None,
-        snapshot_max_bytes: int = DEFAULT_SNAPSHOT_MAX_BYTES,
+        snapshot_max_bytes: int | None = None,
         snapshot_chunk_bytes: int = DEFAULT_SNAPSHOT_CHUNK_BYTES,
     ) -> None:
         """Initialize the backend queue.
@@ -201,16 +201,24 @@ class BackendQueue:
             _validate_key_name(snapshot_owner, "snapshot_owner")
         self._snapshot_owner = snapshot_owner
         self._snapshot_connection_manager = snapshot_connection_manager
-        self._snapshot_max_bytes = snapshot_max_bytes
-        self._snapshot_chunk_bytes = snapshot_chunk_bytes
+        resolved_snapshot_max_bytes = (
+            _MAX_SNAPSHOT_BYTES if snapshot_max_bytes is None else snapshot_max_bytes
+        )
+        resolved_snapshot_chunk_bytes = (
+            min(snapshot_chunk_bytes, resolved_snapshot_max_bytes)
+            if snapshot_max_bytes is None
+            else snapshot_chunk_bytes
+        )
+        self._snapshot_max_bytes = resolved_snapshot_max_bytes
+        self._snapshot_chunk_bytes = resolved_snapshot_chunk_bytes
         if (
-            isinstance(snapshot_max_bytes, bool)
-            or not isinstance(snapshot_max_bytes, int)
-            or snapshot_max_bytes < 1
-            or isinstance(snapshot_chunk_bytes, bool)
-            or not isinstance(snapshot_chunk_bytes, int)
-            or snapshot_chunk_bytes < 1
-            or snapshot_chunk_bytes > snapshot_max_bytes
+            isinstance(resolved_snapshot_max_bytes, bool)
+            or not isinstance(resolved_snapshot_max_bytes, int)
+            or resolved_snapshot_max_bytes < 1
+            or isinstance(resolved_snapshot_chunk_bytes, bool)
+            or not isinstance(resolved_snapshot_chunk_bytes, int)
+            or resolved_snapshot_chunk_bytes < 1
+            or resolved_snapshot_chunk_bytes > resolved_snapshot_max_bytes
         ):
             raise ValueError("Invalid snapshot size limits.")
         self._strategy: QueueStrategy = (
@@ -229,6 +237,11 @@ class BackendQueue:
         self._accepting_operations = True
         self._active_operations = 0
         self._close_complete = False
+        self._close_in_progress = False
+        self._close_attempt = 0
+        self._last_failed_close_attempt = 0
+        self._begin_close_complete = False
+        self._checkpoint_complete = False
         self._monitor: Monitor = (
             monitor if monitor is not None else self._resolve_monitor(spider)
         )
@@ -1257,57 +1270,56 @@ class BackendQueue:
             return ScrapyStatsMonitor(stats)
         return NullMonitor()
 
-    def close(self) -> None:
-        """Close the queue, delegating to the queue strategy's lifecycle hook.
+    def close(self, *, lossy: bool = False) -> None:
+        """Transactionally checkpoint and close the strategy.
 
-        Quiesces the strategy, waits for admitted operations, persists its snapshot
-        (initiative #3), then calls ``self._strategy.close()`` for destructive
-        cleanup. The backend connection itself is owned by the
-        ``ConnectionManager`` and closed separately by the scheduler.
-
-        Safe to call when no strategy lifecycle work is needed — the default
-        ``QueueStrategy.close()`` is a no-op and ``snapshot()`` returns ``None``.
-
-        Close first stops admission, then calls ``strategy.begin_close()`` to wake
-        blocking operations without clearing snapshot state. Already-admitted
-        operations drain without holding the lifecycle lock. Only then does the
-        queue persist a snapshot and run destructive ``strategy.close()`` cleanup.
+        A checkpoint failure leaves strategy state and both managers usable for a
+        later close retry. Callers waiting on the same attempt observe a fresh,
+        redacted failure rather than a false success. ``lossy=True`` is the explicit
+        abort path for discarding nonempty state when no durable checkpoint can be
+        made.
         """
         with self._operation_gate:
-            if not self._accepting_operations:
-                while not self._close_complete:
-                    self._operation_gate.wait()
+            if self._close_complete:
                 return
+            if self._close_in_progress:
+                observed_attempt = self._close_attempt
+                while self._close_in_progress and not self._close_complete:
+                    self._operation_gate.wait()
+                if self._close_complete:
+                    return
+                if self._last_failed_close_attempt == observed_attempt:
+                    raise QueueError("Queue close failed; checkpoint can be retried.")
+            self._close_in_progress = True
+            self._close_attempt += 1
+            attempt = self._close_attempt
             self._accepting_operations = False
 
-        primary_error: BaseException | None = None
+        failure: BaseException | None = None
         try:
-            self._strategy.begin_close()
-        except BaseException as exc:
-            primary_error = exc
-        with self._operation_gate:
-            while self._active_operations > 0:
-                try:
+            if not self._begin_close_complete:
+                self._strategy.begin_close()
+                self._begin_close_complete = True
+            with self._operation_gate:
+                while self._active_operations > 0:
                     self._operation_gate.wait()
-                except BaseException as exc:
-                    if primary_error is None:
-                        primary_error = exc
-        try:
-            self._persist_snapshot()
-        except BaseException as exc:
-            if primary_error is None:
-                primary_error = exc
-        try:
+            if not self._checkpoint_complete:
+                if not lossy:
+                    self._persist_snapshot()
+                self._checkpoint_complete = True
             self._strategy.close()
         except BaseException as exc:
-            if primary_error is None:
-                primary_error = exc
-        finally:
-            with self._operation_gate:
+            failure = exc
+
+        with self._operation_gate:
+            self._close_in_progress = False
+            if failure is None:
                 self._close_complete = True
-                self._operation_gate.notify_all()
-        if primary_error is not None:
-            raise primary_error
+            else:
+                self._last_failed_close_attempt = attempt
+            self._operation_gate.notify_all()
+        if failure is not None:
+            raise failure
 
     #: Storage-key prefix for strategy snapshots (initiative #3). The default
     #: v3 identity length-prefixes both spider and queue components so valid
@@ -1362,8 +1374,8 @@ class BackendQueue:
         snapshot_identity = self._snapshot_key().removeprefix(self._SNAPSHOT_KEY_PREFIX)
         return f"{self._SNAPSHOT_TOMBSTONE_KEY_PREFIX}{snapshot_identity}"
 
-    def _snapshot_storage(self) -> Any | None:
-        """Resolve snapshot storage, returning ``None`` when unsupported."""
+    def _snapshot_storage(self, *, strict: bool = False) -> Any | None:
+        """Resolve snapshot storage, optionally surfacing retryable failures."""
         manager = (
             self._snapshot_connection_manager
             if self._snapshot_connection_manager is not None
@@ -1372,16 +1384,29 @@ class BackendQueue:
         get_storage = getattr(manager, "get_storage_backend", None)
         if get_storage is None:
             return None
+        unsupported = False
+        resolution_failed = False
         try:
-            return get_storage()
+            storage = get_storage()
         except NotImplementedError:
-            return None
+            unsupported = True
         except Exception:
+            resolution_failed = True
+        if unsupported:
+            try:
+                logger.info("Strategy snapshot storage is not available")
+            except BaseException:
+                pass
+            return None
+        if resolution_failed:
             try:
                 logger.error("Failed to resolve strategy snapshot storage")
             except BaseException:
                 pass
+            if strict:
+                raise QueueError("Strategy snapshot storage is unavailable.") from None
             return None
+        return storage
 
     def _snapshot_repository(self, storage: Any) -> SnapshotRepository:
         return SnapshotRepository(
@@ -1391,27 +1416,33 @@ class BackendQueue:
         )
 
     def _persist_snapshot(self) -> None:
-        """Commit a chunked strategy snapshot and then drain compatible old keys."""
+        """Commit a chunked strategy snapshot or raise a redacted retryable error."""
+        snapshot_failed = False
         try:
             state = self._strategy.snapshot()
         except Exception:
+            snapshot_failed = True
+            state = None
+        if snapshot_failed:
             try:
-                logger.error("Strategy snapshot failed; skipping persist")
+                logger.error("Strategy snapshot creation failed")
             except BaseException:
                 pass
-            return
-        storage = self._snapshot_storage()
+            raise QueueError("Strategy snapshot creation failed.") from None
+        storage = self._snapshot_storage(strict=True)
         if storage is None:
-            return
+            if state is None:
+                return
+            raise QueueError("Nonempty strategy state requires snapshot storage.")
         repository = self._snapshot_repository(storage)
         try:
             repository.commit(self._snapshot_key(), state)
         except SnapshotRepositoryError:
             try:
-                logger.error("Failed to commit strategy snapshot")
+                logger.error("Strategy snapshot commit failed")
             except BaseException:
                 pass
-            return
+            raise QueueError("Strategy snapshot commit failed.") from None
 
         # A committed manifest, including an empty manifest, is authoritative.
         # Legacy cleanup therefore happens only after the manifest-last commit.

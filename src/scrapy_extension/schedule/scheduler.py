@@ -1787,15 +1787,51 @@ class BackendScheduler:
         request.errback = _BackendDownloadFailureErrback(self, request.errback)
 
     def close(self, reason: str) -> Deferred[None] | None:
-        """Close the scheduler."""
+        """Close the scheduler, surfacing a retryable checkpoint failure."""
         with self._lifecycle_lock:
             self._close_locked(reason)
         return None
+
+    def abort(self, reason: str) -> None:
+        """Explicitly discard uncheckpointed queue state and finish teardown."""
+        with self._lifecycle_lock:
+            if self._queue is not None:
+                self._queue.close(lossy=True)
+            self._close_locked(reason)
 
     def _close_locked(self, reason: str) -> None:
         """Release one scheduler lifecycle while ``_lifecycle_lock`` is held."""
         if self._lifecycle_state == _LIFECYCLE_CLOSED:
             return None
+
+        # The queue checkpoint is the teardown commit gate. Until it succeeds,
+        # retain the queue, signals, dupefilter, and both manager acquires so a
+        # later close call can retry against the same strategy state.
+        queue_teardown_error: BaseException | None = None
+        if self._queue is not None:
+            queue_failure: BaseException | None = None
+            try:
+                self._queue.close()
+            except BaseException as exc:
+                queue_failure = exc
+            if queue_failure is not None:
+                checkpoint_incomplete = isinstance(queue_failure, QueueError) or (
+                    isinstance(self._queue, BackendQueue)
+                    and not self._queue._checkpoint_complete
+                )
+                if checkpoint_incomplete:
+                    try:
+                        logger.error(
+                            "Queue checkpoint failed; scheduler close can be retried"
+                        )
+                    except BaseException:
+                        pass
+                    raise queue_failure
+                queue_teardown_error = queue_failure
+                try:
+                    logger.error("Failed to close queue strategy during shutdown")
+                except BaseException:
+                    pass
         self._lifecycle_state = _LIFECYCLE_CLOSED
 
         # Shutdown diagnostics must never gain ownership of teardown. A custom
@@ -1820,7 +1856,12 @@ class BackendScheduler:
         # registry pin toward ``MAX_MANAGERS``). Capture the first BaseException
         # into ``primary_error``, run the manager release in a ``finally``, and
         # re-raise ``primary_error`` last. Mirrors pipeline._close_locked (R20-B).
-        primary_error: BaseException | None = None
+        primary_error: BaseException | None = (
+            queue_teardown_error
+            if queue_teardown_error is not None
+            and not isinstance(queue_teardown_error, Exception)
+            else None
+        )
         try:
             if self._connected_signals is not None:
                 signal_handlers = self._connected_ack_signal_handlers
@@ -1849,22 +1890,6 @@ class BackendScheduler:
                         _log_shutdown_exception(
                             "Failed to disconnect signal during shutdown"
                         )
-            # Close the queue strategy FIRST so it can warn about / release any
-            # in-process held state (e.g. DelayQueueStrategy's delayed items) while
-            # the backend is still connected. Must precede connection_manager.close().
-            if self._queue is not None:
-                queue_close_failed = False
-                try:
-                    self._queue.close()
-                except Exception:
-                    queue_close_failed = True
-                except BaseException as exc:
-                    if primary_error is None:
-                        primary_error = exc
-                if queue_close_failed:
-                    _log_shutdown_exception(
-                        "Failed to close queue strategy during shutdown"
-                    )
             if (
                 self._owns_dupefilter
                 and self.dupefilter is not None

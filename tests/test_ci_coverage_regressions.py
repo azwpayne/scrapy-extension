@@ -1285,12 +1285,15 @@ def test_queue_close_waits_for_an_in_progress_close() -> None:
     queue = _queue()
     queue._accepting_operations = False
     queue._close_complete = False
+    queue._close_in_progress = True
+    queue._close_attempt = 1
     operation_gate = MagicMock(name="OperationGate")
-    operation_gate.wait.side_effect = lambda: setattr(
-        queue,
-        "_close_complete",
-        True,
-    )
+
+    def complete_close() -> None:
+        queue._close_in_progress = False
+        queue._close_complete = True
+
+    operation_gate.wait.side_effect = complete_close
     queue._operation_gate = operation_gate
 
     queue.close()

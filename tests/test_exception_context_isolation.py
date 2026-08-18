@@ -13,6 +13,7 @@ from unittest.mock import MagicMock
 import pytest
 from scrapy import Request
 
+from scrapy_extension.exceptions import QueueError
 from scrapy_extension.monitor import NullMonitor
 from scrapy_extension.queue.queue import BackendQueue
 from scrapy_extension.queue.strategies.delay import DelayQueueStrategy
@@ -148,9 +149,10 @@ def test_queue_snapshot_fallback_handler_cannot_recover_error_context() -> None:
     )
 
     with _probe_logger("scrapy_extension.queue.queue") as probe:
-        queue.close()
+        with pytest.raises(QueueError, match="snapshot creation"):
+            queue.close()
 
-    assert queue._close_complete is True
+    assert queue._close_complete is False
     _assert_isolated(probe, marker)
 
 

@@ -518,8 +518,9 @@ Elasticsearch queues use their own storage capability. A Kafka, RabbitMQ,
 Pulsar, SQS, or RocketMQ queue can instead use the configured
 `SCRAPY_STORAGE_BACKEND_*` component for snapshots; this scheduler-owned
 acquire is independent of whether the item pipeline is enabled. A legacy
-queue-only global configuration with no storage component continues to skip
-snapshots best-effort.
+queue-only global configuration with no storage component can still start, but
+a nonempty stateful strategy now refuses clean close unless storage is configured
+or the operator explicitly selects lossy `BackendScheduler.abort(reason)`.
 
 Without an owner, the logical snapshot key is now a length-prefixed v3
 identity:
@@ -569,7 +570,10 @@ A successful restore retains its committed manifest until a later clean close
 publishes the current or empty generation. A crash during that interval replays
 the prior checkpoint: completed work can repeat, but pending work is not lost.
 Keep callbacks idempotent and alert on checkpoint failures, which extend the
-duplicate-replay window. Old unreferenced generation chunks can be removed only
+duplicate-replay window. A failed close is retryable: no destructive strategy
+cleanup or scheduler manager release occurs, and concurrent close callers receive
+a failure for that attempt. Repair storage and invoke close again; use lossy abort
+only when discarding held state is acceptable. Old unreferenced generation chunks can be removed only
 while the owning worker is stopped and after verifying they are not named by the
 logical manifest; never delete the manifest first.
 

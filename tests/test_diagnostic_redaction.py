@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from unittest.mock import MagicMock
 
+import pytest
 from scrapy import Request, Spider
 
 from scrapy_extension.exceptions import QueueError
@@ -61,12 +62,13 @@ def test_queue_snapshot_fallback_log_is_fixed_and_graph_free(caplog) -> None:
 
     caplog.clear()
     with caplog.at_level(logging.ERROR, logger="scrapy_extension.queue.queue"):
-        queue.close()
+        with pytest.raises(QueueError, match="snapshot creation"):
+            queue.close()
 
     assert [record.getMessage() for record in caplog.records] == [
-        "Strategy snapshot failed; skipping persist"
+        "Strategy snapshot creation failed"
     ]
-    assert queue._close_complete is True
+    assert queue._close_complete is False
     _assert_records_are_redacted(caplog, marker)
 
 

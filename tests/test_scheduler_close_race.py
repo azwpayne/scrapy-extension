@@ -1006,7 +1006,7 @@ class TestStateResetsAfterBaseExceptionTeardown:
         dupefilter.close.assert_called_once_with("test-done")
         manager.close.assert_called_once_with()
 
-    def test_queue_interrupt_still_closes_owned_dupefilter(self, mocker):
+    def test_queue_checkpoint_interrupt_retains_owned_dupefilter(self, mocker):
         scheduler, dupefilter, manager = _make_from_crawler_scheduler_with_dupefilter(
             mocker
         )
@@ -1022,8 +1022,9 @@ class TestStateResetsAfterBaseExceptionTeardown:
             scheduler.close("test-done")
 
         assert raised.value is first
-        dupefilter.close.assert_called_once_with("test-done")
-        manager.close.assert_called_once_with()
+        dupefilter.close.assert_not_called()
+        manager.close.assert_not_called()
+        assert scheduler._queue is not None
 
     def test_state_resets_when_owned_dupefilter_close_raises_keyboardinterrupt(
         self, mocker

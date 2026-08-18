@@ -745,10 +745,12 @@ def test_backends_queue_keeps_legacy_snapshot_when_v3_checkpoint_store_fails(
         queue.clear()
     storage.store.side_effect = RuntimeError("v3 store failed")
 
-    queue.close()
+    with pytest.raises(QueueError, match="snapshot commit"):
+        queue.close()
 
     assert state[_LEGACY_SNAPSHOT_KEY] == legacy_state
     assert _SNAPSHOT_KEY not in state
+    assert bool(strategy._holding) is (not clear_before_close)
 
 
 def test_backends_queue_retries_legacy_cleanup_after_v3_restart():
@@ -971,7 +973,9 @@ def test_backends_queue_storage_incapable_skips_cleanly():
         queue_strategy=strategy,
         monitor=MagicMock(),
     )
-    bq.close()  # _restore_snapshot (init) + _persist_snapshot (close) both skip
+    with pytest.raises(QueueError, match="requires snapshot storage"):
+        bq.close()
+    bq.close(lossy=True)
 
 
 def test_backends_queue_init_skips_when_cm_has_no_storage_attr():
@@ -987,14 +991,16 @@ def test_backends_queue_init_skips_when_cm_has_no_storage_attr():
 
     strategy = _delay(clock_value=100.0)
     strategy.push("q", b"x", delay=10.0)
-    # init + close both touch the (absent) storage interface — must not raise:
+    # Init skips restore, but nonempty close requires an explicit lossy abort:
     bq = BackendQueue(
         connection_manager=_NoStorageCM(),  # type: ignore[arg-type]
         queue_name="q",
         queue_strategy=strategy,
         monitor=MagicMock(),
     )
-    bq.close()
+    with pytest.raises(QueueError, match="requires snapshot storage"):
+        bq.close()
+    bq.close(lossy=True)
 
 
 def test_backends_queue_restore_skips_non_bytes_state():

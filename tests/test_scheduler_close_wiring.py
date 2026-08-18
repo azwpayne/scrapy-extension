@@ -26,6 +26,7 @@ class TestBackendQueueCloseDelegatesToStrategy:
 
     def test_close_calls_strategy_close(self) -> None:
         strategy = MagicMock(name="QueueStrategy")
+        strategy.snapshot.return_value = None
         bq = BackendQueue(
             connection_manager=MagicMock(name="ConnectionManager"),
             queue_name="q",
@@ -72,19 +73,19 @@ class TestBackendSchedulerCloseInvokesQueueClose:
             f"Expected queue.close before manager.close, got {call_order}"
         )
 
-    def test_close_swallows_strategy_close_exception(self) -> None:
-        """A failing strategy.close() must not prevent connection teardown or
-        crash shutdown — the scheduler logs and continues (defense-in-depth)."""
+    def test_non_checkpoint_strategy_close_exception_is_nonfatal(self) -> None:
+        """A plain strategy cleanup failure does not impersonate checkpoint failure."""
         manager = MagicMock(name="ConnectionManager")
         scheduler = BackendScheduler(connection_manager=manager)
         mock_queue = MagicMock(name="BackendQueue")
         mock_queue.close.side_effect = RuntimeError("strategy boom")
         scheduler._queue = mock_queue
 
-        scheduler.close(reason="test-done")  # must not raise
+        scheduler.close(reason="test-done")
 
         mock_queue.close.assert_called_once_with()
         manager.close.assert_called_once_with()
+        assert scheduler._queue is None
 
     def test_close_with_no_open_queue_is_safe(self) -> None:
         """If open() was never called (_queue is None), close() must not raise."""

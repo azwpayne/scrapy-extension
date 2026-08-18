@@ -130,13 +130,17 @@ until the 65,536-entry shadow evicts it or the queue lifecycle ends. Choose
 
 ### Snapshot ownership
 
-`delay`, `round_robin`, `time_wheel`, and `ring_buffer` can snapshot local state
-on a clean close. This is best-effort. A Redis, MongoDB, or Elasticsearch queue
+`delay`, `round_robin`, `time_wheel`, and `ring_buffer` snapshot local state on
+a clean close. The checkpoint is a teardown transaction gate: failure is
+surfaced and a later close retries while strategy state and managers remain live.
+A Redis, MongoDB, or Elasticsearch queue
 uses its own storage capability. For Kafka, RabbitMQ, RocketMQ, Pulsar, or SQS,
 configure `SCRAPY_STORAGE_BACKEND_TYPE` and its storage settings; the scheduler
 acquires that storage component specifically for strategy snapshots, even when
 the item pipeline is disabled. A legacy queue-only global configuration without
-a storage component still skips snapshots rather than failing startup.
+a storage component can still start, but closing nonempty state fails rather
+than silently discarding it. `BackendQueue.close(lossy=True)` (or
+`BackendScheduler.abort(reason)`) is the explicit operator-selected discard path.
 
 For multiple workers running the same spider, set a stable unique identity:
 

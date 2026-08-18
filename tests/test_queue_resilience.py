@@ -160,8 +160,10 @@ def test_persist_snapshot_skips_when_strategy_snapshot_raises() -> None:
         queue_strategy=strategy,
         monitor=MagicMock(),
     )
-    bq.close()  # must not raise
-    storage.store.assert_not_called()  # snapshot failed -> never reached store
+    with pytest.raises(QueueError, match="snapshot creation"):
+        bq.close()
+    storage.store.assert_not_called()
+    assert bq._close_complete is False
 
 
 def test_close_releases_strategy_after_begin_close_baseexception() -> None:
@@ -178,9 +180,9 @@ def test_close_releases_strategy_after_begin_close_baseexception() -> None:
         queue.close()
 
     assert raised.value is first
-    strategy.snapshot.assert_called_once_with()
-    strategy.close.assert_called_once_with()
-    assert queue._close_complete is True
+    strategy.snapshot.assert_not_called()
+    strategy.close.assert_not_called()
+    assert queue._close_complete is False
 
 
 def test_close_releases_strategy_after_snapshot_baseexception() -> None:
@@ -196,8 +198,8 @@ def test_close_releases_strategy_after_snapshot_baseexception() -> None:
         queue.close()
 
     assert raised.value is first
-    strategy.close.assert_called_once_with()
-    assert queue._close_complete is True
+    strategy.close.assert_not_called()
+    assert queue._close_complete is False
 
 
 def test_close_preserves_first_baseexception_across_all_phases() -> None:
@@ -216,10 +218,9 @@ def test_close_preserves_first_baseexception_across_all_phases() -> None:
 
     assert raised.value is first
     strategy.begin_close.assert_called_once_with()
-    strategy.snapshot.assert_called_once_with()
-    strategy.close.assert_called_once_with()
-    assert queue._close_complete is True
-    queue.close()
+    strategy.snapshot.assert_not_called()
+    strategy.close.assert_not_called()
+    assert queue._close_complete is False
 
 
 def test_persist_snapshot_skips_when_storage_resolver_raises() -> None:
@@ -234,7 +235,8 @@ def test_persist_snapshot_skips_when_storage_resolver_raises() -> None:
         queue_strategy=strategy,
         monitor=MagicMock(),
     )
-    bq.close()  # must not raise
+    with pytest.raises(QueueError, match="storage is unavailable"):
+        bq.close()
 
 
 def test_persist_snapshot_skips_when_store_raises() -> None:
@@ -248,7 +250,8 @@ def test_persist_snapshot_skips_when_store_raises() -> None:
         queue_strategy=strategy,
         monitor=MagicMock(),
     )
-    bq.close()  # must not raise
+    with pytest.raises(QueueError, match="snapshot commit"):
+        bq.close()
 
 
 @pytest.mark.parametrize(
@@ -295,9 +298,10 @@ def test_snapshot_fallback_diagnostic_failure_preserves_best_effort_contract(
             connection_manager=cm, queue_name="q", queue_strategy=strategy
         )
         strategy.snapshot = MagicMock(side_effect=RuntimeError("snapshot boom"))  # type: ignore[method-assign]
-        queue.close()
+        with pytest.raises(QueueError, match="snapshot creation"):
+            queue.close()
         storage.store.assert_not_called()
-        assert queue._close_complete is True
+        assert queue._close_complete is False
     elif fallback_site == "storage-incapable":
         queue = BackendQueue(
             connection_manager=cm, queue_name="q", queue_strategy=strategy
@@ -311,9 +315,10 @@ def test_snapshot_fallback_diagnostic_failure_preserves_best_effort_contract(
             connection_manager=cm, queue_name="q", queue_strategy=strategy
         )
         cm.get_storage_backend.side_effect = RuntimeError("resolver boom")
-        queue.close()
+        with pytest.raises(QueueError, match="storage is unavailable"):
+            queue.close()
         storage.store.assert_not_called()
-        assert queue._close_complete is True
+        assert queue._close_complete is False
     elif fallback_site == "store":
         strategy.push("q", b"held", delay=10.0)
         storage.store.side_effect = RuntimeError("store boom")
@@ -322,9 +327,10 @@ def test_snapshot_fallback_diagnostic_failure_preserves_best_effort_contract(
         )
         # Construction restores before close; retain the queued held state after
         # that no-op restore so persist reaches the failing store.
-        queue.close()
+        with pytest.raises(QueueError, match="snapshot commit"):
+            queue.close()
         storage.store.assert_called_once()
-        assert queue._close_complete is True
+        assert queue._close_complete is False
     elif fallback_site == "restore-resolver":
         cm.get_storage_backend.side_effect = RuntimeError("resolver boom")
         queue = BackendQueue(
@@ -378,7 +384,7 @@ def test_snapshot_operations_preserve_direct_control_flow_exceptions(
         with pytest.raises(KeyboardInterrupt) as raised:
             queue.close()
         assert raised.value is control_error
-        assert queue._close_complete is True
+        assert queue._close_complete is False
     elif failure_site == "persist-resolver":
         queue = BackendQueue(
             connection_manager=cm, queue_name="q", queue_strategy=strategy
@@ -387,7 +393,7 @@ def test_snapshot_operations_preserve_direct_control_flow_exceptions(
         with pytest.raises(KeyboardInterrupt) as raised:
             queue.close()
         assert raised.value is control_error
-        assert queue._close_complete is True
+        assert queue._close_complete is False
     elif failure_site == "store":
         strategy.push("q", b"held", delay=10.0)
         storage.store.side_effect = control_error
@@ -397,7 +403,7 @@ def test_snapshot_operations_preserve_direct_control_flow_exceptions(
         with pytest.raises(KeyboardInterrupt) as raised:
             queue.close()
         assert raised.value is control_error
-        assert queue._close_complete is True
+        assert queue._close_complete is False
     elif failure_site == "restore-resolver":
         cm.get_storage_backend.side_effect = control_error
         with pytest.raises(KeyboardInterrupt) as raised:
@@ -1091,15 +1097,12 @@ def test_persist_snapshot_warns_when_over_cap(
         queue_strategy=strategy,
         monitor=MagicMock(),
     )
-    with caplog.at_level(logging.WARNING, logger="scrapy_extension.queue.queue"):
-        bq.close()  # must not raise
-    # The over-cap warning fired at persist (close) time, not deferred to restore.
-    assert any(
-        "DROPPED on restart" in r.message and r.levelno == logging.WARNING
-        for r in caplog.records
-    ), [r.message for r in caplog.records]
-    # Persist still happened (operator gets a chance to act before restart).
-    storage.store.assert_called_once()
+    with caplog.at_level(logging.ERROR, logger="scrapy_extension.queue.queue"):
+        with pytest.raises(QueueError, match="snapshot commit"):
+            bq.close()
+    assert any("snapshot commit failed" in r.message.lower() for r in caplog.records)
+    # The symmetric cap rejects before the first backend write.
+    storage.store.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -1131,10 +1134,9 @@ def test_persist_snapshot_over_cap_diagnostic_failure_keeps_checkpoint(
         monitor=MagicMock(),
     )
 
-    queue.close()
+    with pytest.raises(QueueError, match="snapshot commit"):
+        queue.close()
 
-    storage.store.assert_called_once_with(
-        queue._snapshot_key(), strategy.snapshot.return_value
-    )
-    strategy.close.assert_called_once_with()
-    assert queue._close_complete is True
+    storage.store.assert_not_called()
+    strategy.close.assert_not_called()
+    assert queue._close_complete is False
