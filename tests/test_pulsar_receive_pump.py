@@ -857,6 +857,37 @@ def test_disconnect_wins_before_atomic_buffer_extraction(
         backend.disconnect()
 
 
+@pytest.mark.parametrize(
+    "control_error",
+    [KeyboardInterrupt("pump close interrupt"), SystemExit("pump close exit")],
+    ids=["keyboard-interrupt", "system-exit"],
+)
+def test_disconnect_preserves_pump_close_control_after_bookkeeping(
+    mocker: Any, control_error: BaseException
+) -> None:
+    """Pump retirement transfers exact process control only after cleanup."""
+    consumer = MagicMock(name="pump-control-close-consumer")
+    consumer.receive.side_effect = pulsar.Timeout("empty")
+    consumer.close.side_effect = control_error
+    backend = _connected_backend(mocker, [consumer])
+
+    assert backend.pop("pump-control-close", timeout=0) is None
+    pump = backend._receive_pumps["scrapy-pump-control-close"]
+    assert pump.receive_started.wait(timeout=0.5)
+
+    with pytest.raises(type(control_error)) as captured:
+        backend.disconnect()
+
+    assert captured.value is control_error
+    assert control_error.__cause__ is None
+    assert control_error.__context__ is None
+    assert backend._client is None
+    assert backend._receive_pumps == {}
+    assert backend._consumers == {}
+    assert len(pump.records) == 0
+    consumer.close.assert_called_once_with()
+
+
 def test_disconnect_is_bounded_when_close_does_not_interrupt_receive(
     mocker: Any,
 ) -> None:

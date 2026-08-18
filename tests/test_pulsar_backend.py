@@ -586,6 +586,35 @@ class TestPulsarConnect:
         assert b._producers == {}
         assert b._client is None
 
+    def test_disconnect_terminally_redacts_direct_close_control_error(
+        self, mocker
+    ) -> None:
+        marker = "private-direct-close-context-marker"
+        control_error = SystemExit("direct close exit")
+        direct_consumer = mocker.MagicMock(name="direct_consumer")
+
+        def close_with_private_context() -> None:
+            try:
+                raise RuntimeError(marker)
+            except RuntimeError:
+                raise control_error
+
+        direct_consumer.close.side_effect = close_with_private_context
+        b, client = _connected(mocker)
+        b._consumer = direct_consumer
+
+        with pytest.raises(SystemExit) as captured:
+            b.disconnect()
+
+        assert captured.value is control_error
+        assert control_error.__cause__ is None
+        assert control_error.__context__ is None
+        assert marker not in "".join(traceback.format_exception(control_error))
+        assert b._consumer is None
+        assert b._client is None
+        direct_consumer.close.assert_called_once_with()
+        client.close.assert_called_once_with()
+
     def test_disconnect_ignores_diagnostic_control_error_after_close_error(
         self, mocker
     ) -> None:
