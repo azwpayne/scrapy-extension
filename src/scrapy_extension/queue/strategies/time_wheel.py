@@ -91,6 +91,7 @@ class TimeWheelQueueStrategy(QueueStrategy):
         _default_delay: Default delay seconds when push omits ``delay``.
         _clock: Monotonic clock callable (injectable for tests).
         _wheel: ``[deque((item, priority), ...)]`` per slot.
+        _slot_min_deadlines: Minimum ``ready_at`` held by each wheel slot.
         _overflow: Min-heap of ``(ready_at, seq, item, priority)`` for long delays.
         _seq: Tie-break counter for stable heap ordering.
         _last_tick: Tick up to which the wheel has been drained.
@@ -154,6 +155,7 @@ class TimeWheelQueueStrategy(QueueStrategy):
         self._wheel: list[deque[tuple[float, bytes, float]]] = [
             deque() for _ in range(wheel_size)
         ]
+        self._slot_min_deadlines: list[float | None] = [None] * wheel_size
         self._overflow: list[tuple[float, int, bytes, float]] = []
         self._seq = itertools.count()
         self._state_lock = threading.RLock()
@@ -184,6 +186,21 @@ class TimeWheelQueueStrategy(QueueStrategy):
         if not math.isfinite(scaled):
             raise ValueError(f"ready time tick must be finite, got {scaled}")
         return math.ceil(scaled) % self._wheel_size
+
+    def _append_wheel_entry(self, slot: int, entry: tuple[float, bytes, float]) -> None:
+        """Append one entry and update its slot's derived minimum in O(1)."""
+        ready_at = entry[0]
+        self._wheel[slot].append(entry)
+        current_minimum = self._slot_min_deadlines[slot]
+        if current_minimum is None or ready_at < current_minimum:
+            self._slot_min_deadlines[slot] = ready_at
+
+    def _recompute_slot_min_deadline(self, slot: int) -> None:
+        """Rebuild the derived minimum after a slot has been drained."""
+        self._slot_min_deadlines[slot] = min(
+            (ready_at for ready_at, _item, _priority in self._wheel[slot]),
+            default=None,
+        )
 
     # ------------------------------------------------------------------ push
 
@@ -225,7 +242,7 @@ class TimeWheelQueueStrategy(QueueStrategy):
                 slot = self._slot_at(ready_at)
                 # Store ready_at in the slot entry so _drain_ready can skip items whose
                 # delay hasn't elapsed (matters after a long idle — see _drain_ready).
-                self._wheel[slot].append((ready_at, item, priority))
+                self._append_wheel_entry(slot, (ready_at, item, priority))
             else:
                 heapq.heappush(
                     self._overflow, (ready_at, next(self._seq), item, priority)
@@ -277,7 +294,9 @@ class TimeWheelQueueStrategy(QueueStrategy):
                     raise ValueError(f"ready time must be finite, got {ready_at}")
                 if effective <= self._wheel_duration:
                     slot = self._slot_at(ready_at)
-                    self._wheel[slot].append((ready_at, item, normalized_priority))
+                    self._append_wheel_entry(
+                        slot, (ready_at, item, normalized_priority)
+                    )
                 else:
                     heapq.heappush(
                         self._overflow,
@@ -338,16 +357,19 @@ class TimeWheelQueueStrategy(QueueStrategy):
         )
 
     def _next_release_at(self) -> float | None:
-        """Return the next local release, respecting wheel tick granularity."""
+        """Return the next release after scanning only slot minima + overflow head."""
         with self._state_lock:
-            candidates = [
-                math.ceil(ready_at * self._ticks_per_second) / self._ticks_per_second
-                for slot in self._wheel
-                for ready_at, _item, _priority in slot
-            ]
-            if self._overflow:
-                candidates.append(self._overflow[0][0])
-            return min(candidates) if candidates else None
+            next_release = self._overflow[0][0] if self._overflow else None
+            for ready_at in self._slot_min_deadlines:
+                if ready_at is None:
+                    continue
+                release_at = (
+                    math.ceil(ready_at * self._ticks_per_second)
+                    / self._ticks_per_second
+                )
+                if next_release is None or release_at < next_release:
+                    next_release = release_at
+            return next_release
 
     def _pop_until_deadline(
         self,
@@ -418,13 +440,18 @@ class TimeWheelQueueStrategy(QueueStrategy):
                 # rare mixed future/due catch-up path pays indexed-deque deletion cost.
                 entry_index = 0
                 entries_to_scan = len(dq)
-                for _ in range(entries_to_scan):
-                    ready_at_h, item, priority = dq[entry_index]
-                    if ready_at_h > now:
-                        entry_index += 1
-                        continue
-                    qb.push(queue_name, item, priority)
-                    del dq[entry_index]
+                try:
+                    for _ in range(entries_to_scan):
+                        ready_at_h, item, priority = dq[entry_index]
+                        if ready_at_h > now:
+                            entry_index += 1
+                            continue
+                        qb.push(queue_name, item, priority)
+                        del dq[entry_index]
+                finally:
+                    # This slot may now contain only a future tail, or a failed
+                    # due entry plus its tail. Recompute only the slot just scanned.
+                    self._recompute_slot_min_deadline(slot)
             # Drain due overflow. The lock spans backend push through heap removal:
             # another pop must not publish the same uncommitted heap head.
             while self._overflow and self._overflow[0][0] <= now:
@@ -450,6 +477,7 @@ class TimeWheelQueueStrategy(QueueStrategy):
             self._connection_manager.get_queue_backend().clear_queue(queue_name)
             for slot in self._wheel:
                 slot.clear()
+            self._slot_min_deadlines = [None] * self._wheel_size
             self._overflow.clear()
 
     def close(self) -> None:
@@ -458,6 +486,7 @@ class TimeWheelQueueStrategy(QueueStrategy):
             held = sum(len(slot) for slot in self._wheel) + len(self._overflow)
             for slot in self._wheel:
                 slot.clear()
+            self._slot_min_deadlines = [None] * self._wheel_size
             self._overflow.clear()
 
         if held > 0:
@@ -573,7 +602,17 @@ class TimeWheelQueueStrategy(QueueStrategy):
             except BaseException:
                 pass
             return
-        version = int(data["version"])
+        try:
+            version = int(data["version"])
+        except (OverflowError, TypeError, ValueError):
+            try:
+                logger.warning(
+                    "TimeWheelQueueStrategy restore: invalid snapshot version; "
+                    "starting clean."
+                )
+            except BaseException:
+                pass
+            return
         with self._state_lock:
             now = self._clock_now()
             downtime = 0.0
@@ -587,7 +626,7 @@ class TimeWheelQueueStrategy(QueueStrategy):
                     ):
                         raise ValueError("wall clock is not finite")
                     downtime = max(0.0, current_wall_time - snapshot_wall_time)
-                except (KeyError, TypeError, ValueError):
+                except (KeyError, OverflowError, TypeError, ValueError):
                     invalid_v2_clock_metadata = True
                 if invalid_v2_clock_metadata:
                     try:
@@ -628,7 +667,13 @@ class TimeWheelQueueStrategy(QueueStrategy):
                     if not math.isfinite(priority):
                         raise ValueError("priority is not finite")
                     ready_at, original_deadline = restored_timing(entry)
-                except (KeyError, TypeError, ValueError, binascii.Error):
+                except (
+                    KeyError,
+                    OverflowError,
+                    TypeError,
+                    ValueError,
+                    binascii.Error,
+                ):
                     malformed_wheel_entry = True
                 if malformed_wheel_entry:
                     try:
@@ -651,7 +696,13 @@ class TimeWheelQueueStrategy(QueueStrategy):
                     priority = float(entry["priority"])
                     if not math.isfinite(priority):
                         raise ValueError("priority is not finite")
-                except (KeyError, TypeError, ValueError, binascii.Error):
+                except (
+                    KeyError,
+                    OverflowError,
+                    TypeError,
+                    ValueError,
+                    binascii.Error,
+                ):
                     malformed_overflow_entry = True
                 if malformed_overflow_entry:
                     try:
@@ -668,6 +719,7 @@ class TimeWheelQueueStrategy(QueueStrategy):
             recovered_wheel: list[deque[tuple[float, bytes, float]]] = [
                 deque() for _ in range(self._wheel_size)
             ]
+            recovered_slot_min_deadlines: list[float | None] = [None] * self._wheel_size
             recovered_overflow: list[tuple[float, int, bytes, float]] = []
             recovered_seq = itertools.count()
             # Expired deadlines collapse to ``now``. Retain their original deadline
@@ -683,9 +735,11 @@ class TimeWheelQueueStrategy(QueueStrategy):
             for ready_at, _original_deadline, _order, item, priority in staged:
                 use_wheel = ready_at > now and ready_at - now <= self._wheel_duration
                 if use_wheel:
-                    recovered_wheel[self._slot_at(ready_at)].append(
-                        (ready_at, item, priority)
-                    )
+                    slot = self._slot_at(ready_at)
+                    recovered_wheel[slot].append((ready_at, item, priority))
+                    slot_minimum = recovered_slot_min_deadlines[slot]
+                    if slot_minimum is None or ready_at < slot_minimum:
+                        recovered_slot_min_deadlines[slot] = ready_at
                 else:
                     heapq.heappush(
                         recovered_overflow,
@@ -695,6 +749,7 @@ class TimeWheelQueueStrategy(QueueStrategy):
             # fully decoded replacement in one lock-held commit so restore is
             # idempotent and readers never observe a partially rebuilt wheel.
             self._wheel = recovered_wheel
+            self._slot_min_deadlines = recovered_slot_min_deadlines
             self._overflow = recovered_overflow
             self._seq = recovered_seq
             self._last_tick = self._tick_at(now)

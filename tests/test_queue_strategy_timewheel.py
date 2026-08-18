@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 import json
 import math
+import random
 import threading
 from collections import deque
 from unittest.mock import MagicMock
@@ -90,6 +91,69 @@ def test_pop_with_ack_preserves_token_after_local_deadline(mocker):
     delegated = mocker.patch.object(s, "_pop_backend_with_ack", side_effect=backend_pop)
     assert s.pop_with_ack("q", timeout=10.0) == (b"held", "token")
     assert delegated.call_args_list[0].args == ("q", 5.0)
+
+
+def test_next_release_lookup_inspects_wheel_size_not_held_entries():
+    """100k held entries still require exactly one scan of the slot minima."""
+
+    class IterationForbiddenDeque(deque):
+        def __iter__(self):
+            raise AssertionError("release lookup inspected held entries")
+
+    class CountingMinima(list[float | None]):
+        inspected = 0
+
+        def __iter__(self):
+            for deadline in super().__iter__():
+                self.inspected += 1
+                yield deadline
+
+    wheel_size = 64
+    s, _qb, _clock = _strategy(wheel_size=wheel_size, clock_value=0.0)
+    for _ in range(100_000):
+        s.push("q", b"held", delay=5.0)
+    slot = 5 % wheel_size
+    s._wheel[slot] = IterationForbiddenDeque(s._wheel[slot])
+    minima = CountingMinima(s._slot_min_deadlines)
+    s._slot_min_deadlines = minima
+
+    assert s._next_release_at() == 5.0
+    assert minima.inspected == wheel_size
+
+
+def test_next_release_cache_matches_brute_force_randomized():
+    """Cached minima remain equivalent across deterministic pushes and drains."""
+    rng = random.Random(0x5EED)
+    s, _qb, clock = _strategy(
+        wheel_size=17,
+        ticks_per_second=2.5,
+        clock_value=0.0,
+    )
+
+    for index in range(2_000):
+        if rng.random() < 0.8:
+            s.push(
+                "q",
+                index.to_bytes(2, byteorder="big"),
+                delay=rng.uniform(0.001, 14.0),
+            )
+        else:
+            clock[0] += rng.uniform(0.0, 2.0)
+            s._drain_ready("q")
+
+        brute_force = [
+            math.ceil(ready_at * s._ticks_per_second) / s._ticks_per_second
+            for wheel_slot in s._wheel
+            for ready_at, _item, _priority in wheel_slot
+        ]
+        if s._overflow:
+            brute_force.append(s._overflow[0][0])
+        expected = min(brute_force) if brute_force else None
+        actual = s._next_release_at()
+        if expected is None:
+            assert actual is None
+        else:
+            assert actual == pytest.approx(expected)
 
 
 def test_push_default_delay_when_omitted():
@@ -543,8 +607,18 @@ def test_clear_clears_wheel_overflow_and_live():
     s.push("q", b"b", delay=100.0)
     s.clear("q")
     assert all(len(slot) == 0 for slot in s._wheel)
+    assert all(deadline is None for deadline in s._slot_min_deadlines)
     assert len(s._overflow) == 0
     qb.clear_queue.assert_called_once_with("q")
+
+
+def test_close_resets_slot_minimum_deadlines():
+    s, _qb, _clock = _strategy(wheel_size=60, clock_value=100.0)
+    s.push("q", b"a", delay=10.0)
+
+    s.close()
+
+    assert all(deadline is None for deadline in s._slot_min_deadlines)
 
 
 # ---------------------------------------------------------------------------
@@ -584,6 +658,18 @@ def test_snapshot_restore_preserves_overflow_heap_stable_order():
     actual = [entry[2] for entry in sorted(restored._overflow)]
 
     assert actual == expected
+
+
+def test_restore_rebuilds_slot_minimum_deadlines():
+    source, _, _ = _strategy(wheel_size=10, clock_value=0.0)
+    source.push("q", b"later", delay=5.0)
+    source.push("q", b"earlier", delay=4.1)
+
+    restored, _, _ = _strategy(wheel_size=10, clock_value=0.0)
+    restored.restore(source.snapshot())
+
+    assert restored._slot_min_deadlines[5] == 4.1
+    assert restored._next_release_at() == 5.0
 
 
 def test_restore_round_trip_rebuilds_state():
@@ -738,6 +824,62 @@ def test_restore_non_list_collection_is_skipped_without_crashing(field):
         "overflow": [],
     }
     data[field] = 42
+
+    s.restore(json.dumps(data).encode())
+
+    assert all(not slot for slot in s._wheel)
+    assert s._overflow == []
+
+
+def test_restore_huge_integer_clock_metadata_is_rejected_without_escape():
+    s, _, _ = _strategy()
+    s.push("q", b"live", delay=1.0)
+    data = {
+        "version": 2,
+        "strategy": "time_wheel",
+        "snapshot_wall_time": 10**1_000,
+        "slots_flat": [],
+        "overflow": [],
+    }
+
+    s.restore(json.dumps(data).encode())
+
+    assert sum(len(slot) for slot in s._wheel) == 1
+
+
+@pytest.mark.parametrize(
+    ("version", "collection", "numeric_field"),
+    [
+        (1, "slots_flat", "ready_at"),
+        (1, "overflow", "ready_at"),
+        (1, "slots_flat", "priority"),
+        (1, "overflow", "priority"),
+        (2, "slots_flat", "remaining"),
+        (2, "overflow", "remaining"),
+        (2, "slots_flat", "priority"),
+        (2, "overflow", "priority"),
+    ],
+)
+def test_restore_huge_integer_entry_is_skipped_without_escape(
+    version, collection, numeric_field
+):
+    deadline_field = "ready_at" if version == 1 else "remaining"
+    entry = {
+        deadline_field: 1.0,
+        "item_b64": base64.b64encode(b"huge").decode(),
+        "priority": 0.0,
+    }
+    entry[numeric_field] = 10**1_000
+    data = {
+        "version": version,
+        "strategy": "time_wheel",
+        "slots_flat": [],
+        "overflow": [],
+    }
+    if version == 2:
+        data["snapshot_wall_time"] = 1_000.0
+    data[collection] = [entry]
+    s, _, _ = _strategy()
 
     s.restore(json.dumps(data).encode())
 
