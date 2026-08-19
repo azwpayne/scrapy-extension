@@ -69,14 +69,21 @@ def physical_strategy_queue_name(
     Backends that accepted the package's published colon-delimited names keep
     using them for both reads and writes, so upgrades see the existing backlog
     without permanent dual queues or doubled RPCs. Strict-name backends use the
-    portable hash. RabbitMQ is the one compatible backend with a relevant hard
+    portable hash — as do colon-bearing discriminators, whose legacy name would
+    be ambiguous. RabbitMQ is the one compatible backend with a relevant hard
     name limit; a legacy name over 255 UTF-8 bytes could never have existed, so
     the portable name is safe there.
     """
     backend_type = _backend_type_name(connection_manager)
     legacy_supported = backend_type in _LEGACY_COLON_QUEUE_BACKENDS
     rabbit_name_fits = backend_type != "rabbitmq" or len(legacy_name.encode()) <= 255
-    if legacy_supported and rabbit_name_fits:
+    # Invariant: "{queue}:{discriminator}" is collision-free only while the
+    # discriminator is colon-free — a colon there lets (q, "a:b") and
+    # (q + ":a", "b") land on one physical queue. Queue names may still carry
+    # colons: every would-be collision partner has a colon-bearing
+    # discriminator and now hashes away from all legacy names.
+    discriminator_unambiguous = ":" not in discriminator
+    if legacy_supported and rabbit_name_fits and discriminator_unambiguous:
         return legacy_name
     return strategy_queue_name(
         queue_name,

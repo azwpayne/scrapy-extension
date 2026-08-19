@@ -360,6 +360,17 @@ def test_rabbitmq_uses_portable_name_only_when_legacy_name_cannot_exist():
     assert len(physical.encode()) <= 255
 
 
+def test_colon_bearing_queue_name_keeps_published_bucket_name():
+    """R138: priority discriminators are digits, so a colon-bearing queue name
+    keeps the legacy ``{queue}:p{level}`` bucket name (backlog compat)."""
+    cm = MagicMock(name="ConnectionManager")
+    cm.backend_type = "redis"
+    cm.get_queue_backend.return_value = MagicMock()
+    s = PriorityQueueStrategy(cm, levels=3)
+
+    assert s._bucket_queue("jobs:a", 1) == "jobs:a:p1"
+
+
 def test_pop_returns_none_when_all_levels_empty_no_timeout():
     """All levels empty, timeout=0 → scans all levels, returns None."""
     s, qb = _strategy(levels=3)
