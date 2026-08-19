@@ -75,6 +75,10 @@ _filter_full_warned: bool = False
 # for isolation.
 _backend_error_warned: bool = False
 
+# Compensation has a distinct warning because its risk is a surviving remote
+# marker that suppresses a URL, rather than an admitted duplicate fetch.
+_forget_backend_error_warned: bool = False
+
 _DEDUP_BACKEND_FAILURE_MESSAGE = "Dedup backend is unavailable."
 _DEDUP_CIRCUIT_BREAKER_NAME = "dedup"
 
@@ -104,7 +108,18 @@ _MonitorHook = Literal[
 ]
 _PendingMonitorEvent = tuple[_MonitorHook, tuple[object, ...]]
 _MonitorEvent = tuple[_MonitorHook, tuple[object, ...], object]
-_ContinuationDiagnostic = Literal["filter_full", "backend_error"]
+_ContinuationDiagnostic = Literal[
+    "filter_full",
+    "backend_error",
+    "forget_backend_error",
+]
+
+
+def _static_backend_error(exc: BaseException) -> BaseException:
+    """Return a fixed package error without exposing the driving exception."""
+    if type(exc) is CircuitBreakerOpenError:
+        return CircuitBreakerOpenError(_DEDUP_CIRCUIT_BREAKER_NAME)
+    return BackendConnectionError(_DEDUP_BACKEND_FAILURE_MESSAGE)
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -168,14 +183,15 @@ class BackendDupeFilter:
     (wired in ``from_settings``).
 
     Attributes:
-        connection_manager: The connection manager for backend access.
+        connection_manager: The connection manager for backend access. ``None``
+            for in-process strategies built without a backend.
         key: The key for the fingerprints set / filter scope.
         debug: Whether to log filtered requests.
     """
 
     def __init__(
         self,
-        connection_manager: ConnectionManager,
+        connection_manager: ConnectionManager | None,
         key: str = "dupefilter",
         *,
         debug: bool = False,
@@ -189,7 +205,8 @@ class BackendDupeFilter:
         """Initialize the dupefilter.
 
         Args:
-            connection_manager: Connection manager for backend access.
+            connection_manager: Connection manager for backend access. May be
+                ``None`` when an in-process ``membership_filter`` is supplied.
             key: Key for the fingerprints set / filter scope. May contain the
                 literal placeholder ``"{spider}"``; when present it is
                 substituted with ``spider.name`` at :meth:`open` time so each
@@ -219,20 +236,26 @@ class BackendDupeFilter:
                 dupefilters; composite owners can pass False and release their
                 single shared acquire after all borrowed components are closed.
         """
+        if connection_manager is None and connection_manager_lease is not None:
+            raise ValueError("connection_manager_lease requires connection_manager")
         self.connection_manager = connection_manager
         self.key = key
         self.debug = debug
         self.clear_on_open = clear_on_open
         self._fingerprinter = fingerprinter
         self._monitor: Monitor = monitor if monitor is not None else NullMonitor()
-        # Use ``is None`` (not ``or``): a MembershipFilter defines __len__, so an
-        # empty filter (len == 0) would be falsy and ``or`` would wrongly discard
-        # it. Only fall through when no filter was supplied at all.
-        self._filter: MembershipFilter = (
-            membership_filter
-            if membership_filter is not None
-            else SetMembershipFilter(connection_manager, key)
-        )
+        # Use explicit None checks: MembershipFilter defines __len__, so an empty
+        # filter can be falsy. A manager is required only for the default set filter.
+        if membership_filter is not None:
+            self._filter: MembershipFilter = membership_filter
+        elif connection_manager is not None:
+            self._filter = SetMembershipFilter(connection_manager, key)
+        else:
+            raise ConfigurationError(
+                "BackendDupeFilter requires a connection manager when no "
+                "membership filter strategy is supplied.",
+                setting_name="SCRAPY_DEDUP_STRATEGY",
+            )
         self._retry_allowances: OrderedDict[bytes, None] = OrderedDict()
         self._retry_allowance_lock = Lock()
         self._retry_allowance_limit = _DEFAULT_RETRY_ALLOWANCE_LIMIT
@@ -406,7 +429,7 @@ class BackendDupeFilter:
         pending_events: list[_PendingMonitorEvent],
     ) -> tuple[_MonitorFenceToken | None, bool]:
         """Append one complete telemetry batch while lifecycle state is locked."""
-        monitor_events = [
+        monitor_events: list[_MonitorEvent] = [
             (hook_name, args, origin_request) for hook_name, args in pending_events
         ]
         should_warn_overflow = False
@@ -456,12 +479,20 @@ class BackendDupeFilter:
                         "process; subsequent overflows are counted via the "
                         "dupefilter/filter_full stat only."
                     )
-                else:
+                elif diagnostic == "backend_error":
                     logger.warning(
                         "Dedup backend transiently unavailable; degrading — requests will be "
                         "treated as not-seen and may re-fetch until the backend recovers. This "
                         "warning fires once per process; subsequent transient backend errors "
                         "are counted via the errors/dedup stat only."
+                    )
+                else:
+                    logger.warning(
+                        "Dedup backend transiently unavailable while compensating a failed "
+                        "queue push; the remote marker may survive. A one-shot retry "
+                        "allowance was granted so the fingerprint can be re-crawled once. "
+                        "This warning fires once per process; subsequent failures during "
+                        "forget are counted via the errors/dedup stat only."
                     )
             except BaseException:
                 # The graceful-miss outcome was already selected before reporting it.
@@ -536,18 +567,21 @@ class BackendDupeFilter:
                 setting_name="SCRAPY_DEDUP_STRATEGY",
                 setting_value=str(raw_strategy),
             ) from e
-        backend_type, backend_settings = resolve_backend_config(
-            settings,
-            type_key="SCRAPY_SET_BACKEND_TYPE",
-            settings_key="SCRAPY_SET_BACKEND_SETTINGS",
-            required_capabilities={"set"} if strategy is DedupeStrategy.SET else set(),
-            component_name="set",
-        )
-        manager_lease = ConnectionManager.acquire_lease(
-            backend_type=backend_type,
-            settings=backend_settings,
-        )
-        manager = manager_lease.manager
+        manager = None
+        manager_lease = None
+        if strategy is DedupeStrategy.SET:
+            backend_type, backend_settings = resolve_backend_config(
+                settings,
+                type_key="SCRAPY_SET_BACKEND_TYPE",
+                settings_key="SCRAPY_SET_BACKEND_SETTINGS",
+                required_capabilities={"set"},
+                component_name="set",
+            )
+            manager_lease = ConnectionManager.acquire_lease(
+                backend_type=backend_type,
+                settings=backend_settings,
+            )
+            manager = manager_lease.manager
         try:
             key = settings.get("SCRAPY_DUPEFILTER_KEY", "dupefilter")
             # getpriority() distinguishes an absent setting from an explicitly stored
@@ -676,15 +710,16 @@ class BackendDupeFilter:
                 connection_manager_lease=manager_lease,
             )
         except BaseException:
-            try:
-                manager_lease.release()
-            except BaseException:
+            if manager_lease is not None:
                 try:
-                    logger.exception(
-                        "Failed to release ConnectionManager after dupefilter factory failure"
-                    )
+                    manager_lease.release()
                 except BaseException:
-                    pass
+                    try:
+                        logger.exception(
+                            "Failed to release ConnectionManager after dupefilter factory failure"
+                        )
+                    except BaseException:
+                        pass
             raise
 
     @classmethod
@@ -711,11 +746,11 @@ class BackendDupeFilter:
             if stats is not None:
                 dupefilter._monitor = ScrapyStatsMonitor(stats)
                 dupefilter._set_filter_monitor()
-                # R25-F: thread the monitor into the dedup ConnectionManager so
-                # backend/{connect,disconnect,retry}_count cover the set backend in
-                # multi-backend deployments (queue≠dedup). All component monitors wrap
-                # the same crawler.stats, so counters aggregate across managers.
-                dupefilter.connection_manager.set_monitor(dupefilter._monitor)
+                # R25-F: thread the monitor into the dedup ConnectionManager when
+                # this strategy has one. In-process filters emit their own hooks and
+                # intentionally acquire no backend manager.
+                if dupefilter.connection_manager is not None:
+                    dupefilter.connection_manager.set_monitor(dupefilter._monitor)
             return dupefilter
         except BaseException:
             try:
@@ -910,6 +945,7 @@ class BackendDupeFilter:
     def _close_locked(self) -> None:
         """Run reserved filter/manager callbacks outside ``_lifecycle_lock``."""
         primary_error: BaseException | None = None
+        secondary_release_failed = False
         if not self._filter_released:
             try:
                 self._filter.close()
@@ -921,6 +957,7 @@ class BackendDupeFilter:
         if (
             self._filter_released
             and self._owns_connection_manager
+            and self.connection_manager is not None
             and not self._manager_released
         ):
             try:
@@ -932,22 +969,32 @@ class BackendDupeFilter:
                 if primary_error is None:
                     primary_error = exc
                 else:
-                    try:
-                        logger.error(
-                            "ConnectionManager close failed while preserving filter close error",
-                            exc_info=(type(exc), exc, exc.__traceback__),
-                        )
-                    except BaseException:
-                        pass
+                    # Defer logging until the exception handler has unwound: a
+                    # custom handler may inspect sys.exc_info() even when the
+                    # LogRecord itself has no explicit exc_info payload.
+                    secondary_release_failed = True
             else:
                 with self._lifecycle_lock:
                     self._manager_released = True
+        if secondary_release_failed:
+            try:
+                logger.error(
+                    "ConnectionManager close failed while preserving filter close error"
+                )
+            except BaseException:
+                pass
         with self._lifecycle_lock:
             if self._filter_released and (
-                not self._owns_connection_manager or self._manager_released
+                not self._owns_connection_manager
+                or self.connection_manager is None
+                or self._manager_released
             ):
                 self._closed = True
                 self._closing = False
+                # Terminal close has no future monitor dispatch. Drop retained
+                # Request references and invalidate any interrupted drainer.
+                self._monitor_events.clear()
+                self._monitor_drain_token = None
         if primary_error is not None:
             raise primary_error
 
@@ -1520,8 +1567,11 @@ class BackendDupeFilter:
 
         Filters with exact atomic deletion remove the reservation immediately.
         Filters such as Bloom and Cuckoo that raise ``NotImplementedError`` retain
-        their marker and receive one bounded retry allowance instead. The next matching
-        :meth:`request_seen` atomically consumes that allowance and returns a miss;
+        their marker and receive one bounded retry allowance instead. A transient
+        backend or circuit-breaker failure during removal receives the same allowance,
+        reports one static monitor error, and does not strand a ghost marker without a
+        retry path. The next matching :meth:`request_seen` atomically consumes that
+        allowance and returns a miss;
         a successful queue push consumes no further state, while another push
         failure calls ``forget`` again and re-arms one allowance.
 
@@ -1533,6 +1583,8 @@ class BackendDupeFilter:
         Args:
             request: The request whose newly-added fingerprint must be compensated.
         """
+        pending_monitor_events: list[_PendingMonitorEvent] = []
+        pending_diagnostics: list[_ContinuationDiagnostic] = []
         with self._lifecycle_lock:
             if self._closed or self._closing:
                 raise RuntimeError("dupefilter is closing or closed")
@@ -1543,10 +1595,22 @@ class BackendDupeFilter:
                 self._filter.remove(fingerprint)
             except NotImplementedError:
                 retry_allowance_needed = True
+            except (BackendConnectionError, CircuitBreakerOpenError) as exc:
+                retry_allowance_needed = True
+                self._handle_forget_backend_error(
+                    exc,
+                    pending_monitor_events,
+                    pending_diagnostics,
+                )
             if retry_allowance_needed:
-                # ``NotImplementedError`` is no longer active when the helper emits
-                # its bounded-overflow warning.
+                # The handled exception has unwound before advisory overflow logging.
                 self._grant_retry_allowance(fingerprint)
+            drain_token, should_warn_overflow = self._queue_monitor_events_unlocked(
+                request,
+                pending_monitor_events,
+            )
+        self._emit_continuation_diagnostics(pending_diagnostics)
+        self._dispatch_queued_monitor_events(drain_token, should_warn_overflow)
 
     def _grant_retry_allowance(self, fingerprint: bytes) -> None:
         """Insert or refresh one bounded retry allowance for ``fingerprint``."""
@@ -1652,15 +1716,22 @@ class BackendDupeFilter:
         if not _backend_error_warned:
             _backend_error_warned = True
             diagnostics.append("backend_error")
-        if type(exc) is CircuitBreakerOpenError:
-            reported_error: BaseException = CircuitBreakerOpenError(
-                _DEDUP_CIRCUIT_BREAKER_NAME
-            )
-        else:
-            reported_error = BackendConnectionError(_DEDUP_BACKEND_FAILURE_MESSAGE)
-        monitor_events.append(("on_error", ("dedup", reported_error)))
+        monitor_events.append(("on_error", ("dedup", _static_backend_error(exc))))
         if include_miss:
             monitor_events.append(("on_dedup_miss", (fingerprint,)))
+
+    def _handle_forget_backend_error(
+        self,
+        exc: BaseException,
+        monitor_events: list[_PendingMonitorEvent],
+        diagnostics: list[_ContinuationDiagnostic],
+    ) -> None:
+        """Record safe telemetry for failed-push compensation degradation."""
+        global _forget_backend_error_warned
+        if not _forget_backend_error_warned:
+            _forget_backend_error_warned = True
+            diagnostics.append("forget_backend_error")
+        monitor_events.append(("on_error", ("dedup", _static_backend_error(exc))))
 
     def request_fingerprint(self, request: Request) -> str:
         """Generate a fingerprint for a request.

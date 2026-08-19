@@ -97,7 +97,7 @@ def _warn_per_process_scope(strategy: DedupeStrategy) -> None:
 
 def build_membership_filter(
     strategy: DedupeStrategy,
-    connection_manager: ConnectionManager,
+    connection_manager: ConnectionManager | None,
     *,
     key: str = "dupefilter",
     memory_maxsize: int | None = DEFAULT_MEMORY_MAXSIZE,
@@ -111,8 +111,8 @@ def build_membership_filter(
 
     Args:
         strategy: Which dedup strategy to instantiate.
-        connection_manager: Connection manager (used only by the ``set``
-            strategy; in-memory strategies ignore it).
+        connection_manager: Connection manager used by the ``set`` strategy.
+            May be ``None`` for in-process strategies.
         key: Backend set name for the ``set`` strategy.
         memory_maxsize: LRU cap for the ``memory`` strategy. Defaults to
             :data:`DEFAULT_MEMORY_MAXSIZE`; explicit ``None`` opts out.
@@ -133,8 +133,9 @@ def build_membership_filter(
         A concrete MembershipFilter instance.
 
     Raises:
-        ConfigurationError: If ``strategy`` is not a known DedupeStrategy, or
-            if ``strict`` is True and ``strategy`` is per-process.
+        ConfigurationError: If ``strategy`` is not a known DedupeStrategy, if
+            ``strict`` is True and ``strategy`` is per-process, or if the
+            ``set`` strategy is selected without a connection manager.
     """
     if strict and strategy in _PER_PROCESS_STRATEGIES:
         raise ConfigurationError(
@@ -148,6 +149,12 @@ def build_membership_filter(
         )
     _warn_per_process_scope(strategy)
     if strategy is DedupeStrategy.SET:
+        if connection_manager is None:
+            raise ConfigurationError(
+                "Dedup strategy 'set' requires a ConnectionManager for backend access.",
+                setting_name="SCRAPY_DEDUP_STRATEGY",
+                setting_value=strategy.value,
+            )
         return SetMembershipFilter(connection_manager, key)
     if strategy is DedupeStrategy.MEMORY:
         return MemoryMembershipFilter(maxsize=memory_maxsize)
