@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Memcached local defaults now use explicit IPv4 loopback.** The runtime
+  default, Compose-backed integration command, and CI use `127.0.0.1` so an
+  IPv6-first `localhost` resolver cannot miss an IPv4-only Memcached daemon.
+- **Reactor-facing synchronous backend calls now have an explicit latency
+  contract.** Deferred-capable pipeline lifecycle, scheduler connection
+  warm-up/manager release, and acknowledgement hooks run in Twisted's thread
+  pool with ordered ownership fences. `SCRAPY_REACTOR_IO_TIMEOUT` defaults to
+  5 seconds (maximum 60); inherently synchronous scheduler methods remain
+  synchronous, cap manager retry waits, and require the selected backend's
+  native RPC timeout for each
+  individual call.
+- **Pipeline failure policy is reliability-safe by default.** `Settings`,
+  `BackendPipeline.from_settings`, and direct pipeline construction consistently
+  default `SCRAPY_PIPELINE_MAX_STORAGE_ERRORS` to `10`; explicit `None` is the
+  opt-in for best-effort loss.
+- **Default queue and dupefilter keys are project/spider namespaced.** Current
+  request envelopes carry the same identity and foreign deliveries are nacked
+  or re-published;
+  literal legacy/shared keys remain an explicit migration path.
+- **Scrapy support now starts at 2.17.** The dependency floor excludes the
+  advisory-affected 2.15.2-and-earlier releases; release tests verify the wheel
+  and sdist metadata independently.
+- **BackendScheduler now follows Scrapy's generic dupefilter lifecycle.** It
+  calls standard filters with `open()`, preserves the spider-aware
+  `BackendDupeFilter` path, and returns/awaits Deferred lifecycle results before
+  publishing or releasing scheduler resources.
 - **Stable Pulsar polling now uses bounded background receive pumps.** The first
   zero-time poll starts subscription work and returns immediately; later polls
   consume from a per-topic buffer capped at 100 deliveries. Failed pumps are
@@ -30,6 +56,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path. Without snapshot storage, a clean close may skip persistence only when
   the strategy snapshot state is empty; nonempty state fails close so it can be
   retried, unless the caller explicitly chooses a lossy abort (`lossy=True`).
+- **Unreadable current-format queue checkpoints are fenced.** A manifest or
+  chunk read failure no longer permits clean close to overwrite the authoritative
+  checkpoint with a clean-start state. Repair storage and retry, or explicitly
+  authorize replacement with `BackendQueue.reset_snapshot()` before close.
+- **`BackendSpiderMixin` close ownership is retryable.** Failed component,
+  snapshot-lease, signal, or manager cleanup retains the exact reference, keeps
+  the manager acquire live, and raises from direct `close_backend()` callers so
+  a later call can retry. Mixin queue/scheduler getters now reuse the standard
+  settings factories for strategy, dedup, monitor/stats, ACK safety, snapshot
+  ownership, and queue limits; the mixin does not introduce a lossy abort.
 
 ### Breaking
 

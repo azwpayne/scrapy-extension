@@ -99,9 +99,27 @@ green pytest is **not** a green CI:
    with, not identical to, the broader `source-exclude` list in
    `pyproject.toml`; keep both consistent) → fresh wheel install of `[all]`,
    asserting every `Backend/Mode/Settings` trio imports.
-6. `pytest -m "not integration" --cov` (3.10 lane) runs in branch mode.
-   Coverage.py intentionally has `fail_under = 0`; CI reads `coverage.json` and
-   separately enforces **95% statement coverage** and **91% branch coverage**.
+6. `pytest -m "not integration" --cov` (3.10 lane) runs in branch mode with
+   the fixed `--randomly-seed=1125147632` coverage order. Coverage.py
+   intentionally has `fail_under = 0`; CI reads `coverage.json` and separately
+   enforces **95% statement coverage** and **91% branch coverage**. Reproduce the
+   complete JSON gate locally with:
+
+   ```bash
+   uv run --no-sync pytest -m "not integration" --tb=short -q \
+     --randomly-seed=1125147632 --cov=scrapy_extension \
+     --cov-report=term-missing --cov-report=json:coverage.json
+   uv run --no-sync python - <<'PY'
+   import json
+   from pathlib import Path
+
+   totals = json.loads(Path("coverage.json").read_text())['totals']
+   statement = 100 * totals['covered_lines'] / totals['num_statements']
+   branch = 100 * totals['covered_branches'] / totals['num_branches']
+   assert statement >= 95.0 and branch >= 91.0
+   print(f"statement={statement:.2f}% branch={branch:.2f}%")
+   PY
+   ```
 7. Unit matrix 3.10–3.14 (`fail-fast: false`); one 3.12 integration job with
    10 live containerized backends.
 
@@ -149,14 +167,25 @@ Layer rules:
 
 **Global `Settings`** (`settings/base.py`, env prefix `SCRAPY_`): backend_type
 (`redis` default), serializer (json only), retry_attempts=3 (0–20),
-retry_delay=1.0s, queue_max_item_bytes=1 MiB, pipeline_max_item_bytes=1 MiB,
+retry_delay=1.0s, reactor_io_timeout=5s, queue_max_item_bytes=1 MiB,
+pipeline_max_item_bytes=1 MiB,
 storage_strategy=passthrough, storage_buffer_max_age_s=None,
 storage_buffer_max_pending=None, dedup_strict=False,
-pipeline_max_storage_errors=None, circuit_breaker_enabled=False,
+pipeline_max_storage_errors=10 (explicit None opts into best-effort loss),
+circuit_breaker_enabled=False,
 circuit_breaker_failure_threshold=5, circuit_breaker_reset_timeout=30.0
 (cap 3600), backpressure_pause_at/resume_at=None,
 queue_depth_sample_every=100, queue_delay_max_held=100_000,
 monitor_backpressure_threshold=1_000, monitor_pop_rate_window_s=60.0.
+
+`SCRAPY_REACTOR_IO_TIMEOUT` is the bounded reactor-facing wait budget.
+Pipeline writes/lifecycle, scheduler connection warm-up/manager release, and
+ACK/NACK callbacks that can return Deferreds are moved to the Twisted thread
+pool.
+Scrapy's scheduler `enqueue_request`, `next_request`, and
+`has_pending_requests` methods are inherently synchronous; they retain the
+selected backend's native RPC timeout contract and only cap manager retry
+waits. The setting cannot interrupt an arbitrary blocking third-party SDK call.
 
 **Per-backend models** (`settings/<name>.py`, each with
 `SCRAPY_<NAME>_` env prefix, `extra="forbid"`, `hide_input_in_errors=True`):
@@ -193,7 +222,7 @@ managers.
 |---|---|---|---|---|---|---|
 | redis | ✔ | ✔ | ✔ | standalone, master_slave\*, sentinel, cluster | consume-in-pop | ZSET+hash+counter with hash-tagged keys `{ns:queue:name}:*` for cluster-slot Lua atomicity |
 | mongodb | ✔ | ✔ | ✔ | standalone, replica_set, sharded_cluster, atlas | consume-in-pop | priority negated, sort (priority, created_at); counts capped at 100k |
-| elasticsearch | ✔ | ✔ | ✔ | standalone, cloud | consume-in-pop | optimistic-lock delete (`if_seq_no`); refresh read-side only |
+| elasticsearch | ✔ | ✔ | ✔ | standalone, cloud | consume-in-pop | optimistic-lock delete (`if_seq_no`); primary-success mutation/refresh accepts yellow clusters; clear refreshes before and after delete-by-query |
 | kafka | ✔ | — | — | standalone, cluster, confluent | token (offset watermark) | commits contiguous low-watermark only; `enable_auto_commit` forbidden |
 | rabbitmq | ✔ | — | — | standalone, cluster, mirrored_queues | token (delivery_tag + channel generation) | durable push receipt; clear refuses with pending deliveries |
 | rocketmq | ✔ | — | — | standalone, cluster, cloud | token (message + consumer generation) | gRPC **proxy** endpoint `:8081` (not NameServer 9876); broker `--enable-proxy`; Set/Storage rejected at config time |
@@ -263,8 +292,10 @@ Break any of these and the suite (rightly) falls over:
    appear in the key.
 8. **Teardown order.** Scheduler closes the queue strategy **first** while
    the backend is still connected; pipeline closes strategy then manager in a
-   `finally`; spider mixin clears shared state before user hooks; a
-   `BaseException` anywhere must not skip the manager release.
+   `finally`; the spider mixin retains each component/lease/manager reference
+   until that provider confirms cleanup, then releases the shared manager last.
+   A failed direct mixin close is surfaced for a later retry; a
+   `BaseException` never causes a premature manager release.
 9. **Snapshot lifecycle.** `BackendQueue.close()` = stop admission →
    `begin_close` → drain → persist snapshot → `strategy.close()`. Unowned
    snapshot keys are length-prefixed v3; legacy fallback only for unscoped
@@ -421,11 +452,18 @@ fidelity, never N==N; zero delivery is `pytest.fail`, not skip.
   `compatible-with=9`, which ES 8 rejects with HTTP 400).
 - **SQS names with punctuation** are silently blake2s-hashed — don't expect
   `<prefix><queue>` in the AWS console.
-- **`enqueue_request` returns False** both for duplicates and push failures —
-  distinguish via stats, not the return value.
-- **Default `queue_key="scheduler-queue"` is shared across spiders**; the
-  dedup key is NOT auto-templated — use `SCRAPY_DUPEFILTER_KEY="d:{spider}"`
-  for cross-spider isolation.
+- **`enqueue_request` returns False only for duplicates or deterministic
+  serialization rejection.** A transient queue/backend push failure rolls back
+  dedup state and raises a terminal `QueueError`; it must not become
+  `request_dropped`.
+- **Default queue and dedup keys are isolated**: the scheduler uses
+  `scheduler-queue:{project}:{spider}` and the dupefilter uses
+  `dupefilter:{project}:{spider}` (`project` is `BOT_NAME`, or `default`).
+  Current request envelopes are identity-fenced as well. Explicit literal
+  `SCRAPY_QUEUE_KEY` / `SCRAPY_DUPEFILTER_KEY` values are the legacy/shared-key
+  opt-in; add `SCRAPY_QUEUE_ALLOW_CROSS_SPIDER=True` only for intentional
+  cross-spider routing, otherwise mismatched envelopes are nacked or
+  re-published for their owning consumer.
 - **work_stealing without a stable `SCRAPY_QUEUE_WORKER_ID`** strands the
   previous own-queue on restart (auto-UUID warns).
 - **Batched storage crash-before-flush loses the in-flight batch** —

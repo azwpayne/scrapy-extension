@@ -28,6 +28,11 @@ uv run pytest tests/test_backends.py::TestRedisBackend::test_connect_success -v 
 
 The unit suite is mock-based (no live backends needed). Pytest runs with `--disable-socket` by default so unit tests cannot accidentally open real network connections. Integration runs must keep that boundary and explicitly allow only the loopback brokers with `--allow-hosts=localhost,127.0.0.1,::1`, as shown below.
 
+CI sets `SCRAPY_TEST_FAIL_ON_UNEXPECTED_SKIP=1`. In that mode, an unmarked
+unit skip fails the run; benchmark opt-in skips and integration tests (including
+backend-specific optional-service skips) remain allowed. Use the same variable
+locally when adding tests that must not silently disappear.
+
 ### Integration tests (require live backends)
 
 Integration tests verify real-backend behavior the mocks cannot — atomicity,
@@ -47,7 +52,7 @@ run is not integration verification.
 | RocketMQ | `SCRAPY_TEST_ROCKETMQ_NAMESRV` | `localhost:8081` (gRPC proxy, broker started with `--enable-proxy`) |
 | Pulsar | `SCRAPY_TEST_PULSAR_URL` | `pulsar://localhost:6650` |
 | Amazon SQS | `SCRAPY_TEST_SQS_ENDPOINT` | `http://localhost:4566` (LocalStack) |
-| Memcached | `SCRAPY_TEST_MEMCACHED_HOST` | `localhost` |
+| Memcached | `SCRAPY_TEST_MEMCACHED_HOST` | `127.0.0.1` |
 | DynamoDB | `SCRAPY_TEST_DYNAMODB_ENDPOINT` | `http://localhost:4566` (LocalStack) |
 
 Run any subset by setting the global gate and the relevant backend vars:
@@ -82,7 +87,7 @@ SCRAPY_TEST_RABBITMQ_URL=amqp://guest:guest@localhost:5672/ \
 SCRAPY_TEST_KAFKA_BOOTSTRAP=localhost:9092 \
 SCRAPY_TEST_ROCKETMQ_NAMESRV=localhost:8081 \
 SCRAPY_TEST_PULSAR_URL=pulsar://localhost:6650 \
-SCRAPY_TEST_MEMCACHED_HOST=localhost \
+SCRAPY_TEST_MEMCACHED_HOST=127.0.0.1 \
 SCRAPY_TEST_SQS_ENDPOINT=http://localhost:4566 \
 SCRAPY_TEST_DYNAMODB_ENDPOINT=http://localhost:4566 \
 AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION=us-east-1 \

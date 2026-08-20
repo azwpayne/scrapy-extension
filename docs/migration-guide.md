@@ -57,6 +57,27 @@ value.
 
 No persisted backend data or wire-format migration is required for this change.
 
+## Pipeline failure policy and key isolation
+
+`SCRAPY_PIPELINE_MAX_STORAGE_ERRORS` now has one reliability-safe default across
+`Settings`, `BackendPipeline.from_settings`, and direct construction: `10`.
+The eleventh consecutive storage failure raises instead of being reported as a
+successful item. Set it explicitly to `None` only when best-effort loss is an
+intentional, reviewed policy.
+
+Default scheduler and dupefilter keys are now
+`scheduler-queue:{project}:{spider}` and `dupefilter:{project}:{spider}`.
+`project` is Scrapy `BOT_NAME` (or `default`). Current queue envelopes include
+project and spider identity; foreign stamped envelopes are nacked or
+re-published, while identity-free legacy envelopes remain readable during a
+rolling migration.
+
+For a legacy deployment, explicitly retain its literal
+`SCRAPY_QUEUE_KEY`/`SCRAPY_DUPEFILTER_KEY` while draining. Do not enable
+`SCRAPY_QUEUE_ALLOW_CROSS_SPIDER` unless shared consumption is intentional and
+externally routed. The preferred migration is to drain the old shared queue,
+re-enqueue into namespaced keys, and then remove the legacy overrides.
+
 ## Secret Setting Mutation
 
 Assigning a plain `str` to an exact bundled `SecretStr` field now installs a
@@ -581,10 +602,23 @@ the prior checkpoint: completed work can repeat, but pending work is not lost.
 Keep callbacks idempotent and alert on checkpoint failures, which extend the
 duplicate-replay window. A failed close is retryable: no destructive strategy
 cleanup or scheduler manager release occurs, and concurrent close callers receive
-a failure for that attempt. Repair storage and invoke close again; use lossy abort
+a failure for that attempt. If a current-format manifest or chunk read fails,
+persistence is fenced and normal close cannot overwrite the authoritative
+checkpoint. Repair storage and invoke close again; to explicitly replace the
+unreadable checkpoint, call `BackendQueue.reset_snapshot()` first. Use lossy abort
 only when discarding held state is acceptable. Old unreferenced generation chunks can be removed only
 while the owning worker is stopped and after verifying they are not named by the
 logical manifest; never delete the manifest first.
+
+`BackendSpiderMixin.close_backend()` now follows the same retryable ownership
+contract. Direct callers must handle a surfaced component, snapshot-lease, or
+manager close error and invoke `close_backend()` again after the provider is
+healthy; the failed reference remains owned and the manager is not released
+prematurely. The spider signal adapter still logs and swallows ordinary close
+errors so Scrapy's remaining `spider_closed` handlers run. The mixin has no
+lossy abort method; use `BackendQueue.close(lossy=True)` or
+`BackendScheduler.abort(reason)` only when those lower-level objects are owned
+by the caller.
 
 ## TTL Contract
 

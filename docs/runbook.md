@@ -156,7 +156,15 @@ for single-worker compatibility. A restored checkpoint remains stored until the
 next clean close replaces it with current state or deletes it after a clean
 drain. A crash after restore can therefore replay already-processed entries,
 but cannot lose the only copy of entries not yet processed. Hard crashes can
-still lose changes since the last clean checkpoint.
+still lose changes since the last clean checkpoint. If a current-format
+manifest or chunk cannot be read, persistence is fenced rather than replacing
+the authoritative checkpoint with a clean-start snapshot. Repair storage and
+retry when possible; to explicitly replace that unreadable checkpoint, call
+`BackendQueue.reset_snapshot()` before retrying close, or choose the lossy abort
+path when discarding held state is acceptable. `BackendSpiderMixin.close_backend()`
+uses the same retryable ownership rule: it retains a failed component, snapshot
+lease, or manager and raises the failure; call `close_backend()` again after the
+provider is healthy. The mixin itself does not add a lossy abort API.
 
 Snapshots use a v6 manifest-last repository. Each generation is written as
 immutable chunks (256 KiB by default) under fixed-length
@@ -219,6 +227,11 @@ expires; a normal return therefore never means that a contending flush was
 silently skipped. A hard process crash is different from an exception: it can
 still lose both the buffer and a detached in-flight snapshot.
 
+The same default is used by `settings/base.py`, `BackendPipeline.from_settings`,
+and direct `BackendPipeline` construction. Set the setting or constructor
+argument explicitly to `None` only to opt into best-effort loss (swallow and
+count storage errors); an unset setting never selects that mode.
+
 Treat every failed batched close as an incomplete shutdown. The pipeline fences
 that lifecycle in a retry-only closing state: it rejects `process_item()` and
 `open_spider()`, retains manager ownership, and accepts only another
@@ -229,6 +242,22 @@ successful drain is different: release outcome is ambiguous and the pipeline is
 terminal, so do not call close again (which could double-decrement ownership).
 
 Use `passthrough` for the strongest persistence semantics. Use `batched` only with idempotent downstream consumers and an explicit crash-before-flush tolerance. When a blocked backend keeps the cap full, the next item is rejected immediately with `StorageBackpressureError`; treat that as an admission failure and let the crawler's retry/failure policy decide what to do, rather than assuming the item was persisted.
+
+## Queue and dupefilter identity rollout
+
+Default Scrapy component keys are isolated as
+`scheduler-queue:{project}:{spider}` and `dupefilter:{project}:{spider}`.
+`project` is `BOT_NAME` (falling back to `default`) and `spider` is the validated
+spider name. Current queue envelopes carry both identities. A consumer that
+sees another identity nacks the delivery (or re-publishes it after an atomic
+pop) and leaves it for the owning consumer; pre-identity envelopes remain
+readable for rolling upgrades.
+
+For compatibility, explicitly set literal `SCRAPY_QUEUE_KEY` and
+`SCRAPY_DUPEFILTER_KEY` values while draining a legacy shared deployment. Set
+`SCRAPY_QUEUE_ALLOW_CROSS_SPIDER=True` only when cross-spider consumption is
+intentional and externally routed. The preferred migration is to drain and
+re-enqueue into the new namespaced keys rather than continue sharing them.
 
 ## Redis namespace rollout
 
@@ -520,13 +549,19 @@ Elasticsearch safe reads and index setup retain
 `SCRAPY_ELASTICSEARCH_MAX_RETRIES` / retry-on-timeout configuration. Queue,
 set, storage, TTL-reap, and delete-by-query mutations instead use one
 shared-transport no-replay view (`max_retries=0`, `retry_on_timeout=False`, and
-no retry statuses). A normal return requires a complete, well-formed response:
-search/count/single-document operations require complete shard metadata, while
-delete-by-query has no documented top-level `_shards` block and instead
-requires no timeout, failures, version conflicts, or delete-count mismatch.
-Counts and documented optional task/throttling fields must have exact valid
-types. A typed `*OutcomeIndeterminateError` means the server may have committed
-before the response was lost or proved malformed. No automatic replay is not exactly-once;
+no retry statuses). New index creation must report `acknowledged=true`,
+`shards_acknowledged=true`, and the requested index name; a structured
+`resource_already_exists_exception` is the only idempotent create exception. A
+normal return requires a complete, well-formed response:
+search/count/single-document operations require complete shard metadata. Mutation
+and refresh responses accept a successful primary with no failures when an
+unassigned replica makes a single-node cluster yellow; reads remain strict so a
+partial result cannot look authoritative. Clear operations refresh immediately
+before and after delete-by-query. Delete-by-query has no documented top-level
+`_shards` block and instead requires no timeout, failures, version conflicts, or
+delete-count mismatch. Counts and documented optional task/throttling fields must
+have exact valid types. A typed `*OutcomeIndeterminateError` means the server may have
+committed before the response was lost or proved malformed. No automatic replay is not exactly-once;
 stop blind retry loops and reconcile through the queue document ID, set member
 hash, storage key, or domain state first. The localhost response-drop harness is
 opt-in with `SCRAPY_TEST_ES_OUTCOME_SAFETY=1` and a single local HTTP
@@ -541,7 +576,8 @@ per-component config and is the single chokepoint for the fallback chain.
 | Setting | Default | Contract |
 |---|---:|---|
 | `SCRAPY_RETRY_ATTEMPTS` | `3` | Retries **after** the initial attempt; range 0..20. Default therefore permits at most four total attempts. |
-| `SCRAPY_RETRY_DELAY` | `1.0` | Base seconds for full-jitter exponential backoff: retry `n` sleeps uniformly between 0 and `min(base * 2**n, 3600s)` — the 3600s ceiling (R21-C) prevents a large base from overflowing `time.sleep`. Must be finite and non-negative. |
+| `SCRAPY_RETRY_DELAY` | `1.0` | Base seconds for full-jitter exponential backoff: retry `n` sleeps uniformly between 0 and `min(base * 2**n, 3600s)`, then scheduler-facing synchronous calls cap that wait by `SCRAPY_REACTOR_IO_TIMEOUT`. Must be finite and non-negative. |
+| `SCRAPY_REACTOR_IO_TIMEOUT` | `5.0` | Maximum reactor-facing wait budget, bounded to 60s. Deferred-capable pipeline lifecycle, scheduler queue close/connection warm-up/manager release, and ack calls run in the thread pool; synchronous scheduler methods use it only to cap retry waits. Configure the selected backend's native socket/RPC timeout separately because an arbitrary synchronous SDK call cannot be interrupted. |
 
 These are ConnectionManager-level controls. Backend-native retry settings are
 separate. In particular, `SCRAPY_RABBITMQ_CONNECTION_ATTEMPTS` and
@@ -833,9 +869,12 @@ exist; this is the canonical procedure until it lands):
    into a new `## [X.Y.Z] — YYYY-MM-DD` section.
 4. **Verify source and artifacts before publication:** run `uv run --no-sync ruff check`,
    `uv run --no-sync pytest -m "not integration"`, and
-   `uv run --no-sync pytest --cov=scrapy_extension --cov-report=term-missing
-   --cov-report=json:coverage.json`, then independently verify the 95% statement
-   and 91% branch floors before running `uv build --clear`. In the release shell, select exactly one
+   `uv run --no-sync pytest -m "not integration" --randomly-seed=1125147632
+   --cov=scrapy_extension --cov-report=term-missing
+   --cov-report=json:coverage.json`, followed by the JSON gate that independently
+   verifies the 95% statement and 91% branch floors. This fixed order prevents
+   process-global lifecycle fixtures from making coverage order-dependent. Run
+   the gate before `uv build --clear`. In the release shell, select exactly one
    wheel and sdist and record their hashes; retain these variables through
    publication:
 

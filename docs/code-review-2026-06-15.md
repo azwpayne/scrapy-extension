@@ -1006,7 +1006,7 @@ PyPI showed no Homepage/Repository/Issues links. Added:
 
 - All deps were `>=X` with no upper bound — next major release could silently break installs
 - `pymongo>=4.6.0` excluded the CVE-hardened 4.8+ line
-- Added upper bounds matching the next major bump: `redis>=7.3,<9`, `pymongo>=4.8,<5`, `scrapy>=2.14,<3`, etc.
+- Added upper bounds matching the next major bump: `redis>=7.3,<9`, `pymongo>=4.8,<5`, `scrapy>=2.17.0,<3`, etc.
 - Bumped pymongo minimum to 4.8 per R3-I3
 
 ### What this prevents

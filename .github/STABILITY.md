@@ -30,13 +30,13 @@ comes from this document; being exported does not automatically make it Stable.
 | `BackendDupeFilter` (`dupefilter/dupefilter.py`) | Stable | Provides `from_settings` and `from_crawler`. Strategy selection via `SCRAPY_DEDUP_STRATEGY` is Stable; per-strategy tiers in the next table. |
 | `BackendPipeline` (`pipeline/pipeline.py`) | Stable | Provides `from_settings` and `from_crawler`. |
 | `BackendQueue` (`queue/queue.py`) | Stable | Direct construction only; `spider` is optional and keyword-only. `depth_sample_every` (round-9 U4) is Stable with a safe default. |
-| `BackendSpiderMixin` (`spider/spider_mixin.py`) | Stable | Provides `from_crawler`; direct construction requires explicit `setup_backend()` before backend access. |
+| `BackendSpiderMixin` (`spider/spider_mixin.py`) | Stable | Provides `from_crawler`; direct construction requires explicit `setup_backend()` before backend access. `close_backend()` is idempotent and retryable: failed component/lease/manager cleanup is surfaced and ownership is retained; the mixin has no lossy abort. Getters reuse standard component-factory settings. |
 | `Backend` / `QueueBackend` / `SetBackend` / `StorageBackend` ABCs | Stable | The abstract contract 3rd-party backends implement. `QueueBackend.push()` retains its stable signature/`None` return; the `_`-prefixed operation-bound durability receipt is Internal and existing plugins inherit a source-compatible volatile default. |
 | `ConnectionManager` (`backends/connectors.py`) | Stable | Lazy shared registry keyed by `backend_type:settings_digest`. Each `get_manager()` acquisition requires exactly one `close()` release. |
 | `scrapy_extension.backends.connectors.resolve_backend_config()` | Stable | Public fully qualified import used by all three component factories. |
 | `scrapy_extension.monitor.Monitor` / `NullMonitor` / `ScrapyStatsMonitor` | Stable | Public subpackage exports. The hook set is additive; fresh hooks are tiered below. |
 | `BackendType`, `Serializer`, `JSONSerializer`, and `Settings` | Stable | Root-package exports and core extension contracts. |
-| Root-exported exception classes | Stable | `BackendError`, `BackendConnectionError`, `QueueError`, `StorageError`, `SerializationError`, and `ConfigurationError`; documented context attributes are part of each concrete exception's contract. The additive Elasticsearch outcome subclasses (`QueueOutcomeIndeterminateError`, `SetOutcomeIndeterminateError`, and `StorageOutcomeIndeterminateError`) remain catch-compatible with the established queue/set/storage contracts and expose only static redacted diagnostics. As a security boundary, terminal queue/pipeline `SerializationError` instances intentionally expose `data=None` and fixed text only; `serializer` remains available. |
+| Root-exported exception classes | Stable | `BackendError`, `BackendConnectionError`, `BackendOperationTimeout`, `QueueError`, `StorageError`, `SerializationError`, and `ConfigurationError`; documented context attributes are part of each concrete exception's contract. The additive Elasticsearch outcome subclasses (`QueueOutcomeIndeterminateError`, `SetOutcomeIndeterminateError`, and `StorageOutcomeIndeterminateError`) remain catch-compatible with the established queue/set/storage contracts and expose only static redacted diagnostics. As a security boundary, terminal queue/pipeline `SerializationError` instances intentionally expose `data=None` and fixed text only; `serializer` remains available. |
 | Root-exported concrete backend, mode, and backend-settings classes | Inherit backend tier | Stable except the Memcached classes, which are Experimental with that backend. |
 | Root-exported membership filters, `DedupeStrategy`, and `build_membership_filter()` | Inherit strategy tier | See the strategy table below. |
 | Established component/backend selection settings | Stable | Includes `SCRAPY_BACKEND_TYPE`, per-component backend type/settings pairs, and dedup/queue/storage strategy selectors. Fresh settings and hooks are listed separately below. |
@@ -72,11 +72,13 @@ comes from this document; being exported does not automatically make it Stable.
 | `SCRAPY_REDIS_NAMESPACE` physical-key layout | Stable | Persistent data boundary. Future changes require explicit migration guidance. |
 | `SCRAPY_MEMCACHED_ALLOW_FLUSH_ALL` | Stable | Destructive-operation safety gate; default remains false. |
 | SQS/RocketMQ visibility/invisibility settings | Stable | Finite non-renewing lease semantics are operationally significant. |
-| `SCRAPY_RETRY_ATTEMPTS` / `SCRAPY_RETRY_DELAY` | Stable | Initial attempt plus bounded retries with full-jitter exponential backoff. |
+| `SCRAPY_RETRY_ATTEMPTS` / `SCRAPY_RETRY_DELAY` | Stable | Initial attempt plus bounded retries with full-jitter exponential backoff. Scheduler-facing waits are capped by `SCRAPY_REACTOR_IO_TIMEOUT`. |
+| `SCRAPY_REACTOR_IO_TIMEOUT` | Stable | Defaults to 5s, maximum 60s. Deferred-capable pipeline lifecycle, scheduler connection warm-up/manager release, and ack paths are offloaded; inherently synchronous scheduler methods retain a native-backend-timeout contract and only cap retry waits. |
 | `scrapy_extension.backends.registry.BackendDescriptor` entry-point registration | Experimental | Public fully qualified import; no broad 3rd-party ecosystem yet. |
 | `SCRAPY_CIRCUIT_BREAKER_ENABLED` (+ `_FAILURE_THRESHOLD`, `_RESET_TIMEOUT`) | Experimental | Opt-in 3-state breaker proxy (off by default); fresh failure-filter/admission contract may evolve. |
 | `SCRAPY_DEDUP_STRICT` | Experimental | Strict per-process dedup rejection semantics; fresh degrade contract. |
-| `SCRAPY_PIPELINE_MAX_STORAGE_ERRORS` | Experimental | Best-effort storage-error escalation threshold for the pipeline. |
+| `SCRAPY_PIPELINE_MAX_STORAGE_ERRORS` | Experimental | Reliability-safe default is 10 consecutive failures; explicit `None` opts into best-effort loss. |
+| `SCRAPY_QUEUE_ALLOW_CROSS_SPIDER` | Experimental | Explicit escape hatch for legacy/shared queue keys; identity fencing remains enabled by default. |
 | `SCRAPY_STORAGE_BUFFER_MAX_AGE_S` | Experimental | Bounds the batched-storage age-flush window (crash-before-flush loss surface). |
 | `SCRAPY_PIPELINE_MAX_ITEM_BYTES` | Experimental | Per-item serialized store cap (pipeline-side; distinct from queue-side `SCRAPY_QUEUE_MAX_ITEM_BYTES`). |
 

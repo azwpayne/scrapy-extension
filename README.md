@@ -46,7 +46,10 @@ pip install -e ".[redis]"
 
 ### PyPI (after the first public release)
 
-Once a tagged release is published to PyPI, install the same extras with:
+Once a tagged release is published to PyPI, install the same extras with the
+commands below.
+The package requires `Scrapy>=2.17,<3`; this lower bound excludes older
+advisory-affected Scrapy releases.
 
 ```bash
 pip install scrapy-extension                  # Core (no backend deps required)
@@ -130,6 +133,26 @@ variables. Unknown nested fields and unknown names under the selected backend's
 environment prefix fail fast instead of silently falling back to a default.
 Those project checks raise `ConfigurationError`; Pydantic type/range/enum
 failures raise `ValidationError`.
+
+### Reactor and scheduler latency contract
+
+`SCRAPY_REACTOR_IO_TIMEOUT` defaults to **5 seconds** and is bounded to 60
+seconds. Pipeline storage/open/close, scheduler queue close/connection warm-up/release,
+and deferred broker acknowledgements run synchronous backend SDK calls in
+Twisted's thread pool so a slow backend does not stop the reactor heartbeat.
+Writes remain FIFO and close retains ownership until the worker operation really
+finishes; a caller-visible timeout does not cancel a Python thread or pretend
+that a write/ack completed.
+
+Scrapy's `Scheduler.enqueue_request()`, `next_request()`, and
+`has_pending_requests()` are inherently synchronous and cannot return a
+Deferred. They remain bounded synchronous calls: manager retry **waits** are
+capped by this setting, while the selected backend's native socket/RPC timeout
+must bound each individual request. Configure both policies; this extension
+cannot interrupt an arbitrary synchronous third-party SDK call from the reactor
+thread. A slow backend can therefore still delay one scheduler poll up to its
+native timeout, but cannot add unbounded retry sleeps. Use an async-capable
+backend or a smaller native timeout when a tighter heartbeat budget is needed.
 
 ### Redis (standalone, sentinel, cluster; deprecated master_slave alias)
 
@@ -503,15 +526,17 @@ Session is intentionally not inherited; see the
 
 ```python
 SCRAPY_BACKEND_TYPE = "memcached"
-SCRAPY_MEMCACHED_HOST = "localhost"
+SCRAPY_MEMCACHED_HOST = "127.0.0.1"
 SCRAPY_MEMCACHED_PORT = 11211
 # Required only for a non-loopback server on an isolated trusted network:
 # SCRAPY_MEMCACHED_ALLOW_REMOTE_PLAINTEXT = True
 # SCRAPY_MEMCACHED_ALLOW_FLUSH_ALL = True  # dedicated servers only
 ```
 
-Memcached traffic in this backend is unauthenticated and unencrypted. Loopback
-hosts work by default; any remote host fails at startup unless
+Memcached traffic in this backend is unauthenticated and unencrypted. The
+default is the explicit IPv4 loopback (`127.0.0.1`) so IPv6-first `localhost`
+resolution cannot miss an IPv4-only local daemon. Loopback hosts work by
+default; any remote host fails at startup unless
 `ALLOW_REMOTE_PLAINTEXT=True` explicitly accepts that trusted-network risk.
 Mutating operations disable pymemcache's `noreply` default and wait for the
 server response before reporting StorageBackend success. Because the ordinary
@@ -832,7 +857,11 @@ when that loss is intended. In a multi-worker deployment, configure a stable uni
 `SCRAPY_QUEUE_WORKER_ID` is the fallback. A restored checkpoint remains stored
 until the next clean close replaces it with current state or deletes it after a
 clean drain. A crash after restore can therefore replay already-processed
-entries, but cannot lose the only copy of entries not yet processed.
+entries, but cannot lose the only copy of entries not yet processed. If a
+current-format manifest or chunk cannot be read, persistence is fenced rather
+than replacing that checkpoint with a clean-start snapshot; after verifying the
+intended in-memory state, call `BackendQueue.reset_snapshot()` (or use the
+explicit lossy abort) before teardown.
 
 ### Storage strategy — `SCRAPY_STORAGE_STRATEGY`
 
@@ -846,6 +875,30 @@ values (`passthrough` or `batched`). `BackendPipeline` delegates item writes to 
 | `batched` | buffers backend-bound records and flushes them in global insertion order at threshold / spider close | every record retains the exact backend passed to its `store()` call through age/manual/close drains and partial-failure retry; accepted work is capped across the retry buffer and in-flight snapshot (default: `2 × threshold`), and a full strategy raises `StorageBackpressureError` before accepting another item |
 
 Use `passthrough` when item loss is unacceptable. Use `batched` only when throughput is worth the crash-before-flush trade-off and duplicate writes are acceptable after partial flush retry.
+
+`SCRAPY_PIPELINE_MAX_STORAGE_ERRORS` defaults to **10**: the eleventh
+consecutive storage failure raises `BackendError` instead of being reported as a
+successful item. Set it explicitly to `None` only when best-effort loss is an
+intentional policy; the public `Settings` model, `BackendPipeline` factory, and
+runtime constructor use the same default.
+
+### Queue and dupefilter isolation
+
+The Scrapy factories default to `scheduler-queue:{project}:{spider}` and
+`dupefilter:{project}:{spider}`. `{project}` is Scrapy's `BOT_NAME` (or
+`default` when no crawler settings exist), and `{spider}` is the spider name.
+This prevents two spiders or projects sharing a backend from consuming each
+other's requests or fingerprints. Requests written by current versions also
+carry these identities in their serialized envelope; a mismatched envelope is
+nacked (or re-published for an atomic-pop backend) rather than acknowledged as
+poison data.
+
+For a deliberate legacy/shared-key migration, set explicit literal
+`SCRAPY_QUEUE_KEY` and `SCRAPY_DUPEFILTER_KEY` values. Legacy envelopes without
+identity tags remain readable. To intentionally let current envelopes cross
+spider boundaries, additionally set `SCRAPY_QUEUE_ALLOW_CROSS_SPIDER = True`;
+use this only with an application-level routing contract. Prefer draining the
+old shared queue and re-enqueueing into the new namespaced keys.
 
 Set `SCRAPY_STORAGE_BUFFER_MAX_PENDING` to an integer no smaller than the
 batch threshold when a tighter or larger live backlog is appropriate. The cap
@@ -950,7 +1003,8 @@ finally:
 - **Lazy singleton**: thread-safe registry keyed by `backend_type:settings_hash`
 - **Retry logic**: one initial attempt plus up to `SCRAPY_RETRY_ATTEMPTS`
   retries (default 3, range 0..20), with full-jitter exponential backoff whose
-  base is `SCRAPY_RETRY_DELAY` (default 1 second)
+  base is `SCRAPY_RETRY_DELAY` (default 1 second). On scheduler synchronous
+  paths, each retry wait is additionally capped by `SCRAPY_REACTOR_IO_TIMEOUT`.
 - **Reference-counted lifecycle**: every successful `get_manager()` acquisition
   must be paired with exactly one `close()`. A shared manager is disconnected
   only when its final holder releases it; do not close the same acquisition
@@ -975,10 +1029,15 @@ signals exactly once. Do not add a second `from_crawler()` or call
 directly, outside Scrapy's factory, must call `setup_backend()` before using the
 low-level backend properties and must later call `close_backend()`.
 
-The class attributes configure the mixin's direct manager only. Scheduler,
-dupefilter, and pipeline selection still comes from Scrapy settings; use the
-global or component-specific settings shown above when those components must
-use the same backend.
+The class attributes configure the mixin's direct manager. `get_queue()` and
+`get_scheduler()` reuse the standard scheduler/dupefilter factories with that
+manager borrowed, so queue strategy, ACK-concurrency safety, monitor/stats,
+snapshot owner, dedup strategy, and queue limits still come from Scrapy
+settings. `close_backend()` releases the manager only after every component and
+snapshot lease succeeds; a surfaced close failure is retryable by calling it
+again. The mixin has no implicit lossy abort—use the explicit
+`BackendQueue.close(lossy=True)` or `BackendScheduler.abort(reason)` APIs when
+that lower-level ownership is available.
 
 ## Scrapy Components
 
