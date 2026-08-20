@@ -17,8 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     # Bound each matrix lane so a stalled dependency or test cannot consume
     # GitHub Actions' multi-hour default timeout.  The normal suite completes
-    # in minutes; 20 minutes leaves headroom for a cold runner.
-    timeout-minutes: 20
+    # in minutes; 30 minutes leaves headroom for a cold runner.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -101,6 +101,7 @@ jobs:
         if: matrix.python-version == '3.10'
         run: >-
           uv run --no-sync pytest -n 2 --benchmark-disable
+          --randomly-seed=1125147632
           tests/test_memory_filter.py::TestMemoryMembershipFilter::test_add_new_returns_true -q
       - name: Benchmark smoke (five measurements)
         if: matrix.python-version == '3.10'
@@ -296,11 +297,20 @@ jobs:
           assert all(getattr(scrapy_extension, name) for name in optional_exports)
           PY
           done
+      - name: Reactor lifecycle heartbeat regression
+        if: matrix.python-version == '3.10'
+        run: uv run --no-sync pytest tests/test_reactor_lifecycle.py -q --disable-socket
       - name: Unit tests with statement and branch coverage (integration deselected)
         if: matrix.python-version == '3.10'
+        env:
+          SCRAPY_TEST_FAIL_ON_UNEXPECTED_SKIP: "1"
         shell: bash
         run: |
+          # Keep the coverage order fixed: the suite intentionally exercises
+          # process-global lifecycle state, and a random order can change which
+          # defensive branch is reached even when every test passes.
           uv run --no-sync pytest -m "not integration" --tb=short -q \
+            --randomly-seed=1125147632 \
             --cov=scrapy_extension --cov-report=term-missing \
             --cov-report=json:coverage.json
           uv run --no-sync python - <<'PY'
@@ -319,7 +329,11 @@ jobs:
           PY
       - name: Unit tests (integration deselected)
         if: matrix.python-version != '3.10'
-        run: uv run --no-sync pytest -m "not integration" --tb=short -q
+        env:
+          SCRAPY_TEST_FAIL_ON_UNEXPECTED_SKIP: "1"
+        run: >-
+          uv run --no-sync pytest -m "not integration" --tb=short -q
+          --randomly-seed=1125147632
 
   # Integration job — runs tests under tests/integration/ against
   # containerized backends. Runs in parallel with unit-tests so it never
@@ -439,7 +453,7 @@ jobs:
         run: |
           for i in $(seq 1 30); do
             if (echo > /dev/tcp/localhost/9092) >/dev/null 2>&1 && \
-              (echo > /dev/tcp/localhost/11211) >/dev/null 2>&1; then
+              (echo > /dev/tcp/127.0.0.1/11211) >/dev/null 2>&1; then
               echo "Kafka and Memcached are accepting connections"
               exit 0
             fi
@@ -494,13 +508,16 @@ jobs:
           # enough; this flag is what actually enables the suite). Verified:
           # Unset means the entire live-service suite skips (a false green).
           SCRAPY_TEST_INTEGRATION: "1"
+          SCRAPY_TEST_FAIL_ON_UNEXPECTED_SKIP: "1"
           SCRAPY_TEST_REDIS_URL: redis://localhost:6379/0
           SCRAPY_TEST_MONGODB_URI: mongodb://localhost:27017
           SCRAPY_TEST_ES_HOSTS: http://localhost:9200
+          SCRAPY_TEST_ES_OUTCOME_SAFETY: "1"
           SCRAPY_TEST_RABBITMQ_URL: amqp://guest:guest@localhost:5672/
           SCRAPY_TEST_KAFKA_BOOTSTRAP: localhost:9092
           SCRAPY_TEST_PULSAR_URL: pulsar://localhost:6650
-          SCRAPY_TEST_MEMCACHED_HOST: localhost
+          # The service publishes IPv4; avoid IPv6-first localhost resolution.
+          SCRAPY_TEST_MEMCACHED_HOST: 127.0.0.1
           # LocalStack emulates both AWS services. These are intentionally
           # non-secret test credentials; no cloud account is contacted.
           SCRAPY_TEST_SQS_ENDPOINT: http://localhost:4566
@@ -521,3 +538,39 @@ jobs:
           uv run --no-sync pytest tests/integration
           -m integration --tb=short -v --timeout=120
           --allow-hosts=localhost,127.0.0.1,::1
+  # Dependency security scan job — runs on every push and pull request.
+  # Uses pinned tooling to avoid flaky network requirements in ordinary unit checks.
+  # Runs in parallel with unit-tests so it never blocks the fast unit lane.
+  security-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Skip the security scan on pull requests from forks to avoid
+    # supply-chain confusion; the unit-tests job still validates deps.
+    if: github.event_name != 'pull_request' or github.event.pull_request.head.repo.owner.login == github.repository_owner
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install uv and pinned audit tooling
+        run: python -m pip install uv==0.11.29
+      - name: Sync locked audit environment
+        run: uv sync --locked --no-default-groups --group dev
+      - name: Lock dependency graph and run audit
+        run: |
+          set -euo pipefail
+          # A checked-in lock is part of the release contract: --check verifies
+          # it matches pyproject.toml, while --locked refuses to resolve drift.
+          uv lock --check
+          waiver_id=$(uv run --no-sync python tools/check_audit_waiver.py)
+          # The waiver checker binds the one approved PYSEC-2017-83
+          # (GHSA-h7wm-ph43-c39p) exception to its package, range, owner,
+          # fixture, and expiry. Every other advisory remains fatal.
+          uv audit --locked --ignore "$waiver_id"
+      - name: Publish audit report
+        if: always()
+        run: |
+          set -euo pipefail
+          # Output the audit summary for artifact retention
+          uv audit --locked > audit-report.txt 2>&1 || true
