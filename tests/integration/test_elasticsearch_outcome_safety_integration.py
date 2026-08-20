@@ -83,6 +83,10 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         return "\r" not in name and "\n" not in name and ":" not in name
 
     @staticmethod
+    def _sanitize_header_name(name: str) -> str:
+        return name.replace("\r", "").replace("\n", "").replace(":", "")
+
+    @staticmethod
     def _sanitize_header_value(value: str) -> str:
         return value.replace("\r", "").replace("\n", "")
 
@@ -127,11 +131,13 @@ class _ProxyHandler(BaseHTTPRequestHandler):
 
         self.send_response(response.status)
         for name, value in response_headers:
+            safe_name = self._sanitize_header_name(name)
             if (
-                name.lower() not in _HOP_BY_HOP_HEADERS | {"content-length"}
-                and self._is_safe_header_name(name)
+                safe_name
+                and safe_name.lower() not in _HOP_BY_HOP_HEADERS | {"content-length"}
+                and self._is_safe_header_name(safe_name)
             ):
-                self.send_header(name, self._sanitize_header_value(value))
+                self.send_header(safe_name, self._sanitize_header_value(value))
         self.send_header("Content-Length", str(len(response_body)))
         self.send_header("Connection", "close")
         self.end_headers()
