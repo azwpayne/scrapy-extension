@@ -546,7 +546,7 @@ jobs:
     timeout-minutes: 15
     # Skip the security scan on pull requests from forks to avoid
     # supply-chain confusion; the unit-tests job still validates deps.
-    if: github.event_name != 'pull_request' or github.event.pull_request.head.repo.owner.login == github.repository_owner
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.owner.login == github.repository_owner
     steps:
       - uses: actions/checkout@v7
       - name: Set up Python 3.12
