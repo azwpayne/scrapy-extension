@@ -1371,7 +1371,11 @@ class TestBatchedStorageRisk2:
         stop = mocker.Mock()
         stop.wait.side_effect = [False, False, True]
         strat._stop = stop
-        monotonic = mocker.Mock(side_effect=[1.0, 0.0, 1.0])
+        # R139-F7: one monotonic read per loop evaluation — the deadline-driven
+        # interval helper reads the clock BEFORE each wait when the buffer holds
+        # a live oldest item (eval1: helper+need_flush, requeue ts, eval2:
+        # helper+need_flush).
+        monotonic = mocker.Mock(side_effect=[1.0, 1.0, 0.0, 1.0, 1.0])
         monkeypatch.setattr(batched_module.time, "monotonic", monotonic)
         mocker.patch.object(
             batched_module.logger,
@@ -1406,7 +1410,10 @@ class TestBatchedStorageRisk2:
         stop = mocker.Mock()
         stop.wait.side_effect = [False, False, True]
         strat._stop = stop
-        monotonic = mocker.Mock(side_effect=[1.0, 0.0, 1.0])
+        # R139-F7: helper reads precede each wait with a live oldest item —
+        # eval1 (helper + need_flush), the requeue timestamp, eval2 (helper +
+        # need_flush); the final evaluation sees an empty buffer (no clock read).
+        monotonic = mocker.Mock(side_effect=[1.0, 1.0, 0.0, 1.0, 1.0])
         monkeypatch.setattr(batched_module.time, "monotonic", monotonic)
         mocker.patch.object(
             batched_module.logger,
@@ -1458,7 +1465,12 @@ class TestBatchedStorageRisk2:
         monkeypatch.setattr(
             batched_module.time,
             "monotonic",
-            mocker.Mock(side_effect=[1.0, 1.0]),
+            # R139-F7: the deadline-driven helper reads the clock before each
+            # wait while the buffer holds a live oldest item — one read per
+            # need_flush check becomes two per cycle (helper + check) across
+            # the two flush cycles; the trailing evaluation sees an empty
+            # buffer and reads no clock.
+            mocker.Mock(side_effect=[1.0, 1.0, 1.0, 1.0]),
         )
         mocker.patch.object(
             batched_module.logger,
@@ -1650,3 +1662,118 @@ class TestBatchedStorageFlusherTOCTOU:
         finally:
             release_store.set()
             close_thread.join(timeout=2.0)
+
+
+class TestBatchedAgeFlushDeadlineCadence:
+    """R139-F7: the age-flusher cadence must be deadline-driven, not fixed-rate.
+
+    Pre-fix, ``_age_flush_loop`` woke every ``max_buffer_age_s`` and flushed only
+    when the oldest item was ALREADY at least that old — an item accepted just
+    after a wake missed the next check and spent up to ``2 * age`` in volatile
+    memory, while the runbook advertises the knob as bounding crash-loss to
+    roughly the configured value. The wait-interval math now lives in
+    ``_next_age_wait_interval`` so the cadence contract is directly testable.
+    """
+
+    def test_next_interval_live_oldest_returns_remaining_budget(
+        self, monkeypatch, mocker
+    ) -> None:
+        """A live oldest item waits exactly its remaining age budget."""
+        strat = BatchedStorageStrategy(threshold=1000, max_buffer_age_s=10.0)
+        monkeypatch.setattr(
+            batched_module.time, "monotonic", mocker.Mock(return_value=100.0)
+        )
+        with strat._lock:
+            strat._buffer.append((mocker.Mock(), "k", b"v", None))
+            strat._oldest_ts = 95.0
+
+        assert strat._next_age_wait_interval(10.0) == 5.0
+
+    def test_next_interval_empty_buffer_returns_full_age_without_clock_read(
+        self, monkeypatch, mocker
+    ) -> None:
+        """An empty buffer waits the full age and never consults the clock."""
+        strat = BatchedStorageStrategy(threshold=1000, max_buffer_age_s=10.0)
+        monotonic = mocker.Mock(return_value=100.0)
+        monkeypatch.setattr(batched_module.time, "monotonic", monotonic)
+
+        assert strat._next_age_wait_interval(10.0) == 10.0
+        monotonic.assert_not_called()
+
+    @pytest.mark.parametrize("oldest_ts", [90.0, 80.0])
+    def test_next_interval_due_or_overdue_clamps_to_floor(
+        self, oldest_ts, monkeypatch, mocker
+    ) -> None:
+        """A due (0 remaining) or overdue (negative) item waits the floor."""
+        strat = BatchedStorageStrategy(threshold=1000, max_buffer_age_s=10.0)
+        monkeypatch.setattr(
+            batched_module.time, "monotonic", mocker.Mock(return_value=100.0)
+        )
+        with strat._lock:
+            strat._buffer.append((mocker.Mock(), "k", b"v", None))
+            strat._oldest_ts = oldest_ts
+
+        assert strat._next_age_wait_interval(10.0) == batched_module._AGE_WAIT_FLOOR_S
+
+    def test_item_accepted_mid_wait_flushes_within_one_age(self, mocker) -> None:
+        """Wall-clock bound: acceptance → flush within ~age, not up to 2*age.
+
+        ``_stop.wait`` is replaced by a fake that honors the requested timeout
+        with real sleeps but buffers the second item 0.01s AFTER the second wait
+        begins — the adversarial acceptance point of the pre-fix bug (an item
+        accepted while a fixed-age wait is already running). With a real clock
+        and the real flush path, the pre-fix fixed-rate loop wakes 0.04s of item
+        age later, misses (age < cap), and only flushes after one further full
+        interval (≈0.09s > 1.7 * age); the deadline-driven loop re-checks at the
+        item's own deadline (≈age). The 1.7x bound asserts the cadence, not
+        exact timing: sleep overshoot only lengthens the pre-fix elapsed (its
+        0.09s floor is structural) while leaving ~0.035s of slack for scheduler
+        jitter on the fixed side.
+        """
+        age = 0.05
+        backend = mocker.Mock()
+        accepted_at: dict[str, float] = {}
+        flushed_at: dict[str, float] = {}
+
+        def record_flush(key, _value, *, ttl=None):  # noqa: ARG001
+            if key == "k2":
+                flushed_at["k2"] = time.monotonic()
+
+        backend.store.side_effect = record_flush
+        strat = BatchedStorageStrategy(threshold=10**9, max_buffer_age_s=age)
+        # Pre-seed a long-overdue first item so body 1 of the loop flushes it
+        # without spawning the real daemon thread (direct-call convention).
+        with strat._lock:
+            strat._buffer.append((backend, "k1", b"v1", None))
+            strat._oldest_ts = time.monotonic() - 10 * age
+
+        wait_calls = 0
+
+        def fake_wait(timeout=None):
+            nonlocal wait_calls
+            wait_calls += 1
+            if wait_calls == 2:
+                # Item accepted mid-wait: strictly after this wait began, with
+                # 0.01s of margin over any sleep overshoot from wait 1.
+                time.sleep(0.01)
+                accepted_at["k2"] = time.monotonic()
+                with strat._lock:
+                    strat._buffer.append((backend, "k2", b"v2", None))
+                    strat._oldest_ts = accepted_at["k2"]
+                time.sleep(max(0.0, timeout - 0.01))
+            elif timeout is not None:
+                time.sleep(timeout)
+            return wait_calls >= 4
+
+        stop = mocker.Mock()
+        stop.wait.side_effect = fake_wait
+        strat._stop = stop
+
+        strat._age_flush_loop()
+
+        assert flushed_at, "second item was never age-flushed"
+        elapsed = flushed_at["k2"] - accepted_at["k2"]
+        assert elapsed <= age * 1.7, (
+            f"second item spent {elapsed:.3f}s in volatile memory; the deadline-"
+            "driven cadence must flush within ~age, not up to 2*age"
+        )
