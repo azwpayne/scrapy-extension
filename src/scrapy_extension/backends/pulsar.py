@@ -1027,10 +1027,13 @@ class PulsarBackend(Backend, QueueBackend):
 
         With a ``token``: ``consumer.negative_acknowledge(token.message_id)``
         if the client supports it, scheduling the specific message for
-        immediate re-delivery; otherwise no-op (the message stays unacked and
-        is redelivered on the unacked-timeout / consumer restart —
-        at-least-once). Success is terminal across later ack/nack calls and removes
-        the token from the in-flight set; a client exception leaves it retryable.
+        immediate re-delivery; otherwise no-op (the message stays unacked —
+        not lost, at-least-once, but re-delivered only when the consumer
+        restarts or disconnects, e.g. the stale-token consumer replacement;
+        no unacked-message timeout is configured, so there is no time-based
+        re-delivery). Success is terminal across later ack/nack calls and
+        removes the token from the in-flight set; a client exception leaves
+        it retryable.
 
         Without a ``token`` (legacy): nack the tracked ``_last_msg``.
 
@@ -1058,7 +1061,7 @@ class PulsarBackend(Backend, QueueBackend):
             nack = getattr(consumer, "negative_acknowledge", None)
             if callable(nack):
                 nack(message)
-            # else: leave unacked -> redelivered on timeout / restart
+            # else: leave unacked -> redelivered on consumer restart/disconnect
         except Exception as e:
             raise QueueError(
                 f"Failed to nack Pulsar message: {e}", operation="nack"
@@ -1080,8 +1083,10 @@ class PulsarBackend(Backend, QueueBackend):
                 nack = getattr(consumer, "negative_acknowledge", None)
                 if callable(nack):
                     nack(token.message_id)
-                # Older clients without the method leave the message unacked for
-                # timeout/restart redelivery; accepting nack is still terminal locally.
+                # Older clients without the method leave the message unacked,
+                # redelivered only on consumer restart/disconnect (no unacked
+                # message timeout is configured); accepting nack is still
+                # terminal locally.
             except Exception as e:
                 raise QueueError(
                     f"Failed to nack Pulsar message: {e}", operation="nack"

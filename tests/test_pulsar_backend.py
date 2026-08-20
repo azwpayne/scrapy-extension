@@ -7,6 +7,7 @@ constructor signatures stay faithful; individual tests patch ``Client`` or
 
 from __future__ import annotations
 
+import inspect
 import logging
 import subprocess
 import sys
@@ -1032,6 +1033,24 @@ class TestPulsarAckNack:
         consumer_a.negative_acknowledge.assert_called_once_with(msg)
         consumer_b.negative_acknowledge.assert_not_called()
         assert b._last_delivery is None
+
+    def test_nack_docstring_states_actual_redelivery_condition(self) -> None:
+        """R139-F6: nack docs must not promise unacked-timeout redelivery.
+
+        ``_ensure_consumer`` never passes an unacked-message timeout at
+        subscribe time, so an abandoned ack is redelivered only when the
+        consumer restarts or disconnects (the stale-token consumer
+        replacement included) — not on a timer.
+        """
+        doc = PulsarBackend.nack.__doc__ or ""
+        assert "unacked-timeout" not in doc
+        assert "restarts or disconnects" in doc
+
+        source = inspect.getsource(PulsarBackend.nack) + inspect.getsource(
+            PulsarBackend._nack_token
+        )
+        assert "timeout / restart" not in source
+        assert "timeout/restart" not in source
 
 
 class TestPulsarRealAck:
