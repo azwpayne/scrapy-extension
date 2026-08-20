@@ -120,7 +120,10 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         self.send_response(response.status)
         for name, value in response_headers:
             if name.lower() not in _HOP_BY_HOP_HEADERS | {"content-length"}:
-                self.send_header(name, value)
+                safe_name = name.replace("\r", "").replace("\n", "")
+                safe_value = value.replace("\r", "").replace("\n", "")
+                if safe_name:
+                    self.send_header(safe_name, safe_value)
         self.send_header("Content-Length", str(len(response_body)))
         self.send_header("Connection", "close")
         self.end_headers()
