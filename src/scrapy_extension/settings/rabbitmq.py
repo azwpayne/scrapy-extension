@@ -12,7 +12,7 @@ from ipaddress import ip_address
 from typing import Any, Literal
 from urllib.parse import unquote
 
-from pydantic import AmqpDsn, Field, SecretStr, model_validator
+from pydantic import AmqpDsn, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import SettingsConfigDict
 
 from scrapy_extension.exceptions.base import ConfigurationError
@@ -372,13 +372,42 @@ class RabbitMQSettings(RedactedBaseSettings):
     prefetch_count: int = Field(
         default=0,
         ge=0,
-        description="QoS prefetch count (0 = unlimited)",
+        description=(
+            "QoS prefetch count (0 = unlimited). RabbitMQ applies prefetch "
+            "to push (basic_consume) deliveries only; this backend consumes "
+            "via basic_get, which prefetch does not bound."
+        ),
     )
     prefetch_size: int = Field(
         default=0,
         ge=0,
-        description="QoS prefetch size in bytes (0 = unlimited)",
+        description=(
+            "QoS prefetch size in bytes; must be 0 (rejected otherwise). "
+            "RabbitMQ does not implement byte-based prefetch — a nonzero "
+            "value closes the channel at connect."
+        ),
     )
+
+    @field_validator("prefetch_size", mode="after")
+    @classmethod
+    def _reject_byte_based_prefetch(cls, value: int) -> int:
+        """R139-F4: reject ``prefetch_size != 0`` at configuration time.
+
+        RabbitMQ does not implement byte-based prefetch: the broker answers a
+        nonzero ``prefetch_size`` with NOT_IMPLEMENTED and closes the
+        just-opened channel at connect. Failing fast here turns a runtime
+        channel-killing connect into an explicit configuration error.
+        """
+        if value != 0:
+            raise ConfigurationError(
+                (
+                    "RabbitMQ does not implement byte-based prefetch; "
+                    "prefetch_size must be 0. A nonzero value is rejected by "
+                    "the broker and closes the channel at connect."
+                ),
+                setting_name="prefetch_size",
+            )
+        return value
 
     @model_validator(mode="before")
     @classmethod
