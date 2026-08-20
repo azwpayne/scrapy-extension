@@ -40,6 +40,9 @@ _HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
+_HEADER_NAME_CHARS = frozenset(
+    "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+)
 
 
 class _ResponseDropProxy(ThreadingHTTPServer):
@@ -80,7 +83,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _is_safe_header_name(name: str) -> bool:
-        return "\r" not in name and "\n" not in name and ":" not in name
+        return bool(name) and all(char in _HEADER_NAME_CHARS for char in name)
 
     @staticmethod
     def _sanitize_header_name(name: str) -> str:
@@ -89,6 +92,15 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     @staticmethod
     def _sanitize_header_value(value: str) -> str:
         return value.replace("\r", "").replace("\n", "")
+
+    def _send_forwarded_header(self, name: str, value: str) -> None:
+        if not self._is_safe_header_name(name):
+            return
+        # Validate first so sanitization can never rename an invalid field.
+        safe_name = self._sanitize_header_name(name)
+        if safe_name.lower() in _HOP_BY_HOP_HEADERS | {"content-length"}:
+            return
+        self.send_header(safe_name, self._sanitize_header_value(value))
 
     def _forward(self) -> None:
         server = self.server
@@ -131,13 +143,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
 
         self.send_response(response.status)
         for name, value in response_headers:
-            safe_name = self._sanitize_header_name(name)
-            if (
-                safe_name
-                and safe_name.lower() not in _HOP_BY_HOP_HEADERS | {"content-length"}
-                and self._is_safe_header_name(safe_name)
-            ):
-                self.send_header(safe_name, self._sanitize_header_value(value))
+            self._send_forwarded_header(name, value)
         self.send_header("Content-Length", str(len(response_body)))
         self.send_header("Connection", "close")
         self.end_headers()
