@@ -78,6 +78,14 @@ class _ProxyHandler(BaseHTTPRequestHandler):
 
     protocol_version = "HTTP/1.1"
 
+    @staticmethod
+    def _is_safe_header_name(name: str) -> bool:
+        return "\r" not in name and "\n" not in name and ":" not in name
+
+    @staticmethod
+    def _sanitize_header_value(value: str) -> str:
+        return value.replace("\r", "").replace("\n", "")
+
     def _forward(self) -> None:
         server = self.server
         assert isinstance(server, _ResponseDropProxy)
@@ -119,8 +127,11 @@ class _ProxyHandler(BaseHTTPRequestHandler):
 
         self.send_response(response.status)
         for name, value in response_headers:
-            if name.lower() not in _HOP_BY_HOP_HEADERS | {"content-length"}:
-                self.send_header(name, value)
+            if (
+                name.lower() not in _HOP_BY_HOP_HEADERS | {"content-length"}
+                and self._is_safe_header_name(name)
+            ):
+                self.send_header(name, self._sanitize_header_value(value))
         self.send_header("Content-Length", str(len(response_body)))
         self.send_header("Connection", "close")
         self.end_headers()
