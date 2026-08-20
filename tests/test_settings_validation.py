@@ -763,6 +763,40 @@ class TestRabbitMQModeConditional:
         assert exc_info.value.setting_name == "ha_mode"
 
 
+class TestRabbitMQPrefetchValidation:
+    """RabbitMQSettings R139-F4: ``prefetch_size`` must stay 0.
+
+    RabbitMQ does not implement byte-based prefetch: a nonzero
+    ``prefetch_size`` is accepted by pika but rejected by the broker with
+    NOT_IMPLEMENTED, closing the just-opened channel at connect. The knob
+    must fail fast at configuration time instead.
+    """
+
+    def test_prefetch_size_nonzero_rejected(self) -> None:
+        """A nonzero ``prefetch_size`` must raise ConfigurationError naming
+        the setting and stating both the unimplemented-feature and the
+        channel-closing consequence."""
+        with pytest.raises(ConfigurationError) as exc_info:
+            RabbitMQSettings(prefetch_size=1024)
+        assert exc_info.value.setting_name == "prefetch_size"
+        message = str(exc_info.value)
+        assert "byte-based prefetch" in message
+        assert "closes the channel" in message
+
+    def test_prefetch_size_zero_is_valid(self) -> None:
+        """``prefetch_size=0`` (the only supported value) constructs fine."""
+        assert RabbitMQSettings(prefetch_size=0).prefetch_size == 0
+
+    def test_default_prefetch_size_is_zero(self) -> None:
+        """The default must remain the one valid value."""
+        assert RabbitMQSettings().prefetch_size == 0
+
+    def test_prefetch_count_remains_accepted(self) -> None:
+        """``prefetch_count`` stays a valid knob (0 = unlimited); only the
+        byte-based half is rejected."""
+        assert RabbitMQSettings(prefetch_count=10).prefetch_count == 10
+
+
 # ---------------------------------------------------------------------------
 # SV4 — URL/scheme format guards (round 9b)
 # ---------------------------------------------------------------------------

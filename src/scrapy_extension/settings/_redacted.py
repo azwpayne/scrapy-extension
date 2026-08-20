@@ -142,6 +142,7 @@ _SAFE_SETTINGS_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
         "RabbitMQ cluster nodes must be non-empty host or host:port values.",
         "RabbitMQ connections outside loopback require verified TLS.",
         "RabbitMQ host must be a non-empty hostname or IP address.",
+        "RabbitMQ does not implement byte-based prefetch; prefetch_size must be 0. A nonzero value is rejected by the broker and closes the channel at connect.",
         "RabbitMQ password must be explicitly set and cannot be blank.",
         "RabbitMQ port must be between 1 and 65535.",
         "RabbitMQ ssl_enabled must be a boolean.",

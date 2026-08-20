@@ -135,6 +135,11 @@ _KAFKA_CLEAR_QUEUE_UNSUPPORTED_MESSAGE = (
     "accepted after clear returns. Stop and drain the queue with an "
     "operator-controlled Kafka maintenance workflow instead."
 )
+_KAFKA_MIXED_MODE_ACK_REFUSED_MESSAGE = (
+    "Legacy ack(token=None) refused: this topic-partition still has un-acked "
+    "pop_with_ack records in flight, so committing would advance the committed "
+    "offset past them. Ack each pop_with_ack token instead."
+)
 _KAFKA_SAFE_QUEUE_MESSAGES: frozenset[str] = frozenset(
     {
         "Kafka create-topics response has no valid topic_errors list.",
@@ -148,6 +153,7 @@ _KAFKA_SAFE_QUEUE_MESSAGES: frozenset[str] = frozenset(
         "Kafka consumer group has no committed offset and auto_offset_reset='none'.",
         "Kafka returned an invalid committed offset.",
         _KAFKA_CLEAR_QUEUE_UNSUPPORTED_MESSAGE,
+        _KAFKA_MIXED_MODE_ACK_REFUSED_MESSAGE,
     }
 )
 
@@ -1413,10 +1419,16 @@ class KafkaBackend(Backend, QueueBackend):
         last-committed offset up to it is completed. No unprocessed record is
         ever skipped.
 
-        Without a ``token`` (legacy single-pop caller): commit the tracked
-        ``_last_record`` wholesale. Only correct for ``CONCURRENT_REQUESTS=1``
-        — kept for backward compatibility with external callers that pop()
-        then ack() without threading the token through.
+        Without a ``token`` (legacy single-pop caller): commit an explicit
+        offset map for the tracked ``_last_record``'s topic-partition only
+        (``offset + 1``), never a bare ``commit()`` — that would sweep the
+        fetch position of every assigned partition, advancing committed
+        offsets past concurrently in-flight token records. Refused with a
+        :class:`QueueError` when the record's topic-partition still has
+        un-acked ``pop_with_ack`` records in flight. Only correct for
+        ``CONCURRENT_REQUESTS=1`` — kept for backward compatibility with
+        external callers that pop() then ack() without threading the token
+        through.
 
         Args:
             queue_name: Name of the queue (unused for the commit; kept for
@@ -1425,7 +1437,9 @@ class KafkaBackend(Backend, QueueBackend):
                 ``None`` to ack the last-popped record.
 
         Raises:
-            QueueError: If the underlying commit fails.
+            QueueError: If the underlying commit fails, or the legacy path is
+                attempted while the record's topic-partition has un-acked
+                in-flight token offsets.
         """
         del queue_name
         if token is not None:
@@ -1434,11 +1448,23 @@ class KafkaBackend(Backend, QueueBackend):
             self._ack_token(token)
             return
         with self._delivery_lock:
-            # Legacy path: commit the last-popped record wholesale.
+            # Legacy path: commit an explicit offset map scoped to the
+            # last-popped record's topic-partition. Other partitions'
+            # positions are never swept.
             if self._consumer is None or self._last_record is None:
                 return
+            record = self._last_record
+            topic_partition = (record.topic, record.partition)
+            # A bare commit would advance this partition's committed offset
+            # past the still-unacked token records; refuse the mixed mode.
+            if self._in_flight.get(topic_partition):
+                raise QueueError(
+                    _KAFKA_MIXED_MODE_ACK_REFUSED_MESSAGE,
+                    operation="ack",
+                )
             try:
-                self._consumer.commit()
+                tp = TopicPartition(record.topic, record.partition)
+                self._consumer.commit({tp: OffsetAndMetadata(record.offset + 1, "")})
             except KafkaError as e:
                 msg = f"Failed to ack Kafka message: {e}"
                 raise QueueError(msg, operation="ack") from e

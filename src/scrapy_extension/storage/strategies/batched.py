@@ -61,6 +61,14 @@ _FLUSH_LOCK_TIMEOUT_S: float = 5.0
 #: bounded (at a 30s ceiling instead of the old 10s).
 _CLOSE_DRAIN_DEADLINE_S: float = 30.0
 
+#: R139-F7: floor (seconds) for a single age-flusher wait (see
+#: :meth:`BatchedStorageStrategy._next_age_wait_interval`). A nearly-due oldest
+#: item has a remaining age budget at or below zero; without a floor the
+#: deadline-driven loop would wake in a tight spin until the flush comparison
+#: ticks over. 10ms bounds that spin while keeping worst-case flush latency at
+#: the configured cap plus one wakeup epsilon.
+_AGE_WAIT_FLOOR_S: float = 0.01
+
 _BATCHED_STORAGE_FLUSH_FAILURE_MESSAGE = "Batched storage flush failed."
 
 logger = logging.getLogger(__name__)
@@ -603,21 +611,55 @@ class BatchedStorageStrategy(StorageStrategy):
                 self._flusher = None
                 raise
 
+    def _next_age_wait_interval(self, age: float) -> float:
+        """Return the deadline-driven wait until the next age-flush check.
+
+        R139-F7: the pre-fix loop waited a fixed ``age`` between checks, so an
+        item accepted just after a wake missed the next check and spent up to
+        ``2 * age`` in volatile memory — twice what ``max_buffer_age_s`` is
+        documented to bound. This computes each wait from the oldest item's own
+        deadline instead: an empty buffer (or a missing timestamp) waits a full
+        ``age``; a live oldest item waits exactly its remaining budget, clamped
+        to ``_AGE_WAIT_FLOOR_S`` so a nearly-due item cannot busy-loop the
+        daemon.
+
+        Acquires ``self._lock`` to read a consistent
+        (``_buffer``, ``_oldest_ts``) pair and reads the clock under it so the
+        budget cannot go stale mid-computation; the caller must wait OUTSIDE
+        the lock (the loop's existing discipline).
+
+        Args:
+            age: The already-None-checked ``max_buffer_age_s`` cap.
+
+        Returns:
+            Seconds the age-flush loop should wait before its next check.
+        """
+        with self._lock:
+            oldest_ts = self._oldest_ts
+            if not self._buffer or oldest_ts is None:
+                return age
+            return max(age - (time.monotonic() - oldest_ts), _AGE_WAIT_FLOOR_S)
+
     def _age_flush_loop(self) -> None:
-        """Periodically flush when the oldest buffered item exceeds the age cap.
+        """Flush when the oldest buffered item reaches the age cap (deadline-driven).
 
         Bounds the crash-before-flush loss window to roughly ``max_buffer_age_s``:
-        the loop wakes on the age interval and flushes if the oldest item is older
-        than the cap. Uses ``_stop.wait(timeout=...)`` so :meth:`close` unblocks it
-        immediately on shutdown. All flush work goes through ``_flush``
-        (lock-guarded) so it composes safely with the store-path threshold flush.
-        A transient flush failure is logged and the loop continues so a temporary
-        outage does not permanently disable the flusher.
+        each cycle sleeps the oldest item's REMAINING age budget (a full ``age``
+        when the buffer is empty — see :meth:`_next_age_wait_interval`), so an
+        item accepted just after a wake is re-checked at its own deadline rather
+        than one full interval later. Worst-case time-to-flush is the cap plus
+        one wakeup epsilon instead of up to ``2 * age``. The flush condition
+        itself is unchanged: flush once the oldest item is at least ``age`` old.
+        Uses ``_stop.wait(timeout=...)`` so :meth:`close` unblocks it immediately
+        on shutdown. All flush work goes through ``_flush`` (lock-guarded) so it
+        composes safely with the store-path threshold flush. A transient flush
+        failure is logged and the loop continues so a temporary outage does not
+        permanently disable the flusher.
         """
         age = self.max_buffer_age_s
         if age is None:  # defensive — _ensure_flusher should have checked
             return
-        while not self._stop.wait(timeout=age):
+        while not self._stop.wait(timeout=self._next_age_wait_interval(age)):
             with self._lock:
                 need_flush = (
                     bool(self._buffer)

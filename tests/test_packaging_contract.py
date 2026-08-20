@@ -40,7 +40,7 @@ def _pyproject() -> dict[str, object]:
 def test_isolated_build_backend_is_exactly_pinned() -> None:
     build_system = _pyproject()["build-system"]
     assert isinstance(build_system, dict)
-    assert build_system["requires"] == ["uv_build==0.12.3"]
+    assert build_system["requires"] == ["uv_build==0.12.5"]
 
 
 def test_sdist_configuration_keeps_tests_self_contained_and_clean() -> None:

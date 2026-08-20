@@ -325,7 +325,7 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
     """Redis backend implementation with multimode support.
 
     Implements all backend interfaces using Redis data structures:
-    - Queue: Redis Sorted Sets (ZADD/ZRANGEBYSCORE/ZREM)
+    - Queue: Redis Sorted Sets (atomic Lua scripts: ZADD push, ZPOPMIN pop)
     - Set: Redis Sets (SADD/SREM/SISMEMBER/SCARD/DEL)
     - Storage: Redis Strings with TTL (SET/GET/DEL/EXISTS/TTL)
 

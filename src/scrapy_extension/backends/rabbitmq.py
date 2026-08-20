@@ -1171,7 +1171,9 @@ class RabbitMQBackend(Backend, QueueBackend):
 
         Args:
             queue_name: Name of the queue.
-            timeout: Seconds to wait (unused for RabbitMQ, blocking not supported).
+            timeout: Seconds to wait for an item (0 = non-blocking). While
+                waiting, the queue is polled in ~50ms slices until the
+                deadline elapses or an item arrives.
 
         Returns:
             The popped item, or None if queue is empty.
@@ -1200,7 +1202,9 @@ class RabbitMQBackend(Backend, QueueBackend):
 
         Args:
             queue_name: Name of the queue.
-            timeout: Seconds to wait (unused for RabbitMQ).
+            timeout: Seconds to wait for an item (0 = non-blocking). While
+                waiting, the queue is polled in ~50ms slices until the
+                deadline elapses or an item arrives.
 
         Returns:
             ``(body, token)`` where ``token`` carries the AMQP delivery tag and
@@ -1504,6 +1508,12 @@ class RabbitMQBackend(Backend, QueueBackend):
                 msg = "Not connected to RabbitMQ"
                 raise QueueError(msg, queue_name=queue_name, operation="queue_len")
             try:
+                # R139-F2: a passive declare of a never-created queue is answered
+                # by the broker with a 404 that closes the channel (queue_len
+                # would raise instead of returning 0). Declare first, mirroring
+                # push/_basic_get, so the passive probe can only hit an existing
+                # queue.
+                self._ensure_queue_exists(queue_name)
                 result = channel.queue_declare(
                     queue=queue_name,
                     passive=True,
@@ -1554,6 +1564,11 @@ class RabbitMQBackend(Backend, QueueBackend):
                     operation="clear_queue",
                 )
             try:
+                # R139-F3: queue_purge of a never-created queue is answered by
+                # the broker with a 404 that closes the channel (sibling Redis
+                # DEL / Mongo delete_many are silent no-ops on missing keys).
+                # Declare first so purging a fresh queue is a harmless no-op.
+                self._ensure_queue_exists(queue_name)
                 session[1].queue_purge(queue=queue_name)
             except AMQPError as e:
                 msg = f"Failed to clear queue {queue_name}: {e}"

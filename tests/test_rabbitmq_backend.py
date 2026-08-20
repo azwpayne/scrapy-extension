@@ -1878,3 +1878,161 @@ def test_disconnect_clears_delivery_tag_state_and_in_flight_set():
     assert backend._in_flight_tags == set()
     assert backend._channel is None
     assert backend._connection is None
+
+
+# ---------------------------------------------------------------------------
+# R139-F2 — queue_len must run the declare gate before the passive declare
+# ---------------------------------------------------------------------------
+
+
+def test_rabbitmq_queue_len_declares_fresh_queue_before_passive_probe(mocker):
+    """R139-F2: queue_len on a never-created queue must return 0, not 404.
+
+    Without the ``_ensure_queue_exists`` gate that push/_basic_get use, the
+    passive declare of a missing queue is answered by the broker with a 404
+    that closes the channel: queue_len raises QueueError instead of returning
+    0 per the QueueBackend contract, and every later op on the session fails
+    until reconnect. The broker simulation mirrors that: a passive declare of
+    an undeclared queue raises; an active declare creates it.
+    """
+    config = RabbitMQSettings()
+    backend = RabbitMQBackend(config)
+
+    mock_instance = mocker.MagicMock()
+    mock_channel = mocker.MagicMock()
+    mock_instance.channel.return_value = mock_channel
+    mocker.patch("pika.BlockingConnection", return_value=mock_instance)
+
+    declared: set[str] = set()
+
+    def declare_side_effect(queue=None, passive=False, **_kwargs):
+        if passive and queue not in declared:
+            raise pika.exceptions.AMQPError(
+                f"404 NOT_FOUND - no queue '{queue}' in vhost '/'"
+            )
+        declared.add(queue)
+        result = mocker.MagicMock()
+        result.method.message_count = 0
+        return result
+
+    mock_channel.queue_declare.side_effect = declare_side_effect
+
+    backend.connect()
+
+    assert backend.queue_len("fresh_queue") == 0
+    assert "fresh_queue" in backend._declared_queues
+
+
+def test_rabbitmq_queue_len_active_declare_precedes_passive_declare(mocker):
+    """R139-F2: the gate declare must happen before the passive probe.
+
+    A passive declare only succeeds once the queue exists, so the call order
+    on the channel is load-bearing: active declare first, passive second.
+    """
+    config = RabbitMQSettings()
+    backend = RabbitMQBackend(config)
+
+    mock_instance = mocker.MagicMock()
+    mock_channel = mocker.MagicMock()
+    mock_instance.channel.return_value = mock_channel
+    mocker.patch("pika.BlockingConnection", return_value=mock_instance)
+
+    passive_result = mocker.MagicMock()
+    passive_result.method.message_count = 0
+    mock_channel.queue_declare.return_value = passive_result
+
+    backend.connect()
+    assert backend.queue_len("test_queue") == 0
+
+    calls = mock_channel.queue_declare.call_args_list
+    assert len(calls) == 2
+    assert not calls[0].kwargs.get("passive")
+    assert calls[0].kwargs.get("queue") == "test_queue"
+    assert calls[1].kwargs.get("passive") is True
+    assert calls[1].kwargs.get("queue") == "test_queue"
+
+
+# ---------------------------------------------------------------------------
+# R139-F3 — clear_queue must run the declare gate before the purge
+# ---------------------------------------------------------------------------
+
+
+def test_rabbitmq_clear_queue_purges_fresh_queue_without_error(mocker):
+    """R139-F3: clearing a never-created queue must be a no-op, not a 404.
+
+    ``queue_purge`` of a missing queue 404s on a real broker (siblings Redis
+    ``DEL`` / Mongo ``delete_many`` are silent no-ops), raising QueueError and
+    killing the channel. With the declare gate the queue is created first, so
+    purging a fresh queue is a harmless no-op.
+    """
+    config = RabbitMQSettings()
+    backend = RabbitMQBackend(config)
+
+    mock_instance = mocker.MagicMock()
+    mock_channel = mocker.MagicMock()
+    mock_instance.channel.return_value = mock_channel
+    mocker.patch("pika.BlockingConnection", return_value=mock_instance)
+
+    declared: set[str] = set()
+
+    def declare_side_effect(queue=None, **_kwargs):
+        declared.add(queue)
+        return mocker.MagicMock()
+
+    def purge_side_effect(queue=None):
+        if queue not in declared:
+            raise pika.exceptions.AMQPError(
+                f"404 NOT_FOUND - no queue '{queue}' in vhost '/'"
+            )
+        return None
+
+    mock_channel.queue_declare.side_effect = declare_side_effect
+    mock_channel.queue_purge.side_effect = purge_side_effect
+
+    backend.connect()
+
+    backend.clear_queue("fresh_queue")
+    assert "fresh_queue" in backend._declared_queues
+
+
+def test_rabbitmq_clear_queue_declares_before_purge(mocker):
+    """R139-F3: the gate declare must precede the purge on the channel."""
+    config = RabbitMQSettings()
+    backend = RabbitMQBackend(config)
+
+    mock_instance = mocker.MagicMock()
+    mock_channel = mocker.MagicMock()
+    mock_instance.channel.return_value = mock_channel
+    mocker.patch("pika.BlockingConnection", return_value=mock_instance)
+
+    backend.connect()
+    backend.clear_queue("test_queue")
+
+    order = [
+        call[0]
+        for call in mock_channel.mock_calls
+        if call[0] in ("queue_declare", "queue_purge")
+    ]
+    assert order == ["queue_declare", "queue_purge"]
+
+
+# ---------------------------------------------------------------------------
+# R139-F5 — pop timeout docstrings must match the honored-deadline behavior
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("method_name", ["pop", "pop_with_ack"])
+def test_rabbitmq_pop_docstrings_state_deadline_honoring_timeout(method_name):
+    """R139-F5: the timeout docs must match the implementation and the ABC.
+
+    ``_basic_get`` honors ``timeout`` (a monotonic deadline with ~50ms-slice
+    polling; test_rabbitmq_backend_pop_blocking_retries pins the retry loop),
+    matching the QueueBackend contract "Seconds to wait for an item
+    (0 = non-blocking)". The old "unused for RabbitMQ" wording told callers
+    blocking was unsupported when a large timeout actually blocks the thread
+    for that window.
+    """
+    doc = getattr(RabbitMQBackend, method_name).__doc__ or ""
+    assert "unused for RabbitMQ" not in doc
+    assert "non-blocking" in doc
+    assert "deadline" in doc

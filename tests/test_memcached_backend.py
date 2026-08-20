@@ -986,3 +986,72 @@ class TestMemcachedStorageErrorContract:
         client.set.side_effect = RuntimeError("boom")
         with pytest.raises(BackendError):
             b.store("key1", b"value")
+
+
+# ---------------------------------------------------------------------------
+# R138-F2: clear_storage lifecycle classification.
+# A None connection snapshot (never-connected or disconnected) is a lifecycle
+# state, not a capability gap — it must surface the static storage contract,
+# never the allow_flush_all advisory for a flag the operator already enabled.
+# ---------------------------------------------------------------------------
+
+
+class TestMemcachedClearStorageLifecycleContract:
+    def test_never_connected_clear_storage_is_storage_error_not_advisory(
+        self,
+    ) -> None:
+        backend = _make_backend(allow_flush_all=True)
+        assert backend._connection_snapshot is None
+
+        with pytest.raises(StorageError) as exc_info:
+            backend.clear_storage()
+
+        error = exc_info.value
+        assert type(error) is StorageError
+        assert str(error) == "Memcached storage clear failed."
+        assert error.operation == "clear_storage"
+        assert error.key is None
+        assert "SCRAPY_MEMCACHED_ALLOW_FLUSH_ALL" not in str(error)
+
+    def test_disconnected_clear_storage_is_storage_error_not_advisory(
+        self, mocker
+    ) -> None:
+        backend = _make_backend(allow_flush_all=True)
+        client = mocker.MagicMock()
+        client.stats.return_value = {}
+        client.flush_all.return_value = True
+        mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
+        backend.connect()
+        backend.disconnect()
+        assert backend._connection_snapshot is None
+
+        with pytest.raises(StorageError) as exc_info:
+            backend.clear_storage()
+
+        error = exc_info.value
+        assert type(error) is StorageError
+        assert str(error) == "Memcached storage clear failed."
+        assert error.operation == "clear_storage"
+        assert error.key is None
+        assert "SCRAPY_MEMCACHED_ALLOW_FLUSH_ALL" not in str(error)
+        client.flush_all.assert_not_called()
+
+    def test_connected_capability_disabled_keeps_not_implemented_error(
+        self, mocker
+    ) -> None:
+        backend = _make_backend()
+        client = mocker.MagicMock()
+        client.stats.return_value = {}
+        mocker.patch.object(memcached_mod, "MemcachedClient", return_value=client)
+        backend.connect()
+        assert backend._connection_snapshot is not None
+
+        with pytest.raises(NotImplementedError) as exc_info:
+            backend.clear_storage()
+
+        assert type(exc_info.value) is NotImplementedError
+        assert (
+            str(exc_info.value)
+            == memcached_mod._MEMCACHED_CLEAR_STORAGE_DISABLED_MESSAGE
+        )
+        client.flush_all.assert_not_called()

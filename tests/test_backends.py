@@ -431,6 +431,19 @@ class TestRedisBackend:
         backend = RedisBackend(redis_settings)
         assert backend.backend_type == BackendType.REDIS
 
+    def test_class_docstring_documents_atomic_lua_queue_ops(self):
+        """Queue doc must match the atomic Lua implementation (R138 F3).
+
+        The queue is driven by the atomic Lua scripts (ZADD push, ZPOPMIN pop);
+        ZRANGEBYSCORE/ZREM appear nowhere in the implementation, so the class
+        docstring must not advertise them.
+        """
+        from scrapy_extension.backends.redis import RedisBackend
+
+        docstring = RedisBackend.__doc__ or ""
+        assert "ZPOPMIN" in docstring
+        assert "ZRANGEBYSCORE" not in docstring
+
     def test_connect_success(self, redis_settings, mock_redis, mocker):
         """Test successful connection."""
         from scrapy_extension.backends.redis import RedisBackend

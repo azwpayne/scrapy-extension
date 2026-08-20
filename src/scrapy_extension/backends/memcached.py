@@ -582,8 +582,8 @@ class MemcachedBackend(Backend, StorageBackend):
             ValueError: If ``prefix`` contains invalid characters.
             NotImplementedError: If prefix scoping is requested or the destructive
                 global flush has not been explicitly enabled.
-            StorageError: If the underlying client raises (was previously
-                silently swallowed).
+            StorageError: If the backend is not connected or the underlying
+                client raises (was previously silently swallowed).
         """
         if prefix is not None:
             _validate_key_name(prefix, "prefix")
@@ -594,7 +594,16 @@ class MemcachedBackend(Backend, StorageBackend):
             with self._lifecycle_lock:
                 client = self._client
                 snapshot = self._connection_snapshot
-            if snapshot is None or not snapshot.allow_flush_all:
+            if snapshot is None:
+                # Lifecycle state, not a capability gap (never-connected or
+                # disconnected): advise reconnection, not the flush flag an
+                # operator may already have enabled.
+                raise StorageError(
+                    "Memcached backend is not connected",
+                    operation="clear_storage",
+                    key=None,
+                )
+            if not snapshot.allow_flush_all:
                 raise NotImplementedError(_MEMCACHED_CLEAR_STORAGE_DISABLED_MESSAGE)
             try:
                 flushed = client.flush_all()

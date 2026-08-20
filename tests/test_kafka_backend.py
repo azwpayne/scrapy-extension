@@ -11,6 +11,7 @@ import pytest
 from kafka import TopicPartition
 from kafka.admin import NewTopic
 from kafka.errors import KafkaError, TopicAlreadyExistsError
+from kafka.structs import OffsetAndMetadata
 
 from scrapy_extension.backends import kafka as kafka_module
 from scrapy_extension.backends.kafka import KafkaBackend
@@ -2277,16 +2278,81 @@ class TestKafkaBackendPopWithAckConcurrency:
         assert oam2.offset == 3
 
     def test_ack_token_none_legacy_fallback_commits_last_record(self, mocker):
-        """(d) ack(token=None) legacy fallback commits the last-popped record wholesale."""
+        """(d) ack(token=None) commits an explicit single-partition offset map.
+
+        The map covers only the last-popped record's topic-partition at
+        ``offset + 1``. A bare ``commit()`` would sweep the fetch POSITION of
+        every assigned partition, advancing committed offsets past
+        concurrently in-flight token records (silent loss on crash/rebalance).
+        """
         config = KafkaSettings()
         backend = KafkaBackend(config)
         mock_consumer = mocker.MagicMock()
         backend._consumer = mock_consumer
-        backend._last_record = mocker.MagicMock()
+        backend._last_record = self._record(mocker, 0, 5)
 
         backend.ack("testq", token=None)  # legacy path
 
-        mock_consumer.commit.assert_called_once_with()  # bare commit, no offset map
+        mock_consumer.commit.assert_called_once_with(
+            {TopicPartition("scrapy-testq", 0): OffsetAndMetadata(6, "")}
+        )
+        # _last_record is settled, not left armed for a repeat commit.
+        assert backend._last_record is None
+
+    def test_ack_token_none_refused_when_token_records_in_flight_on_partition(
+        self, mocker
+    ):
+        """Legacy bare ack is refused while the record's partition has in-flight tokens.
+
+        pop_with_ack(offset 0) leaves it in-flight; a later legacy pop(offset 1)
+        re-arms ``_last_record``. The bare-commit slot must not advance the
+        committed offset past the still-unacked token record.
+        """
+        records = [
+            self._record(mocker, 0, 0),
+            self._record(mocker, 0, 1),
+        ]
+        backend, mock_consumer = self._make_backend_with_records(mocker, records)
+
+        _value, token = backend.pop_with_ack("testq")
+        assert token is not None
+        _legacy_value = backend.pop("testq")  # re-arms _last_record on same tp
+        assert _legacy_value is not None
+
+        with pytest.raises(QueueError, match="pop_with_ack"):
+            backend.ack("testq", token=None)
+
+        mock_consumer.commit.assert_not_called()
+        # Refusal is not settlement: the legacy slot stays armed for retry.
+        assert backend._last_record is not None
+        assert 0 in backend._in_flight[("scrapy-testq", 0)]
+
+    def test_ack_token_none_allowed_with_in_flight_only_on_other_partition(
+        self, mocker
+    ):
+        """In-flight tokens on OTHER partitions never block a legacy ack.
+
+        The explicit offset map touches only the legacy record's own
+        topic-partition, so other partitions' positions are never swept and
+        their in-flight bookkeeping is untouched.
+        """
+        records = [
+            self._record(mocker, 1, 0),
+            self._record(mocker, 0, 4),
+        ]
+        backend, mock_consumer = self._make_backend_with_records(mocker, records)
+
+        _value, token = backend.pop_with_ack("testq")  # in-flight on partition 1
+        assert token is not None
+        _legacy_value = backend.pop("testq")  # legacy record on partition 0
+        assert _legacy_value is not None
+
+        backend.ack("testq", token=None)
+
+        mock_consumer.commit.assert_called_once_with(
+            {TopicPartition("scrapy-testq", 0): OffsetAndMetadata(5, "")}
+        )
+        assert 0 in backend._in_flight[("scrapy-testq", 1)]
 
     def test_nack_does_not_commit_redeliver_semantics(self, mocker):
         """(e) nack(token) rewinds an assigned partition for in-session retry."""

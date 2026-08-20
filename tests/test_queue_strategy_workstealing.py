@@ -366,6 +366,45 @@ def test_rabbitmq_uses_portable_name_only_when_legacy_name_cannot_exist():
     assert len(physical.encode()) <= 255
 
 
+def test_colon_bearing_worker_id_on_legacy_backend_uses_portable_name():
+    """R138: ``jobs`` + worker ``a:b`` resolved to ``jobs:a:b`` — the same
+    physical queue another logical queue's worker resolves to — so one worker
+    pops and clears the other queue's requests. Colon-bearing worker identities
+    take the injective hash name instead."""
+    cm = MagicMock(name="ConnectionManager")
+    cm.backend_type = "redis"
+    cm.get_queue_backend.return_value = MagicMock()
+    s = WorkStealingQueueStrategy(cm, worker_id="a:b", peer_ids=())
+
+    physical = s._own_queue("jobs")
+
+    assert physical != "jobs:a:b"
+    assert physical.startswith("scrapyext-worker-")
+
+
+def test_colon_worker_identity_pair_resolves_to_distinct_physical_names():
+    """The collision pair (queue=jobs, worker="a:b") vs (queue=jobs:a, worker="b")
+    must not share one physical queue on a legacy-colon backend."""
+    cm = MagicMock(name="ConnectionManager")
+    cm.backend_type = "redis"
+    cm.get_queue_backend.return_value = MagicMock()
+    colon_worker = WorkStealingQueueStrategy(cm, worker_id="a:b", peer_ids=())
+    colon_queue = WorkStealingQueueStrategy(cm, worker_id="b", peer_ids=())
+
+    assert colon_worker._own_queue("jobs") != colon_queue._own_queue("jobs:a")
+
+
+def test_colon_bearing_queue_name_with_colon_free_worker_keeps_legacy_name():
+    """Minimal behavior change: only the discriminator side hashes away, so a
+    colon-bearing queue name with a colon-free worker keeps its published name."""
+    cm = MagicMock(name="ConnectionManager")
+    cm.backend_type = "redis"
+    cm.get_queue_backend.return_value = MagicMock()
+    s = WorkStealingQueueStrategy(cm, worker_id="b", peer_ids=())
+
+    assert s._own_queue("jobs:a") == "jobs:a:b"
+
+
 def test_pop_skips_empty_peer_steals_from_next():
     """Own + w2 empty, w3 has item."""
     s, qb = _strategy(worker_id="w1", peer_ids=("w2", "w3"))
