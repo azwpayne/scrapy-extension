@@ -40,6 +40,9 @@ _HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
+_HEADER_NAME_CHARS = frozenset(
+    "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+)
 
 
 class _ResponseDropProxy(ThreadingHTTPServer):
@@ -77,6 +80,27 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     """Forward one request, optionally closing after the upstream committed."""
 
     protocol_version = "HTTP/1.1"
+
+    @staticmethod
+    def _is_safe_header_name(name: str) -> bool:
+        return bool(name) and all(char in _HEADER_NAME_CHARS for char in name)
+
+    @staticmethod
+    def _sanitize_header_name(name: str) -> str:
+        return name.replace("\r", "").replace("\n", "").replace(":", "")
+
+    @staticmethod
+    def _sanitize_header_value(value: str) -> str:
+        return value.replace("\r", "").replace("\n", "")
+
+    def _send_forwarded_header(self, name: str, value: str) -> None:
+        if not self._is_safe_header_name(name):
+            return
+        # Validate first so sanitization can never rename an invalid field.
+        safe_name = self._sanitize_header_name(name)
+        if safe_name.lower() in _HOP_BY_HOP_HEADERS | {"content-length"}:
+            return
+        self.send_header(safe_name, self._sanitize_header_value(value))
 
     def _forward(self) -> None:
         server = self.server
@@ -119,8 +143,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
 
         self.send_response(response.status)
         for name, value in response_headers:
-            if name.lower() not in _HOP_BY_HOP_HEADERS | {"content-length"}:
-                self.send_header(name, value)
+            self._send_forwarded_header(name, value)
         self.send_header("Content-Length", str(len(response_body)))
         self.send_header("Connection", "close")
         self.end_headers()
