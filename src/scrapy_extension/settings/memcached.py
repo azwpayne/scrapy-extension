@@ -157,9 +157,9 @@ class MemcachedSettings(RedactedBaseSettings):
         description="Memcached deployment mode (standalone)",
     )
     host: str = Field(
-        default="localhost",
+        default="127.0.0.1",
         min_length=1,
-        description="Memcached host",
+        description="Memcached host (IPv4 loopback by default for portable local use)",
     )
     port: int = Field(
         default=11211,

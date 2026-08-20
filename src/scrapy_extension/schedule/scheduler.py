@@ -11,16 +11,17 @@ import os
 import sys
 import threading
 import uuid
-from collections.abc import AsyncIterable, Callable, Iterable, Mapping
+from collections.abc import AsyncIterable, Callable, Iterable, Mapping, MutableMapping
 from dataclasses import dataclass, replace
-from inspect import getattr_static, isawaitable
-from typing import TYPE_CHECKING, Any
+from inspect import getattr_static, isawaitable, signature
+from typing import TYPE_CHECKING, Any, cast
 
 from pydispatch.errors import DispatcherKeyError
 from scrapy import signals
 from scrapy.http import Request
 from scrapy.utils.misc import load_object
-from twisted.internet.defer import Deferred
+from twisted.internet.defer import Deferred, DeferredList, fail
+from twisted.internet.threads import deferToThread
 from twisted.python.failure import Failure as TwistedFailure
 
 from scrapy_extension.backends.base import BackendType, _validate_key_name
@@ -30,12 +31,14 @@ from scrapy_extension.backends.connectors import (
     _CONSUMER_SCOPED_BACKENDS,
     ConnectionManager,
     ConnectionManagerLease,
+    release_manager_acquire,
     resolve_backend_config,
 )
 from scrapy_extension.backends.registry import has_capability
 from scrapy_extension.exceptions import (
     BackendConnectionError,
     BackendError,
+    BackendOperationTimeout,
     ConfigurationError,
     QueueError,
     SerializationError,
@@ -52,6 +55,20 @@ from scrapy_extension.utils._config import (
     get_bool_setting,
     parse_float_setting,
     parse_int_setting,
+)
+from scrapy_extension.utils.identity import (
+    DEFAULT_PROJECT_NAME,
+    DEFAULT_QUEUE_KEY_TEMPLATE,
+    project_name_from_settings,
+    project_name_from_spider,
+    resolve_identity_template,
+)
+from scrapy_extension.utils.reactor import (
+    DEFAULT_REACTOR_IO_TIMEOUT_S,
+    MAX_REACTOR_IO_TIMEOUT_S,
+    bounded_deferred,
+    defer_to_thread_ordered,
+    reactor_is_running,
 )
 
 if TYPE_CHECKING:
@@ -76,17 +93,120 @@ _MISSING_STATIC_ATTRIBUTE = object()
 _EnqueueDiagnostic = tuple[str, str, str | None]
 
 
+@dataclass(frozen=True)
+class _DeferredLifecycleResult:
+    """Authoritative lifecycle completion plus its caller-facing timeout view."""
+
+    operation: Deferred[Any]
+    bounded: Deferred[Any]
+
+
+_LifecycleContinuation = _DeferredLifecycleResult | Deferred[Any] | None
+
+
+def _lifecycle_operation(result: _LifecycleContinuation) -> Deferred[Any] | None:
+    """Return the authoritative Deferred hidden by one lifecycle result."""
+    if isinstance(result, _DeferredLifecycleResult):
+        if result.bounded is not result.operation:
+            # The outer lifecycle owns the public timeout view. Consume the
+            # nested view we flatten so a late nested failure cannot be reported
+            # as an unhandled Deferred after the outer view has settled.
+            result.bounded.addErrback(lambda _failure: None)
+        return result.operation
+    if isinstance(result, Deferred):
+        return result
+    return None
+
+
+def _chain_lifecycle_result(
+    source: Deferred[Any],
+    continuation: Callable[[Any], _LifecycleContinuation],
+    *,
+    preserve_failure: Any | Callable[[], Any | None] | None = None,
+) -> Deferred[Any]:
+    """Flatten one lifecycle continuation without leaking its result wrapper.
+
+    Twisted chains a Deferred returned from a callback, but it treats the
+    package's ``(_operation, _bounded)`` pair as an ordinary value. Returning
+    that value from a close callback therefore publishes completion too early.
+    This helper also creates a separate destination Deferred: a close
+    continuation may be attached to its own opening Deferred without forming a
+    self-chain when that opening Deferred is also the lifecycle source.
+    """
+    chained: Deferred[Any] = Deferred()
+
+    def settle_success(value: Any) -> Any:
+        chained.callback(value)
+        return value
+
+    def settle_failure(failure: Any) -> None:
+        chained.errback(failure)
+        return None
+
+    def flatten(value: Any) -> None:
+        source_failure = value if isinstance(value, TwistedFailure) else None
+        failure = preserve_failure() if callable(preserve_failure) else preserve_failure
+        if failure is None:
+            failure = source_failure
+        try:
+            result = continuation(value)
+        except BaseException as exc:
+            settle_failure(
+                failure if failure is not None else TwistedFailure(exc)  # type: ignore[no-untyped-call]
+            )
+            return None
+        operation = _lifecycle_operation(result)
+        if operation is None:
+            if failure is not None:
+                settle_failure(failure)
+            else:
+                settle_success(result)
+            return None
+
+        def operation_success(result_value: Any) -> Any:
+            if isinstance(result_value, TwistedFailure):
+                settle_failure(failure if failure is not None else result_value)
+            elif failure is not None:
+                settle_failure(failure)
+            else:
+                settle_success(result_value)
+            return result_value
+
+        def operation_failure(operation_failure_value: Any) -> None:
+            settle_failure(failure if failure is not None else operation_failure_value)
+            # The destination observed the operation's failure; consume this
+            # branch so a public timeout cannot leave a second unhandled Failure.
+            return None
+
+        operation.addCallbacks(operation_success, operation_failure)
+        return None
+
+    # Close teardown must also run when an opening stage fails (including a
+    # cancellation requested by close); the continuation decides which failure,
+    # if any, remains authoritative. Returning None consumes the source branch;
+    # ``chained`` retains the public result independently.
+    source.addBoth(flatten)
+    return chained
+
+
 class _SchedulerAttemptToken:
     """Frame-scoped lifecycle ownership reclaimable after its call unwinds."""
 
-    __slots__ = ("thread_id",)
+    __slots__ = ("pending", "thread_id")
 
     def __init__(self) -> None:
         self.thread_id = threading.get_ident()
+        # A Deferred lifecycle callback outlives the call frame. Keep the close
+        # reservation authoritative until that callback settles it; otherwise a
+        # concurrent close could reclaim the same resources while the hook is
+        # still running.
+        self.pending = False
 
     @property
     def active(self) -> bool:
-        """Whether the owning ``_close_attempt`` frame still holds this token."""
+        """Whether the owning close attempt still holds this token."""
+        if self.pending:
+            return True
         try:
             frame = sys._current_frames().get(self.thread_id)  # noqa: SLF001
         except Exception:  # noqa: BLE001 - stale ownership must be reclaimable
@@ -137,6 +257,8 @@ class _QueueComponentConfig:
     ring_buffer_full_policy: str
     queue_key_template: str | None = None
     queue_key: str | None = None
+    project_name: str | None = None
+    allow_cross_spider: bool = False
     strategy_type: Any | None = None
     default_delay: float | None = None
     min_interval: float | None = None
@@ -157,6 +279,7 @@ class _QueueComponentConfig:
     queue_snapshot_owner: str | None = None
     queue_snapshot_max_bytes: int | None = None
     queue_snapshot_chunk_bytes: int | None = None
+    reactor_io_timeout: float | None = None
 
     @classmethod
     def from_early_settings(
@@ -203,9 +326,20 @@ class _QueueComponentConfig:
         settings: Settings,
         *,
         spider_name: str | None,
+        project_name: str | None = None,
+        queue_key_override: str | None = None,
     ) -> _QueueComponentConfig:
-        """Validate and resolve the queue key at the original factory checkpoint."""
-        queue_key = settings.get("SCRAPY_QUEUE_KEY", "scheduler-queue")
+        """Validate and resolve the queue key at the original factory checkpoint.
+
+        ``queue_key_override`` is used by composite owners such as
+        :class:`BackendSpiderMixin`. It keeps validation and identity-placeholder
+        handling in this one factory while allowing explicit legacy key overrides.
+        """
+        queue_key = (
+            settings.get("SCRAPY_QUEUE_KEY", DEFAULT_QUEUE_KEY_TEMPLATE)
+            if queue_key_override is None
+            else queue_key_override
+        )
         if not isinstance(queue_key, str):
             raise ConfigurationError(
                 f"SCRAPY_QUEUE_KEY must be a string, got {queue_key!r}.",
@@ -221,14 +355,17 @@ class _QueueComponentConfig:
                     setting_name="spider.name",
                     setting_value=spider_name,
                 ) from exc
-        resolved_queue_key = (
-            queue_key.replace("{spider}", spider_name)
-            if spider_name is not None
-            else queue_key
+        resolved_project_name = project_name or project_name_from_settings(settings)
+        resolved_queue_key = resolve_identity_template(
+            queue_key,
+            spider_name=spider_name,
+            project_name=resolved_project_name,
         )
         try:
             _validate_key_name(
-                resolved_queue_key.replace("{spider}", "spider"),
+                resolved_queue_key.replace("{spider}", "spider").replace(
+                    "{project}", "project"
+                ),
                 "SCRAPY_QUEUE_KEY",
             )
         except ValueError as exc:
@@ -241,6 +378,11 @@ class _QueueComponentConfig:
             self,
             queue_key_template=queue_key,
             queue_key=resolved_queue_key,
+            project_name=resolved_project_name,
+            allow_cross_spider=get_bool_setting(
+                settings,
+                "SCRAPY_QUEUE_ALLOW_CROSS_SPIDER",
+            ),
         )
 
     def with_strategy_settings(self, settings: Settings) -> _QueueComponentConfig:
@@ -423,6 +565,13 @@ class _QueueComponentConfig:
             ),
             maximum=min(queue_snapshot_max_bytes, MAX_SNAPSHOT_CHUNK_BYTES),
         )
+        reactor_io_timeout = parse_float_setting(
+            settings.get("SCRAPY_REACTOR_IO_TIMEOUT", DEFAULT_REACTOR_IO_TIMEOUT_S),
+            "SCRAPY_REACTOR_IO_TIMEOUT",
+            minimum=0.0,
+            minimum_exclusive=True,
+            maximum=MAX_REACTOR_IO_TIMEOUT_S,
+        )
         snapshot_owner_raw = settings.get("SCRAPY_QUEUE_SNAPSHOT_OWNER")
         queue_snapshot_owner = (
             snapshot_owner_raw if snapshot_owner_raw is not None else self.worker_id
@@ -463,7 +612,41 @@ class _QueueComponentConfig:
             queue_snapshot_owner=queue_snapshot_owner,
             queue_snapshot_max_bytes=queue_snapshot_max_bytes,
             queue_snapshot_chunk_bytes=queue_snapshot_chunk_bytes,
+            reactor_io_timeout=reactor_io_timeout,
         )
+
+
+def _call_dupefilter_open(dupefilter: object, spider: Spider) -> Any:
+    """Call a dupefilter's Scrapy-2.17 lifecycle hook compatibly.
+
+    Scrapy's stable ``BaseDupeFilter`` contract is ``open()``; the scheduler's
+    own ``open(spider)`` argument must not be forwarded to generic filters such
+    as ``RFPDupeFilter``.  ``BackendDupeFilter`` predates that contract in this
+    package because it uses the spider to resolve ``{spider}`` keys, so retain
+    its package-specific call.  Required-argument and variadic third-party test
+    doubles remain supported for source compatibility.
+    """
+    from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
+
+    open_hook = getattr(dupefilter, "open")
+    if isinstance(dupefilter, BackendDupeFilter):
+        return open_hook(spider)
+    try:
+        parameters = tuple(signature(open_hook).parameters.values())
+    except (TypeError, ValueError):
+        # Some proxy objects (including older Scrapy extensions) do not expose
+        # a signature. Their historical spider-aware form is the safest fallback.
+        return open_hook(spider)
+    if any(
+        parameter.kind in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD)
+        for parameter in parameters
+    ) or any(
+        parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)
+        and parameter.default is parameter.empty
+        for parameter in parameters
+    ):
+        return open_hook(spider)
+    return open_hook()
 
 
 def _static_declaration_rank(component: object, name: str) -> int | None:
@@ -624,6 +807,80 @@ class _DeferredReplacementAckGroup:
         self._next_child = 0
         self._sealed = False
         self._terminal = False
+        self._settlement_in_progress = False
+        self._settlement_operation: Deferred[Any] | None = None
+
+    def _settle_source(self, *, negative: bool) -> None:
+        """Settle outside the group lock and retain async authority until done."""
+        if reactor_is_running():
+            try:
+                ordered = self._scheduler._settle_token_async_ordered(
+                    self._source_token,
+                    negative=negative,
+                    log_message=(
+                        "Failed to nack source after errback output failure"
+                        if negative
+                        else "Failed to ack source message after errback replacements committed"
+                    ),
+                )
+            except BaseException:
+                with self._lock:
+                    self._settlement_in_progress = False
+                raise
+            if ordered is None:
+                with self._lock:
+                    self._settlement_in_progress = False
+                return
+            operation, _bounded = ordered
+            with self._lock:
+                self._settlement_operation = operation
+
+            def settled_success(_value: Any) -> Any:
+                with self._lock:
+                    if self._settlement_operation is operation:
+                        self._settlement_operation = None
+                        self._settlement_in_progress = False
+                        if not negative:
+                            self._pending.clear()
+                            self._terminal = True
+                return _value
+
+            def settled_failure(failure: Any) -> Any:
+                with self._lock:
+                    if self._settlement_operation is operation:
+                        self._settlement_operation = None
+                        self._settlement_in_progress = False
+                return failure
+
+            # The adapter may return an already-fired Deferred. No group mutex is
+            # held while registering callbacks that can run synchronously.
+            operation.addCallbacks(settled_success, settled_failure)
+            operation.addErrback(lambda _failure: None)
+            return
+
+        try:
+            settled = (
+                self._scheduler._nack_token(
+                    self._source_token,
+                    log_message="Failed to nack source after errback output failure",
+                )
+                if negative
+                else self._scheduler._ack_token(
+                    self._source_token,
+                    log_message=(
+                        "Failed to ack source message after errback replacements committed"
+                    ),
+                )
+            )
+        except BaseException:
+            with self._lock:
+                self._settlement_in_progress = False
+            raise
+        with self._lock:
+            self._settlement_in_progress = False
+            if settled and not negative:
+                self._pending.clear()
+                self._terminal = True
 
     def new_child(self) -> _DeferredReplacementAckToken | None:
         """Register one replacement unless this group already aborted."""
@@ -637,56 +894,57 @@ class _DeferredReplacementAckGroup:
 
     def seal(self) -> None:
         """Declare output enumeration complete and ack if no child remains."""
+        settle = False
         with self._lock:
             if self._terminal:
                 return
             self._sealed = True
-            if self._pending:
-                return
-            if self._scheduler._ack_token(
-                self._source_token,
-                log_message=(
-                    "Failed to ack source message after errback replacements committed"
-                ),
-            ):
-                self._terminal = True
+            if not self._pending and not self._settlement_in_progress:
+                self._settlement_in_progress = True
+                settle = True
+        if settle:
+            self._settle_source(negative=False)
 
     def accept(self, child_id: int) -> None:
         """Mark one replacement committed and settle a sealed final child."""
+        settle = False
         with self._lock:
             if self._terminal or child_id not in self._pending:
                 return
             if not self._sealed or len(self._pending) > 1:
                 self._pending.remove(child_id)
                 return
-            if self._scheduler._ack_token(
-                self._source_token,
-                log_message=(
-                    "Failed to ack source message after errback replacements committed"
-                ),
-            ):
-                self._pending.remove(child_id)
-                self._terminal = True
+            if not self._settlement_in_progress:
+                self._settlement_in_progress = True
+                settle = True
+        if settle:
+            self._settle_source(negative=False)
 
     def abort(self) -> None:
         """Nack a source whose replacement output failed during enumeration."""
         with self._lock:
             if self._terminal:
                 return
-            self._scheduler._nack_token(
-                self._source_token,
-                log_message="Failed to nack source after errback output failure",
-            )
-            # Even if the broker call failed, visibility timeout/redelivery is the
+            # An ACK/NACK worker already owns the source transition. It cannot be
+            # cancelled safely; do not issue a second broker transition from this
+            # abort path. A late failure leaves the source available for redelivery.
+            if self._settlement_in_progress:
+                self._pending.clear()
+                self._terminal = True
+                return
+            # Even if the broker call fails, visibility timeout/redelivery is the
             # only safe recovery. Never let late child commits turn this into an ack.
             self._pending.clear()
             self._terminal = True
+            self._settlement_in_progress = True
+        self._settle_source(negative=True)
 
 
 class _DeferredReplacementAckToken(_QueueAckToken):
     """One idempotent child completion in a deferred source-ack group."""
 
     __slots__ = ("_child_id", "_group")
+    _reactor_safe_settlement = True
 
     def __init__(self, group: _DeferredReplacementAckGroup, child_id: int) -> None:
         self._group = group
@@ -970,7 +1228,7 @@ class BackendScheduler:
     def __init__(
         self,
         connection_manager: ConnectionManager,
-        queue_key: str = "scheduler-queue",
+        queue_key: str = DEFAULT_QUEUE_KEY_TEMPLATE,
         stats: StatsCollector | None = None,
         dupefilter: Any | None = None,
         queue_strategy: QueueStrategy | None = None,
@@ -984,17 +1242,22 @@ class BackendScheduler:
         queue_snapshot_owner: str | None = None,
         queue_snapshot_max_bytes: int = DEFAULT_SNAPSHOT_MAX_BYTES,
         queue_snapshot_chunk_bytes: int = DEFAULT_SNAPSHOT_CHUNK_BYTES,
+        project_name: str | None = None,
+        allow_cross_spider: bool = False,
         snapshot_connection_manager: ConnectionManager | None = None,
         owns_snapshot_connection_manager: bool = False,
         owns_connection_manager: bool = True,
         connection_manager_lease: ConnectionManagerLease | None = None,
         snapshot_connection_manager_lease: ConnectionManagerLease | None = None,
+        reactor_io_timeout: float = DEFAULT_REACTOR_IO_TIMEOUT_S,
     ) -> None:
         """Initialize the scheduler.
 
         Args:
             connection_manager: Connection manager for backend access.
-            queue_key: Key for the request queue.
+            queue_key: Key/template for the request queue. The default is
+                ``scheduler-queue:{project}:{spider}``; literal legacy/shared keys
+                remain available by explicit configuration.
             stats: Optional stats collector for metrics.
             dupefilter: Optional dupefilter implementing Scrapy's request_seen/log API.
             queue_strategy: Optional queue-semantics strategy threaded into the
@@ -1025,6 +1288,10 @@ class BackendScheduler:
             queue_snapshot_owner: Stable per-worker identity for isolating local
                 strategy snapshots. ``None`` preserves the legacy single-worker
                 key shape.
+            project_name: Optional project identity used by ``{project}`` key
+                templates. Defaults to Scrapy's ``BOT_NAME`` or ``default``.
+            allow_cross_spider: Explicitly disable request-envelope identity
+                fencing for a deliberately shared/legacy queue.
             snapshot_connection_manager: Optional storage-capable manager used
                 exclusively by ``BackendQueue`` snapshot restore/persist. The
                 queue's normal operations continue to use ``connection_manager``.
@@ -1036,10 +1303,15 @@ class BackendScheduler:
                 manager. Defaults to True for standalone schedulers; composite
                 owners can pass False and release their shared acquire after the
                 scheduler has quiesced its queue and signals.
+            reactor_io_timeout: Caller-visible wait budget for Deferred lifecycle,
+                queue-close, and acknowledgement adapters. Synchronous scheduler
+                methods remain synchronous because Scrapy requires their return types.
         """
         self.connection_manager = connection_manager
         self._queue_key_template = queue_key
         self.queue_key = queue_key
+        self._project_name = project_name or DEFAULT_PROJECT_NAME
+        self._allow_cross_spider = allow_cross_spider
         self.stats = stats
         self.dupefilter = dupefilter
         self._owns_dupefilter: bool = dupefilter is not None
@@ -1086,6 +1358,7 @@ class BackendScheduler:
         self._queue_snapshot_owner = queue_snapshot_owner
         self._queue_snapshot_max_bytes = queue_snapshot_max_bytes
         self._queue_snapshot_chunk_bytes = queue_snapshot_chunk_bytes
+        self._reactor_io_timeout = reactor_io_timeout
         self._snapshot_connection_manager = snapshot_connection_manager
         self._owns_snapshot_connection_manager = owns_snapshot_connection_manager
         self._snapshot_connection_manager_lease = snapshot_connection_manager_lease
@@ -1106,8 +1379,24 @@ class BackendScheduler:
         # through construction.
         self._lifecycle_lock = threading.RLock()
         self._lifecycle_state = _LIFECYCLE_NEW
+        # Opening has its own authoritative worker. A public timeout only ends
+        # the bounded view; close must still fence that worker before teardown.
+        self._opening_operation: Deferred[Any] | None = None
+        self._opening_settled = True
+        self._opening_failure: Any | None = None
+        self._open_close_requested = False
         self._close_attempt_owner: _SchedulerAttemptToken | None = None
         self._close_attempt_thread_id: int | None = None
+        # The worker/lifecycle Deferred remains authoritative after the bounded
+        # close view times out. Composite owners use it to avoid releasing shared
+        # resources while the scheduler is still finishing teardown.
+        self._close_completion_deferred: Deferred[Any] | None = None
+        self._close_retain_authoritative_failure = False
+        # Replacement source settlements retain their authoritative worker
+        # Deferred until the broker call completes. Close waits on this generation's
+        # set before releasing the queue manager.
+        self._settlement_lock = threading.Lock()
+        self._pending_settlements: set[Deferred[Any]] = set()
 
     @classmethod
     def from_settings(
@@ -1115,6 +1404,16 @@ class BackendScheduler:
         settings: Settings,
         *,
         spider_name: str | None = None,
+        project_name: str | None = None,
+        queue_key: str | None = None,
+        connection_manager: ConnectionManager | None = None,
+        backend_type_override: str | None = None,
+        owns_connection_manager: bool | None = None,
+        stats: StatsCollector | None = None,
+        dupefilter: Any | None = None,
+        snapshot_connection_manager: ConnectionManager | None = None,
+        snapshot_connection_manager_lease: ConnectionManagerLease | None = None,
+        owns_snapshot_connection_manager: bool | None = None,
     ) -> BackendScheduler:
         """Create scheduler from Scrapy settings.
 
@@ -1165,9 +1464,35 @@ class BackendScheduler:
             required_capabilities={"queue"},
             component_name="queue",
         )
+        if connection_manager is not None and not (
+            settings.get("SCRAPY_QUEUE_BACKEND_TYPE")
+            or settings.get("SCRAPY_BACKEND_TYPE")
+            or os.environ.get("SCRAPY_QUEUE_BACKEND_TYPE")
+            or os.environ.get("SCRAPY_BACKEND_TYPE")
+        ):
+            # A mixin's manager is configured by its class attributes rather than
+            # Scrapy's global component settings.  Use its actual descriptor for
+            # capability, ACK, and snapshot decisions when no component override
+            # is present; otherwise the standard settings resolver remains the
+            # source of truth.
+            candidate: Any = backend_type_override
+            if candidate is None:
+                candidate = getattr(
+                    connection_manager, "_backend_type_for_operations", None
+                )
+                if callable(candidate):
+                    candidate = candidate()
+            if candidate is None:
+                candidate = getattr(connection_manager, "backend_type", None)
+            candidate = getattr(candidate, "value", candidate)
+            if isinstance(candidate, str) and has_capability(candidate, "queue"):
+                backend_type = candidate
+                backend_settings = {}
         queue_config = queue_config.with_queue_key(
             settings,
             spider_name=spider_name,
+            project_name=project_name,
+            queue_key_override=queue_key,
         )
         assert queue_config.queue_key is not None
         assert queue_config.queue_key_template is not None
@@ -1188,13 +1513,30 @@ class BackendScheduler:
                 **backend_settings,
                 _CONNECTION_MANAGER_SCOPE_KEY: scope,
             }
-        manager_lease = ConnectionManager.acquire_lease(
-            backend_type=backend_type,
-            settings=backend_settings,
+        manager_lease: ConnectionManagerLease | None = None
+        if connection_manager is None:
+            manager_lease = ConnectionManager.acquire_lease(
+                backend_type=backend_type,
+                settings=backend_settings,
+            )
+            manager = manager_lease.manager
+        else:
+            # Composite owners (notably BackendSpiderMixin) already hold the
+            # queue manager's acquire.  Reuse that exact manager instead of
+            # creating a second registry reference; the owner will release it
+            # only after every borrowed component has quiesced.
+            manager = connection_manager
+        if snapshot_connection_manager is not None:
+            snapshot_manager_lease = snapshot_connection_manager_lease
+        else:
+            snapshot_manager_lease = None
+        # An injected snapshot manager/lease is an ownership transfer from a
+        # composite factory.  The normal settings path below fills these values.
+        snapshot_manager_owned = (
+            owns_snapshot_connection_manager
+            if owns_snapshot_connection_manager is not None
+            else snapshot_connection_manager is not None
         )
-        manager = manager_lease.manager
-        snapshot_connection_manager: ConnectionManager | None = None
-        snapshot_manager_lease: ConnectionManagerLease | None = None
         try:
             # Ack-concurrency gate (round-2 C1 fix). Inspect the backend CLASS —
             # no instantiation/connection needed. NOTE (2026-07-10): every bundled
@@ -1202,7 +1544,7 @@ class BackendScheduler:
             # for bundled backends — it remains a defensive backstop for a
             # hypothetical 3rd-party single-slot backend.
             ack_backend = (
-                manager if isinstance(manager, ConnectionManager) else backend_type
+                manager if type(manager) is ConnectionManager else backend_type
             )
             BackendScheduler._enforce_ack_concurrency_gate(settings, ack_backend)
 
@@ -1268,12 +1610,17 @@ class BackendScheduler:
                 queue_strategy,
                 ack_backend,
             )
-            if queue_config.strategy_type in {
-                QueueStrategyType.DELAY,
-                QueueStrategyType.ROUND_ROBIN,
-                QueueStrategyType.TIME_WHEEL,
-                QueueStrategyType.RING_BUFFER,
-            } and not has_capability(backend_type, "storage"):
+            if (
+                snapshot_connection_manager is None
+                and queue_config.strategy_type
+                in {
+                    QueueStrategyType.DELAY,
+                    QueueStrategyType.ROUND_ROBIN,
+                    QueueStrategyType.TIME_WHEEL,
+                    QueueStrategyType.RING_BUFFER,
+                }
+                and not has_capability(backend_type, "storage")
+            ):
                 storage_type_override = settings.get("SCRAPY_STORAGE_BACKEND_TYPE")
                 has_explicit_storage_type = storage_type_override not in (
                     None,
@@ -1301,6 +1648,7 @@ class BackendScheduler:
                         settings=snapshot_backend_settings,
                     )
                     snapshot_connection_manager = snapshot_manager_lease.manager
+                    snapshot_manager_owned = True
             queue_config = queue_config.with_runtime_settings(settings)
             assert queue_config.queue_key is not None
             assert queue_config.queue_depth_sample_every is not None
@@ -1309,6 +1657,7 @@ class BackendScheduler:
             assert queue_config.monitor_pop_rate_window_s is not None
             assert queue_config.queue_snapshot_max_bytes is not None
             assert queue_config.queue_snapshot_chunk_bytes is not None
+            assert queue_config.reactor_io_timeout is not None
             return cls(
                 connection_manager=manager,
                 queue_key=queue_config.queue_key,
@@ -1324,9 +1673,17 @@ class BackendScheduler:
                 queue_snapshot_owner=queue_config.queue_snapshot_owner,
                 queue_snapshot_max_bytes=queue_config.queue_snapshot_max_bytes,
                 queue_snapshot_chunk_bytes=queue_config.queue_snapshot_chunk_bytes,
+                reactor_io_timeout=queue_config.reactor_io_timeout,
+                project_name=queue_config.project_name,
+                allow_cross_spider=queue_config.allow_cross_spider,
+                stats=stats,
+                dupefilter=dupefilter,
                 snapshot_connection_manager=snapshot_connection_manager,
-                owns_snapshot_connection_manager=(
-                    snapshot_connection_manager is not None
+                owns_snapshot_connection_manager=snapshot_manager_owned,
+                owns_connection_manager=(
+                    owns_connection_manager
+                    if owns_connection_manager is not None
+                    else True
                 ),
                 connection_manager_lease=manager_lease,
                 snapshot_connection_manager_lease=snapshot_manager_lease,
@@ -1334,7 +1691,7 @@ class BackendScheduler:
         except BaseException:
             if snapshot_manager_lease is not None:
                 try:
-                    snapshot_manager_lease.release()
+                    release_manager_acquire(snapshot_manager_lease, exact=True)
                 except BaseException:
                     try:
                         logger.exception(
@@ -1343,8 +1700,10 @@ class BackendScheduler:
                         )
                     except BaseException:
                         pass
+            if manager_lease is None:
+                raise
             try:
-                manager_lease.release()
+                release_manager_acquire(manager_lease, exact=True)
             except BaseException:
                 try:
                     logger.exception(
@@ -1536,6 +1895,7 @@ class BackendScheduler:
             crawler.settings,
             spider_name=cls._crawler_spider_name(crawler),
         )
+        factory_failure: BaseException | None = None
         try:
             scheduler.stats = crawler.stats
             dupefilter_path = crawler.settings.get("DUPEFILTER_CLASS")
@@ -1544,17 +1904,133 @@ class BackendScheduler:
                 scheduler.dupefilter = dupefilter_cls.from_crawler(crawler)
                 scheduler._owns_dupefilter = True
             return scheduler
+        except BaseException as exc:
+            factory_failure = exc
+        # No scheduler is returned on this path. Use a normal close first so any
+        # authoritative checkpoint is preserved; a failed checkpoint/close then
+        # transitions to the explicit lossy abort, which skips replacing the last
+        # valid checkpoint and still releases both exact managers.
+        try:
+            scheduler._rollback_factory_failure()
         except BaseException:
             try:
-                scheduler.close("crawler-factory-failed")
+                logger.error("Failed to schedule scheduler factory rollback")
             except BaseException:
+                pass
+        assert factory_failure is not None
+        raise factory_failure
+
+    def _force_factory_manager_release(self) -> None:
+        """Release both factory-owned managers after a lossy abort attempt."""
+        primary_error: BaseException | None = None
+        managers = (
+            (
+                "snapshot",
+                self._snapshot_connection_manager,
+                self._snapshot_connection_manager_lease,
+                self._snapshot_manager_released,
+                self._owns_snapshot_connection_manager,
+            ),
+            (
+                "queue",
+                self.connection_manager,
+                self._connection_manager_lease,
+                self._manager_released,
+                self._owns_connection_manager,
+            ),
+        )
+        for name, manager, lease, released, owns in managers:
+            if not owns or manager is None or released:
+                continue
+            try:
+                if lease is not None:
+                    release_manager_acquire(lease, exact=True)
+                else:
+                    release_manager_acquire(manager)
+            except BaseException as exc:
+                if primary_error is None:
+                    primary_error = exc
                 try:
-                    logger.exception(
-                        "Failed to close scheduler after crawler factory failure"
+                    logger.error(
+                        "Failed to release %s ConnectionManager after scheduler "
+                        "factory abort",
+                        name,
                     )
                 except BaseException:
                     pass
-            raise
+            else:
+                if name == "snapshot":
+                    self._snapshot_manager_released = True
+                else:
+                    self._manager_released = True
+        if primary_error is not None:
+            raise primary_error
+
+    def _observe_factory_cleanup(
+        self,
+        result: Deferred[Any] | None,
+        *,
+        on_failure: Callable[[Any], None],
+    ) -> None:
+        """Observe a factory cleanup Deferred without creating an unhandled branch."""
+        if not isinstance(result, Deferred):
+            return
+
+        def consume_failure(failure: Any) -> None:
+            try:
+                on_failure(failure)
+            except BaseException:
+                try:
+                    self._force_factory_manager_release()
+                except BaseException:
+                    pass
+            return None
+
+        observed = result.addErrback(consume_failure)
+        observed.addErrback(lambda _failure: None)
+
+    def _rollback_factory_failure(self) -> None:
+        """Retryably unwind an unpublished scheduler after crawler wiring fails."""
+        abort_started = False
+
+        def lossy_abort(_failure: Any = None) -> None:
+            nonlocal abort_started
+            if abort_started:
+                return
+            abort_started = True
+            try:
+                result = self.abort("crawler-factory-failed")
+            except BaseException:
+                try:
+                    self._force_factory_manager_release()
+                except BaseException:
+                    pass
+                return
+            authority = getattr(self, "_close_completion_deferred", None)
+            if not isinstance(authority, Deferred):
+                authority = result
+            public = result if isinstance(result, Deferred) else None
+            if public is not None and public is not authority:
+                # A timeout view has no owner once the factory returns. Its
+                # failure is advisory; the authoritative abort below owns retry.
+                public.addErrback(lambda _failure: None)
+            self._observe_factory_cleanup(
+                authority,
+                on_failure=lambda _abort_failure: self._force_factory_manager_release(),
+            )
+
+        try:
+            result = self.close("crawler-factory-failed")
+        except BaseException:
+            lossy_abort()
+            return
+        authority = getattr(self, "_close_completion_deferred", None)
+        if not isinstance(authority, Deferred):
+            authority = result
+        public = result if isinstance(result, Deferred) else None
+        if public is not None and public is not authority:
+            public.addErrback(lambda _failure: None)
+        self._observe_factory_cleanup(authority, on_failure=lossy_abort)
 
     @staticmethod
     def _crawler_spider_name(crawler: Crawler) -> str | None:
@@ -1568,8 +2044,21 @@ class BackendScheduler:
                 return name
         return None
 
+    def _warm_connections(self) -> None:
+        """Warm queue and snapshot managers outside the reactor thread."""
+        self.connection_manager.get_queue_backend()
+        if self._snapshot_connection_manager is not None:
+            self._snapshot_connection_manager.get_storage_backend()
+
     def open(self, spider: Spider) -> Deferred[None] | None:
-        """Open one scheduler lifecycle without running callbacks under its lock."""
+        """Open the scheduler and await asynchronous lifecycle hooks.
+
+        Scrapy 2.17 awaits a Deferred returned by a scheduler lifecycle method.
+        Do not publish an open scheduler, or construct its queue, until a generic
+        dupefilter's ``open()`` Deferred has succeeded.  The bundled
+        ``BackendDupeFilter`` remains spider-aware through the compatibility
+        helper above.
+        """
         with self._lifecycle_lock:
             if self._lifecycle_state == _LIFECYCLE_CLOSED:
                 raise RuntimeError("Scheduler is closed and cannot be reopened")
@@ -1583,94 +2072,357 @@ class BackendScheduler:
                 raise RuntimeError("Scheduler is already open for a different spider")
             self._lifecycle_state = _LIFECYCLE_OPENING
             self._spider = spider
+            self._opening_settled = False
+            self._opening_failure = None
+            self._open_close_requested = False
 
-        open_failure: BaseException | None = None
+        open_result: Any = None
+        open_error: BaseException | None = None
         try:
-            _validate_key_name(spider.name, field_name="spider.name")
-            queue_key = self._queue_key_template.replace("{spider}", spider.name)
             if (
                 self._owns_dupefilter
                 and self.dupefilter is not None
                 and not self._dupefilter_open
                 and not self._dupefilter_released
             ):
-                self.dupefilter.open(spider)
+                open_result = _call_dupefilter_open(self.dupefilter, spider)
+        except BaseException as exc:
+            open_error = exc
+        if open_error is not None:
+            return self._finish_open_failure(open_error)
+
+        opening_authority: Deferred[Any] | None = None
+        generic_public_signal: Deferred[Any] | None = None
+        generic_public_view: Deferred[Any] | None = None
+        warmup_public_view: Deferred[Any] | None = None
+        public_open_result: Deferred[Any] | None = None
+
+        def bridge_open_authority(result: Any) -> Any:
+            """Publish the full opening result for a later close request."""
+            if opening_authority is not None and not opening_authority.called:
+                if isinstance(result, TwistedFailure):
+                    opening_authority.errback(result)
+                else:
+                    opening_authority.callback(result)
+            return result
+
+        def finish_after_dupefilter(_ignored: Any = None) -> Any:
+            """Run warm-up and return its authoritative operation, not its view."""
+            nonlocal warmup_public_view
+            if not reactor_is_running():
                 with self._lifecycle_lock:
-                    self._dupefilter_open = True
-            monitor = BackendScheduler._resolve_monitor_for_spider(
-                spider,
-                backpressure_threshold=self._monitor_backpressure_threshold,
-                pop_rate_window_s=self._monitor_pop_rate_window_s,
-            )
-            self.connection_manager.set_monitor(monitor)
-            if self._snapshot_connection_manager is not None:
-                self._snapshot_connection_manager.set_monitor(monitor)
-            queue = BackendQueue(
-                connection_manager=self.connection_manager,
-                queue_name=queue_key,
-                spider=spider,
-                queue_strategy=self._queue_strategy,
-                max_item_bytes=self._queue_max_item_bytes,
-                monitor=monitor,
-                depth_sample_every=self._queue_depth_sample_every,
-                pop_rate_window_s=self._monitor_pop_rate_window_s,
-                snapshot_owner=self._queue_snapshot_owner,
-                snapshot_connection_manager=self._snapshot_connection_manager,
-                snapshot_max_bytes=self._queue_snapshot_max_bytes,
-                snapshot_chunk_bytes=self._queue_snapshot_chunk_bytes,
-            )
-            with self._lifecycle_lock:
-                self.queue_key = queue_key
-                self._queue = queue
-            self._connect_ack_signals(spider)
-        except BaseException as exc:
-            open_failure = exc
-
-        if open_failure is not None:
-            cleanup_failed = False
-            try:
-                self._close_attempt("open-failed", allow_opening=True)
-            except BaseException:
-                cleanup_failed = True
-            if cleanup_failed:
+                    close_requested = self._open_close_requested
+                if close_requested:
+                    with self._lifecycle_lock:
+                        self._opening_settled = True
+                    return None
                 try:
-                    logger.error("Failed to clean up scheduler after open failure")
-                except BaseException:
-                    pass
-            raise open_failure
+                    self._finish_open(spider)
+                except BaseException as exc:
+                    open_failure = exc
+                    with self._lifecycle_lock:
+                        self._opening_settled = True
+                        self._opening_failure = TwistedFailure(  # type: ignore[no-untyped-call]
+                            open_failure
+                        )
+                    if opening_authority is None:
+                        # The synchronous non-generic path lets the outer open()
+                        # boundary perform exactly one rollback attempt.
+                        raise open_failure
+                    cleanup = self._cleanup_after_open_failure("open-failed")
+                    if isinstance(cleanup, Deferred):
+                        return cleanup.addBoth(lambda _ignored: fail(open_failure))
+                    raise open_failure
+                with self._lifecycle_lock:
+                    self._opening_settled = True
+                if (
+                    not reactor_is_running()
+                    and public_open_result is not None
+                    and not public_open_result.called
+                ):
+                    public_open_result.callback(None)
+                return None
 
-        publication_failure: BaseException | None = None
-        try:
+            # Keep the backend warm-up in the thread pool. The returned operation
+            # remains authoritative after the caller-facing timeout, so a timed
+            # out thread cannot publish OPEN or race close/manager release.
+            operation = deferToThread(self._warm_connections)
             with self._lifecycle_lock:
-                # OPEN is the first success publication. If a later package-state
-                # assignment is interrupted, the recovery path below can close an
-                # ordinary OPEN scheduler instead of stranding OPENING ownership.
-                self._lifecycle_state = _LIFECYCLE_OPEN
-                self._backpressure_paused = False
-                self._backpressure_probe_due = False
-        except BaseException as exc:
-            publication_failure = exc
+                if opening_authority is None:
+                    self._opening_operation = operation
 
-        if publication_failure is not None:
-            cleanup_failed = False
-            try:
-                self._close_attempt("open-publication-failed", allow_opening=True)
-            except BaseException:
-                cleanup_failed = True
-            if cleanup_failed:
+            def finish_success(value: Any) -> Any:
+                with self._lifecycle_lock:
+                    self._opening_settled = True
+                    close_requested = self._open_close_requested
+                if close_requested:
+                    return fail(RuntimeError("Scheduler open cancelled by close"))
                 try:
-                    logger.error(
-                        "Failed to clean up scheduler after open publication failure"
+                    self._finish_open(spider)
+                except BaseException as exc:
+                    self._opening_failure = TwistedFailure(  # type: ignore[no-untyped-call]
+                        exc
                     )
-                except BaseException:
-                    pass
-            raise publication_failure
+                    cleanup = self._cleanup_after_open_failure("open-failed")
+                    if isinstance(cleanup, Deferred):
 
+                        def restore_open_failure(
+                            _ignored: Any, failure: BaseException
+                        ) -> Deferred[None]:
+                            return fail(failure)
+
+                        return cleanup.addBoth(restore_open_failure, exc)
+                    return fail(exc)
+                with self._lifecycle_lock:
+                    if self._open_close_requested:
+                        return fail(RuntimeError("Scheduler open cancelled by close"))
+                return value
+
+            def finish_failure(failure: Any) -> Any:
+                with self._lifecycle_lock:
+                    self._opening_settled = True
+                    self._opening_failure = failure
+                    close_requested = self._open_close_requested
+                if close_requested:
+                    return failure
+                cleanup = self._cleanup_after_open_failure("open-failed")
+                if isinstance(cleanup, Deferred):
+                    return cleanup.addBoth(lambda _ignored: failure)
+                return failure
+
+            operation.addCallbacks(finish_success, finish_failure)
+            if opening_authority is not None:
+                # The generic-open public stage transitions to this bounded warm-up
+                # view only after the authoritative callback has started it and the
+                # ownership/publication callbacks above have been attached.
+                warmup_public_view = bounded_deferred(
+                    operation,
+                    timeout=self._reactor_io_timeout,
+                    operation="scheduler connection warm-up",
+                )
+                if (
+                    generic_public_signal is not None
+                    and not generic_public_signal.called
+                ):
+                    generic_public_signal.callback(None)
+                operation.addErrback(lambda _failure: None)
+            return operation
+
+        if isinstance(open_result, Deferred):
+            # A generic dupefilter has two views: this private authority drives
+            # warm-up/publication and close, while the public stages bound the
+            # generic open and the later warm-up independently.
+            opening_authority = Deferred()
+            generic_public_signal = Deferred()
+            public_open_result = Deferred()
+            with self._lifecycle_lock:
+                self._opening_operation = opening_authority
+
+            def handle_dupefilter_failure(failure: Any) -> Any:
+                result = self._handle_open_failure(failure, "open-failed")
+
+                def publish_failure(_ignored: Any) -> Any:
+                    if reactor_is_running() and not generic_public_signal.called:
+                        generic_public_signal.errback(failure)
+                    return failure
+
+                if isinstance(result, Deferred):
+                    return result.addBoth(publish_failure)
+                publish_failure(None)
+                return result
+
+            authoritative = open_result.addCallbacks(
+                finish_after_dupefilter,
+                handle_dupefilter_failure,
+            )
+            authoritative.addBoth(bridge_open_authority)
+            # In synchronous/non-reactor use the source Deferred is the public
+            # scheduler.open result for Scrapy compatibility. Leave its terminal
+            # Failure untouched so the caller observes it; the separate authority
+            # bridge is consumed only for close bookkeeping.
+            if not reactor_is_running():
+                DeferredList(
+                    [opening_authority],
+                    fireOnOneErrback=False,
+                    consumeErrors=True,
+                )
+                return open_result
+
+            # The public generic/warm-up views are separate Deferreds. Consume
+            # this private chain's terminal Failure after it has bridged both
+            # close authority and the caller-facing signal.
+            authoritative.addErrback(lambda _failure: None)
+            # If no close owner exists, DeferredList consumes only the gate's late
+            # Failure. A close attached before settlement remains authoritative and
+            # uses _opening_failure to preserve the original open error.
+            DeferredList(
+                [opening_authority],
+                fireOnOneErrback=False,
+                consumeErrors=True,
+            )
+
+            def publish_generic_success(_value: Any) -> Any:
+                if public_open_result.called:
+                    return None
+                if warmup_public_view is None:
+                    public_open_result.callback(None)
+                else:
+                    warmup_public_view.addCallbacks(
+                        lambda value: (
+                            public_open_result.callback(value)
+                            if not public_open_result.called
+                            else value
+                        ),
+                        lambda failure: (
+                            public_open_result.errback(failure)
+                            if not public_open_result.called
+                            else None
+                        ),
+                    )
+                return None
+
+            def publish_generic_failure(failure: Any) -> None:
+                if not public_open_result.called:
+                    public_open_result.errback(failure)
+                return None
+
+            generic_public_view = bounded_deferred(
+                generic_public_signal,
+                timeout=self._reactor_io_timeout,
+                operation="scheduler dupefilter open",
+            )
+            generic_public_view.addCallbacks(
+                publish_generic_success,
+                publish_generic_failure,
+            )
+            # ``generic_public_signal`` is an internal bridge.  The bounded view
+            # observes its failure for the caller-facing Deferred, but
+            # ``bounded_deferred`` deliberately preserves source failures for
+            # authoritative owners.  This bridge has no later owner, so consume it
+            # only after the cleanup chain has published the public result.  Without
+            # this observer a generic dupefilter failure is reported again as an
+            # unhandled Deferred during GC.
+            generic_public_signal.addErrback(lambda _failure: None)
+            return public_open_result
+
+        open_error = None
+        open_deferred: Deferred[None] | None = None
+        try:
+            result = finish_after_dupefilter()
+            if isinstance(result, Deferred):
+                open_deferred = bounded_deferred(
+                    result,
+                    timeout=self._reactor_io_timeout,
+                    operation="scheduler connection warm-up",
+                )
+                result.addErrback(lambda _failure: None)
+        except BaseException as exc:
+            open_error = exc
+        if open_error is not None:
+            return self._finish_open_failure(open_error)
+        return open_deferred
+
+    def _finish_open_failure(self, error: BaseException) -> Deferred[None] | None:
+        """Clean up outside the original exception handler and preserve its error."""
+        cleanup = self._cleanup_after_open_failure("open-failed")
+        if isinstance(cleanup, Deferred):
+
+            def fail_open(_ignored: Any, original: BaseException) -> Deferred[None]:
+                return fail(original)
+
+            return cleanup.addBoth(fail_open, error)
+        raise error
+
+    def _finish_open(self, spider: Spider) -> None:
+        """Construct and publish the scheduler after dupefilter open succeeds."""
+        with self._lifecycle_lock:
+            if (
+                self._open_close_requested
+                or self._lifecycle_state != _LIFECYCLE_OPENING
+            ):
+                return
+        _validate_key_name(spider.name, field_name="spider.name")
+        if self._project_name == DEFAULT_PROJECT_NAME:
+            self._project_name = project_name_from_spider(spider)
+        _validate_key_name(self._project_name, field_name="project_name")
+        queue_key = resolve_identity_template(
+            self._queue_key_template,
+            spider_name=spider.name,
+            project_name=self._project_name,
+        )
+        _validate_key_name(queue_key, field_name="queue_key")
+        if (
+            self._owns_dupefilter
+            and self.dupefilter is not None
+            and not self._dupefilter_open
+            and not self._dupefilter_released
+        ):
+            with self._lifecycle_lock:
+                self._dupefilter_open = True
+        monitor = BackendScheduler._resolve_monitor_for_spider(
+            spider,
+            backpressure_threshold=self._monitor_backpressure_threshold,
+            pop_rate_window_s=self._monitor_pop_rate_window_s,
+        )
+        self.connection_manager.set_monitor(monitor)
+        if self._snapshot_connection_manager is not None:
+            self._snapshot_connection_manager.set_monitor(monitor)
+        queue = BackendQueue(
+            connection_manager=self.connection_manager,
+            queue_name=queue_key,
+            spider=spider,
+            project_name=self._project_name,
+            allow_cross_spider=self._allow_cross_spider,
+            queue_strategy=self._queue_strategy,
+            max_item_bytes=self._queue_max_item_bytes,
+            monitor=monitor,
+            depth_sample_every=self._queue_depth_sample_every,
+            pop_rate_window_s=self._monitor_pop_rate_window_s,
+            snapshot_owner=self._queue_snapshot_owner,
+            snapshot_connection_manager=self._snapshot_connection_manager,
+            snapshot_max_bytes=self._queue_snapshot_max_bytes,
+            snapshot_chunk_bytes=self._queue_snapshot_chunk_bytes,
+            reactor_io_timeout=self._reactor_io_timeout,
+        )
+        with self._lifecycle_lock:
+            self.queue_key = queue_key
+            self._queue = queue
+        self._connect_ack_signals(spider)
+        with self._lifecycle_lock:
+            if (
+                self._open_close_requested
+                or self._lifecycle_state != _LIFECYCLE_OPENING
+            ):
+                return
+            # OPEN is the first success publication.
+            self._lifecycle_state = _LIFECYCLE_OPEN
+            self._backpressure_paused = False
+            self._backpressure_probe_due = False
         try:
             logger.info("Scheduler opened for spider %s", spider.name)
         except BaseException:
             pass
-        return None
+
+    def _cleanup_after_open_failure(self, reason: str) -> Deferred[None] | None:
+        """Close partially opened resources without hiding the primary failure."""
+        try:
+            return self._close_attempt(reason, allow_opening=True)
+        except BaseException:
+            try:
+                logger.error("Failed to clean up scheduler after open failure")
+            except BaseException:
+                pass
+            return None
+
+    def _handle_open_failure(self, failure: Any, reason: str) -> Any:
+        """Wait for cleanup, then preserve the original Deferred failure."""
+        with self._lifecycle_lock:
+            self._opening_settled = True
+            self._opening_failure = failure
+        cleanup = self._cleanup_after_open_failure(reason)
+        if isinstance(cleanup, Deferred):
+            return cleanup.addBoth(lambda _ignored: failure)
+        return failure
 
     def _connect_ack_signals(self, spider: Spider) -> None:
         """Wire response_received → ack, spider_error → nack.
@@ -1749,7 +2501,7 @@ class BackendScheduler:
         response: Response,
         request: Request,
         spider: Spider,
-    ) -> None:
+    ) -> Any:
         """Ack the specific popped message after the download succeeded.
 
         Reads the ack token the pop path injected into
@@ -1759,7 +2511,7 @@ class BackendScheduler:
         correct under ``CONCURRENT_REQUESTS > 1``.
         """
         del response, spider
-        self._ack_request_token(
+        return self._ack_request_token(
             request,
             log_message="Failed to ack message after response_received",
         )
@@ -1769,7 +2521,7 @@ class BackendScheduler:
         failure: Failure,
         response: Response,
         spider: Spider,
-    ) -> None:
+    ) -> Any:
         """Nack the specific popped message so it re-delivers for retry.
 
         Reads the ack token from ``response.request.meta`` (the request that
@@ -1778,14 +2530,14 @@ class BackendScheduler:
         del failure, spider
         failed_request = getattr(response, "request", None)
         if failed_request is None:
-            return
-        self._nack_request_token(
+            return None
+        return self._nack_request_token(
             failed_request,
             log_message="Failed to nack message after spider_error",
         )
 
     def _ack_token(self, token: Any, *, log_message: str) -> bool:
-        """Best-effort ack of one explicit token, returning settlement success."""
+        """Best-effort synchronous ack of one explicit token."""
         queue = self._queue
         if queue is None:
             return False
@@ -1806,15 +2558,141 @@ class BackendScheduler:
             return False
         return True
 
-    def _ack_request_token(self, request: Request, *, log_message: str) -> None:
+    def _track_authoritative_settlement(self, operation: Deferred[Any]) -> None:
+        """Retain one worker operation until its backend call really completes."""
+        with self._settlement_lock:
+            self._pending_settlements.add(operation)
+
+        def complete(result: Any) -> Any:
+            with self._settlement_lock:
+                self._pending_settlements.discard(operation)
+            return result
+
+        # The adapter may return an already-fired Deferred. Attach outside the
+        # registry lock so synchronous callback execution cannot re-enter it.
+        operation.addBoth(complete)
+
+    def _settle_token_async_ordered(
+        self,
+        token: Any,
+        *,
+        negative: bool,
+        log_message: str,
+    ) -> tuple[Deferred[Any], Deferred[bool]] | None:
+        """Return authoritative and bounded views of one reactor settlement."""
+        queue = self._queue
+        if queue is None:
+            return None
+        operation, bounded = defer_to_thread_ordered(
+            queue.nack if negative else queue.ack,
+            token=token,
+            timeout=self._reactor_io_timeout,
+            operation="scheduler nack" if negative else "scheduler ack",
+        )
+        self._track_authoritative_settlement(operation)
+
+        def success(_value: Any) -> bool:
+            return True
+
+        bounded._scheduler_public_failed = False  # type: ignore[attr-defined]
+        bounded._scheduler_timed_out = False  # type: ignore[attr-defined]
+
+        def failure(failure_value: Any) -> bool:
+            bounded._scheduler_public_failed = True  # type: ignore[attr-defined]
+            if isinstance(failure_value, TwistedFailure) and failure_value.check(  # type: ignore[no-untyped-call]
+                BackendOperationTimeout
+            ):
+                bounded._scheduler_timed_out = True  # type: ignore[attr-defined]
+            self._record_stat(
+                "scheduler/nack_error" if negative else "scheduler/ack_error"
+            )
+            try:
+                logger.error(log_message)
+            except BaseException:
+                pass
+            return False
+
+        # ``bounded`` is only the caller-facing diagnostic view. Group state is
+        # finalized from ``operation`` so a timeout cannot permit a late duplicate.
+        return operation, bounded.addCallbacks(success, failure)
+
+    @staticmethod
+    def _remove_request_token_if_same(request: Any, token: Any) -> None:
+        """Remove only the delivery token that this settlement actually owned."""
+        meta = getattr(request, "meta", None)
+        if (
+            isinstance(meta, MutableMapping)
+            and meta.get(BACKEND_ACK_TOKEN_META_KEY) is token
+        ):
+            meta.pop(BACKEND_ACK_TOKEN_META_KEY, None)
+
+    def _settle_token_async(
+        self,
+        token: Any,
+        *,
+        negative: bool,
+        log_message: str,
+        on_authoritative_success: Callable[[], None] | None = None,
+    ) -> Deferred[bool] | None:
+        """Settle one broker token off-reactor while retaining best-effort policy."""
+        ordered = self._settle_token_async_ordered(
+            token,
+            negative=negative,
+            log_message=log_message,
+        )
+        if ordered is None:
+            return None
+        operation, bounded = ordered
+        if on_authoritative_success is not None:
+
+            def authoritative_success(value: Any) -> Any:
+                if not getattr(bounded, "_scheduler_public_failed", False) or getattr(
+                    bounded, "_scheduler_timed_out", False
+                ):
+                    on_authoritative_success()
+                return value
+
+            operation.addCallback(authoritative_success)
+        # The authoritative failure is already represented by the bounded view's
+        # one diagnostic callback. Consume only this worker chain's late failure;
+        # callers still receive the public timeout/failure Deferred.
+        operation.addErrback(lambda _failure: None)
+        return bounded
+
+    def _ack_request_token(self, request: Request, *, log_message: str) -> Any:
         """Best-effort ack of the token carried by ``request``."""
         if getattr(request, "meta", None) is None:
-            return
+            return None
         token = request.meta.get(BACKEND_ACK_TOKEN_META_KEY)
         if token is None:
-            return
+            return None
+        if reactor_is_running():
+            result = self._settle_token_async(
+                token,
+                negative=False,
+                log_message=log_message,
+                on_authoritative_success=lambda: self._remove_request_token_if_same(
+                    request, token
+                ),
+            )
+            if result is None:
+                return None
+            return result
         if self._ack_token(token, log_message=log_message):
-            request.meta.pop(BACKEND_ACK_TOKEN_META_KEY, None)
+            self._remove_request_token_if_same(request, token)
+        return None
+
+    def _pending_settlement_barrier(self) -> Deferred[Any] | None:
+        """Wait for all authoritative source settlements before queue teardown."""
+        with self._settlement_lock:
+            pending = tuple(self._pending_settlements)
+        if not pending:
+            return None
+        return DeferredList(
+            pending,
+            fireOnOneErrback=False,
+            consumeErrors=True,
+        ).addCallback(lambda _results: None)
 
     def _nack_token(self, token: Any, *, log_message: str) -> bool:
         """Best-effort nack of one explicit token, returning settlement success."""
@@ -1838,15 +2716,28 @@ class BackendScheduler:
             return False
         return True
 
-    def _nack_request_token(self, request: Request, *, log_message: str) -> None:
+    def _nack_request_token(self, request: Request, *, log_message: str) -> Any:
         """Best-effort nack of the token carried by ``request``."""
         if getattr(request, "meta", None) is None:
-            return
+            return None
         token = request.meta.get(BACKEND_ACK_TOKEN_META_KEY)
         if token is None:
-            return
+            return None
+        if reactor_is_running():
+            result = self._settle_token_async(
+                token,
+                negative=True,
+                log_message=log_message,
+                on_authoritative_success=lambda: self._remove_request_token_if_same(
+                    request, token
+                ),
+            )
+            if result is None:
+                return None
+            return result
         if self._nack_token(token, log_message=log_message):
-            request.meta.pop(BACKEND_ACK_TOKEN_META_KEY, None)
+            self._remove_request_token_if_same(request, token)
+        return None
 
     def _restore_original_errback(self, request: Request) -> None:
         """Remove this scheduler's transient failure wrapper before enqueue."""
@@ -1863,13 +2754,12 @@ class BackendScheduler:
         request.errback = _BackendDownloadFailureErrback(self, request.errback)
 
     def close(self, reason: str) -> Deferred[None] | None:
-        """Close the scheduler, surfacing a retryable checkpoint failure."""
-        self._close_attempt(reason)
-        return None
+        """Close the scheduler, propagating asynchronous dupefilter teardown."""
+        return self._close_attempt(reason)
 
-    def abort(self, reason: str) -> None:
+    def abort(self, reason: str) -> Deferred[None] | None:
         """Explicitly discard uncheckpointed queue state and finish teardown."""
-        self._close_attempt(reason, lossy=True)
+        return self._close_attempt(reason, lossy=True)
 
     def _close_attempt(
         self,
@@ -1877,21 +2767,27 @@ class BackendScheduler:
         *,
         lossy: bool = False,
         allow_opening: bool = False,
-    ) -> None:
-        """Reserve one bounded close pass, run callbacks unlocked, then publish."""
+    ) -> Deferred[None] | None:
+        """Reserve one close pass and retain ownership until Deferred hooks settle."""
         owner_token = _SchedulerAttemptToken()
         with self._lifecycle_lock:
             if self._lifecycle_state == _LIFECYCLE_CLOSED:
-                return
+                return None
             if self._lifecycle_state == _LIFECYCLE_OPENING and not allow_opening:
-                raise RuntimeError("Scheduler open is already in progress")
+                if not self._opening_settled and self._opening_operation is not None:
+                    # A caller-facing open timeout does not cancel the worker. Close
+                    # becomes the cancellation/teardown request and remains fenced
+                    # by that worker's authoritative completion.
+                    self._open_close_requested = True
+                else:
+                    raise RuntimeError("Scheduler open is already in progress")
             if self._lifecycle_state == _LIFECYCLE_CLOSING:
                 current_owner = self._close_attempt_owner
                 if current_owner is not None and current_owner.active:
                     if current_owner.thread_id == owner_token.thread_id:
                         # Re-entrant close from an untrusted callback is bounded and
                         # leaves the outer attempt authoritative.
-                        return
+                        return None
                     raise RuntimeError("Scheduler close is already in progress")
                 # The prior attempt unwound before it could clear package ownership.
                 # Reclaim the stale token; provider handles remain authoritative and
@@ -1899,45 +2795,232 @@ class BackendScheduler:
             self._lifecycle_state = _LIFECYCLE_CLOSING
             self._close_attempt_owner = owner_token
             self._close_attempt_thread_id = owner_token.thread_id
+
         try:
-            self._close_locked(reason, lossy=lossy)
-        finally:
+            result = self._close_locked(reason, lossy=lossy)
+        except BaseException:
             with self._lifecycle_lock:
                 if self._close_attempt_owner is owner_token:
                     self._close_attempt_owner = None
                     self._close_attempt_thread_id = None
+                self._close_retain_authoritative_failure = False
+            raise
+        public_result: Deferred[Any] | None = None
+        authoritative_result: Deferred[Any] | None = None
+        if isinstance(result, _DeferredLifecycleResult):
+            authoritative_result = result.operation
+            public_result = result.bounded
+        elif isinstance(result, Deferred):
+            authoritative_result = result
+            public_result = result
 
-    def _close_locked(self, reason: str, *, lossy: bool = False) -> None:
+        if authoritative_result is not None:
+            owner_token.pending = True
+            self._close_completion_deferred = authoritative_result
+            retain_authoritative_failure = self._close_retain_authoritative_failure
+
+            def finish(value: Any) -> Any:
+                owner_token.pending = False
+                with self._lifecycle_lock:
+                    if self._close_attempt_owner is owner_token:
+                        self._close_attempt_owner = None
+                        self._close_attempt_thread_id = None
+                    if self._close_completion_deferred is authoritative_result:
+                        self._close_completion_deferred = None
+                    self._close_retain_authoritative_failure = False
+                return value
+
+            try:
+                authoritative_result.addBoth(finish)
+                if (
+                    not retain_authoritative_failure
+                    and public_result is authoritative_result
+                    and self._opening_operation is not None
+                    and not self._opening_settled
+                ):
+                    # There is no separate timeout view for an opening-stage close.
+                    # Fork a public result before consuming the authoritative
+                    # failure, so callers still observe it without leaving a late
+                    # worker Failure unhandled.
+                    public_view: Deferred[Any] = Deferred()
+
+                    def publish_success(value: Any) -> Any:
+                        if not public_view.called:
+                            public_view.callback(value)
+                        return value
+
+                    def publish_failure(failure: Any) -> None:
+                        if not public_view.called:
+                            public_view.errback(failure)
+                        return None
+
+                    authoritative_result.addCallbacks(
+                        publish_success,
+                        publish_failure,
+                    )
+                    public_result = public_view
+                elif (
+                    not retain_authoritative_failure
+                    and public_result is not authoritative_result
+                ):
+                    # A distinct bounded public view has its own failure callback.
+                    authoritative_result.addErrback(lambda _failure: None)
+                assert public_result is not None
+                return public_result
+            except BaseException:
+                owner_token.pending = False
+                with self._lifecycle_lock:
+                    if self._close_attempt_owner is owner_token:
+                        self._close_attempt_owner = None
+                        self._close_attempt_thread_id = None
+                    if self._close_completion_deferred is authoritative_result:
+                        self._close_completion_deferred = None
+                    self._close_retain_authoritative_failure = False
+                raise
+        with self._lifecycle_lock:
+            if self._close_attempt_owner is owner_token:
+                self._close_attempt_owner = None
+                self._close_attempt_thread_id = None
+            self._close_retain_authoritative_failure = False
+        return None
+
+    def _bound_close_operation(
+        self,
+        operation: Deferred[Any],
+        *,
+        operation_name: str = "scheduler connection close",
+    ) -> _DeferredLifecycleResult:
+        """Expose a bounded waiter while retaining the real teardown chain."""
+        bounded = (
+            bounded_deferred(
+                operation,
+                timeout=self._reactor_io_timeout,
+                operation=operation_name,
+            )
+            if reactor_is_running()
+            else operation
+        )
+        return _DeferredLifecycleResult(operation, bounded)
+
+    def _handle_queue_close_failure(
+        self,
+        queue: BackendQueue | Any | None,
+        failure: BaseException,
+        *,
+        lossy: bool,
+    ) -> None:
+        """Apply the existing queue retry/terminal policy after a worker call."""
+        if lossy:
+            queue_incomplete = False
+        elif isinstance(queue, BackendQueue):
+            queue_incomplete = not queue._close_complete
+        else:
+            queue_incomplete = isinstance(failure, QueueError)
+        if queue_incomplete:
+            raise failure
+        if not isinstance(failure, Exception):
+            self._terminal_queue_error = failure
+        else:
+            try:
+                logger.error("Failed to close queue strategy during shutdown")
+            except BaseException:
+                pass
+
+    def _close_locked(
+        self, reason: str, *, lossy: bool = False
+    ) -> _DeferredLifecycleResult | Deferred[None] | None:
         """Run one reserved teardown pass; extension callbacks run unlocked."""
         if self._lifecycle_state == _LIFECYCLE_CLOSED:
-            return
+            return None
+
+        if not self._opening_settled:
+            opening = self._opening_operation
+            if opening is not None:
+                continuation = _chain_lifecycle_result(
+                    opening,
+                    lambda _ignored: self._close_locked(reason, lossy=lossy),
+                    preserve_failure=lambda: self._opening_failure,
+                )
+                # The generic-open public view already bounds the caller's wait.
+                # Keep close directly on the authoritative gate so this request
+                # cannot publish before the late open operation has been fenced.
+                return continuation
 
         if not self._queue_terminal:
-            queue_failure: BaseException | None = None
+            pending_settlements = self._pending_settlement_barrier()
+            if pending_settlements is not None:
+                # Do not release the queue generation while a replacement source
+                # settlement is still authoritative. The callback performs no
+                # backend work itself and re-enters this method only after the
+                # worker Deferreds have settled.
+                continuation = _chain_lifecycle_result(
+                    pending_settlements,
+                    lambda _ignored: self._close_locked(reason, lossy=lossy),
+                )
+                return self._bound_close_operation(
+                    continuation,
+                    operation_name="scheduler replacement settlement",
+                )
             queue = self._queue
+            if queue is not None and reactor_is_running():
+                # BackendQueue.close() includes synchronous strategy and storage
+                # calls. Never execute that work on Scrapy's reactor thread.
+                worker = deferToThread(
+                    queue.close,
+                    **({"lossy": True} if lossy else {}),
+                )
+
+                def queue_success(_value: Any) -> Any:
+                    self._queue_terminal = True
+                    return self._close_after_queue(reason, lossy=lossy)
+
+                def queue_failure(failure: Any) -> Any:
+                    error = (
+                        failure.value
+                        if isinstance(failure, TwistedFailure)
+                        else failure
+                    )
+                    self._handle_queue_close_failure(
+                        queue,
+                        cast(BaseException, error),
+                        lossy=lossy,
+                    )
+                    self._queue_terminal = True
+                    return self._close_after_queue(reason, lossy=lossy)
+
+                worker.addCallbacks(queue_success, queue_failure)
+                return self._bound_close_operation(
+                    worker,
+                    operation_name="scheduler queue close",
+                )
+
+            queue_close_error: BaseException | None = None
             if queue is not None:
                 try:
                     queue.close(lossy=True) if lossy else queue.close()
                 except BaseException as exc:
-                    queue_failure = exc
-            if queue_failure is not None:
-                if lossy:
-                    queue_incomplete = False
-                elif isinstance(queue, BackendQueue):
-                    queue_incomplete = not queue._close_complete
-                else:
-                    queue_incomplete = isinstance(queue_failure, QueueError)
-                if queue_incomplete:
-                    raise queue_failure
-                if not isinstance(queue_failure, Exception):
-                    self._terminal_queue_error = queue_failure
-                else:
-                    try:
-                        logger.error("Failed to close queue strategy during shutdown")
-                    except BaseException:
-                        pass
+                    queue_close_error = exc
+            if queue_close_error is not None:
+                self._handle_queue_close_failure(
+                    queue,
+                    queue_close_error,
+                    lossy=lossy,
+                )
             self._queue_terminal = True
 
+        remainder = self._close_after_queue(reason, lossy=lossy)
+        if isinstance(remainder, Deferred):
+            return self._bound_close_operation(remainder)
+        return remainder
+
+    def _close_after_queue(
+        self,
+        reason: str,
+        *,
+        lossy: bool,
+    ) -> Deferred[Any] | None:
+        """Release signals, filters, and managers after queue quiescence."""
+        del lossy
         # Every following handle remains authoritative until its provider confirms
         # release. A failing pass leaves CLOSING and a later call resumes here.
         if self._signal_leases:
@@ -1970,30 +3053,59 @@ class BackendScheduler:
             if type(self.dupefilter) is BackendDupeFilter:
                 self.dupefilter.release(self._dupefilter_release_owner, reason)
             else:
-                # Preserve subclass close hooks; BackendDupeFilter.close itself
-                # retries through one stable internal owner token.
-                self.dupefilter.close(reason)
+                # Generic Scrapy dupefilters receive the standard close(reason)
+                # hook.  Scrapy 2.17 permits that hook to return a Deferred; keep
+                # every later release behind it so a delayed close cannot race the
+                # manager teardown.
+                close_result = self.dupefilter.close(reason)
+                if isinstance(close_result, Deferred):
+
+                    def finish_dupefilter_close(_ignored: Any) -> Any:
+                        self._dupefilter_released = True
+                        self._dupefilter_open = False
+                        return self._finish_close_after_dupefilter(reason)
+
+                    return close_result.addCallback(finish_dupefilter_close)
             self._dupefilter_released = True
             self._dupefilter_open = False
 
+        return self._finish_close_after_dupefilter(reason)
+
+    def _release_managers(self) -> None:
+        """Release every owned acquire, preserving the first failure."""
+        primary_error: BaseException | None = None
         if (
             self._owns_snapshot_connection_manager
             and self._snapshot_connection_manager is not None
             and not self._snapshot_manager_released
         ):
-            if self._snapshot_connection_manager_lease is not None:
-                self._snapshot_connection_manager_lease.release()
+            try:
+                if self._snapshot_connection_manager_lease is not None:
+                    self._snapshot_connection_manager_lease.release()
+                else:
+                    self._snapshot_connection_manager.close()
+            except BaseException as exc:
+                primary_error = exc
             else:
-                self._snapshot_connection_manager.close()
-            self._snapshot_manager_released = True
+                self._snapshot_manager_released = True
 
         if self._owns_connection_manager and not self._manager_released:
-            if self._connection_manager_lease is not None:
-                self._connection_manager_lease.release()
+            try:
+                if self._connection_manager_lease is not None:
+                    self._connection_manager_lease.release()
+                else:
+                    self.connection_manager.close()
+            except BaseException as exc:
+                if primary_error is None:
+                    primary_error = exc
             else:
-                self.connection_manager.close()
-            self._manager_released = True
+                self._manager_released = True
 
+        if primary_error is not None:
+            raise primary_error
+
+    def _publish_closed(self, reason: str) -> None:
+        """Publish CLOSED only after every manager release has completed."""
         # No ownership handle remains. Publish final package state under the lock;
         # every provider callback above completed while it was released.
         with self._lifecycle_lock:
@@ -2004,6 +3116,10 @@ class BackendScheduler:
             self._signals_connected = False
             self._backpressure_paused = False
             self._backpressure_probe_due = False
+            self._opening_operation = None
+            self._opening_settled = True
+            self._opening_failure = None
+            self._open_close_requested = False
             self._lifecycle_state = _LIFECYCLE_CLOSED
         try:
             logger.info("Scheduler closed: %s", reason)
@@ -2014,6 +3130,16 @@ class BackendScheduler:
         self._terminal_queue_error = None
         if terminal_error is not None:
             raise terminal_error
+
+    def _finish_close_after_dupefilter(self, reason: str) -> Deferred[Any] | None:
+        """Release managers off-reactor, then publish CLOSED."""
+        if reactor_is_running():
+            operation = deferToThread(self._release_managers)
+            return operation.addCallback(lambda _value: self._publish_closed(reason))
+
+        self._release_managers()
+        self._publish_closed(reason)
+        return None
 
     def enqueue_request(self, request: Request) -> bool:
         """Enqueue a request.
@@ -2033,7 +3159,10 @@ class BackendScheduler:
             request: The request to enqueue.
 
         Returns:
-            True if the request was enqueued, False on duplicate or push failure.
+            True if the request was enqueued, False on duplicate or deterministic
+            serialization rejection. Transient queue/backend push failures raise
+            ``QueueError`` after dedup compensation so Scrapy cannot classify them
+            as ``request_dropped``.
         """
         queue = self._queue
         if queue is None:
@@ -2058,6 +3187,7 @@ class BackendScheduler:
         deferred_diagnostics: list[_EnqueueDiagnostic] = []
         ordinary_outcome: bool | None = None
         retry_after_dupefilter_failure = False
+        terminal_push_failure = False
         try:
             # Dedup check is INSIDE the try (round-2 C6 fix) so a dedup-backend
             # outage degrades to default-enqueue instead of crashing the spider.
@@ -2246,7 +3376,13 @@ class BackendScheduler:
                 deferred_diagnostics.append(
                     ("error", "Failed to enqueue request", "scheduler/queue_error")
                 )
-                ordinary_outcome = False
+                # A queue/backend push failure is not a deterministic rejection.
+                # Returning False makes Scrapy emit request_dropped without a retry,
+                # which can lose the request even after the dedup reservation was
+                # correctly rolled back.  Keep False for duplicates and
+                # SerializationError only; publish a terminal error after all
+                # compensation diagnostics have been prepared.
+                terminal_push_failure = True
         except BaseException:
             # Process-control interruption after receipt handoff but before a
             # confirmed push follows the package's at-least-once policy: compensate
@@ -2293,21 +3429,34 @@ class BackendScheduler:
             # historical diagnostic-before-fallback ordering without exposing the
             # raw failure to logger or stats extensions.
             self._flush_enqueue_diagnostics(deferred_diagnostics)
-            fallback_push_failed = False
             try:
                 queue.push(request, priority=priority)
-            except (QueueError, SerializationError, BackendError):
-                fallback_push_failed = True
-            if fallback_push_failed:
+            except SerializationError:
+                self._record_enqueue_diagnostic(
+                    "error",
+                    "Failed to serialize request after dedup outage",
+                    stat="scheduler/serialization_errors",
+                )
+                return False
+            except (QueueError, BackendError):
                 self._record_enqueue_diagnostic(
                     "error",
                     "Failed to enqueue request after dedup outage",
+                    stat="scheduler/queue_error",
                 )
-                return False
+                raise QueueError(
+                    "Queue push failed after dedup outage; request was not dropped.",
+                    operation="push",
+                ) from None
             self._record_stat("scheduler/enqueued")
             return True
 
         self._flush_enqueue_diagnostics(deferred_diagnostics)
+        if terminal_push_failure:
+            raise QueueError(
+                "Queue push failed; request was not dropped and must be retried.",
+                operation="push",
+            ) from None
         if ordinary_outcome is not None:
             return ordinary_outcome
         return True

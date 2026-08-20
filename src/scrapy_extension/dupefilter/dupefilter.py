@@ -11,7 +11,7 @@ from collections import OrderedDict, deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from threading import Lock, RLock, get_ident
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 from weakref import ReferenceType, WeakSet, ref
 
 from scrapy_extension.backends.base import _validate_key_name
@@ -29,6 +29,11 @@ from scrapy_extension.utils._config import (
     get_bool_setting,
     parse_float_setting,
     parse_int_setting,
+)
+from scrapy_extension.utils.identity import (
+    DEFAULT_DUPEFILTER_KEY_TEMPLATE,
+    project_name_from_spider,
+    resolve_identity_template,
 )
 from scrapy_extension.utils.request import request_fingerprint
 
@@ -56,6 +61,45 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _cleanup_factory_filter_and_manager(
+    membership_filter: MembershipFilter | None,
+    manager: Any | None,
+    manager_lease: Any | None,
+    *,
+    owns_manager: bool,
+) -> BaseException | None:
+    """Abort an unpublished filter in dependency order.
+
+    Construction has no returned object to carry a retry callback. Try the filter
+    twice (covering effect-then-raise) and then release the exact manager acquire;
+    a persistent filter failure takes the explicit lossy construction-abort path.
+    The connection layer retains a failed exact release for a later registry retry.
+    """
+    cleanup_error: BaseException | None = None
+    if membership_filter is not None:
+        try:
+            membership_filter.close()
+        except BaseException as exc:
+            cleanup_error = exc
+            try:
+                membership_filter.close()
+            except BaseException:
+                pass
+    if owns_manager and manager is not None:
+        from scrapy_extension.backends.connectors import release_manager_acquire
+
+        try:
+            if manager_lease is not None:
+                release_manager_acquire(manager_lease, exact=True)
+            else:
+                release_manager_acquire(manager)
+        except BaseException as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+    return cleanup_error
+
 
 # Module-level warn-once flag for the cuckoo-filter-full degradation (Theme C,
 # R7-A). Mirrors the factory.py:31 ``_warned`` pattern so a long-running crawl
@@ -192,7 +236,7 @@ class BackendDupeFilter:
     def __init__(
         self,
         connection_manager: ConnectionManager | None,
-        key: str = "dupefilter",
+        key: str = DEFAULT_DUPEFILTER_KEY_TEMPLATE,
         *,
         debug: bool = False,
         fingerprinter: _Fingerprinter | None = None,
@@ -208,9 +252,9 @@ class BackendDupeFilter:
             connection_manager: Connection manager for backend access. May be
                 ``None`` when an in-process ``membership_filter`` is supplied.
             key: Key for the fingerprints set / filter scope. May contain the
-                literal placeholder ``"{spider}"``; when present it is
-                substituted with ``spider.name`` at :meth:`open` time so each
-                spider gets its own dedup scope (C8 fix).
+                literal placeholders ``"{project}"`` and ``"{spider}"``; when
+                present they are substituted at :meth:`open` time so each
+                project/spider gets its own dedup scope.
             debug: Whether to log filtered requests.
             fingerprinter: Optional Scrapy request fingerprinter. When provided
                 (normally threaded from ``crawler.request_fingerprinter`` via
@@ -527,7 +571,16 @@ class BackendDupeFilter:
             return
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> BackendDupeFilter:
+    def from_settings(
+        cls,
+        settings: Settings,
+        *,
+        connection_manager: ConnectionManager | None = None,
+        fingerprinter: _Fingerprinter | None = None,
+        monitor: Monitor | None = None,
+        owns_connection_manager: bool | None = None,
+        key_override: str | None = None,
+    ) -> BackendDupeFilter:
         """Create dupefilter from Scrapy settings.
 
         Backend selection: ``SCRAPY_SET_BACKEND_TYPE`` /
@@ -558,6 +611,8 @@ class BackendDupeFilter:
         )
 
         raw_strategy = settings.get("SCRAPY_DEDUP_STRATEGY", DedupeStrategy.SET.value)
+        if raw_strategy is None or raw_strategy == "":
+            raw_strategy = DedupeStrategy.SET.value
         try:
             strategy = DedupeStrategy(raw_strategy)
         except ValueError as e:
@@ -567,9 +622,12 @@ class BackendDupeFilter:
                 setting_name="SCRAPY_DEDUP_STRATEGY",
                 setting_value=str(raw_strategy),
             ) from e
-        manager = None
+        manager = connection_manager if strategy is DedupeStrategy.SET else None
         manager_lease = None
-        if strategy is DedupeStrategy.SET:
+        owns_manager = (
+            owns_connection_manager if owns_connection_manager is not None else True
+        )
+        if strategy is DedupeStrategy.SET and manager is None:
             backend_type, backend_settings = resolve_backend_config(
                 settings,
                 type_key="SCRAPY_SET_BACKEND_TYPE",
@@ -582,8 +640,17 @@ class BackendDupeFilter:
                 settings=backend_settings,
             )
             manager = manager_lease.manager
+        membership_filter: MembershipFilter | None = None
+        factory_failure: BaseException | None = None
         try:
-            key = settings.get("SCRAPY_DUPEFILTER_KEY", "dupefilter")
+            key = (
+                settings.get(
+                    "SCRAPY_DUPEFILTER_KEY",
+                    DEFAULT_DUPEFILTER_KEY_TEMPLATE,
+                )
+                if key_override is None
+                else key_override
+            )
             # getpriority() distinguishes an absent setting from an explicitly stored
             # None; Settings.get(name, default) intentionally treats both alike.
             memory_maxsize = (
@@ -643,7 +710,7 @@ class BackendDupeFilter:
                 )
             try:
                 _validate_key_name(
-                    key.replace("{spider}", "spider"),
+                    key.replace("{spider}", "spider").replace("{project}", "project"),
                     "SCRAPY_DUPEFILTER_KEY",
                 )
             except ValueError as exc:
@@ -705,22 +772,37 @@ class BackendDupeFilter:
                 connection_manager=manager,
                 key=key,
                 debug=debug,
+                fingerprinter=fingerprinter,
                 membership_filter=membership_filter,
+                monitor=monitor,
                 clear_on_open=clear_on_open,
+                owns_connection_manager=owns_manager,
                 connection_manager_lease=manager_lease,
             )
-        except BaseException:
-            if manager_lease is not None:
-                try:
-                    manager_lease.release()
-                except BaseException:
-                    try:
-                        logger.exception(
-                            "Failed to release ConnectionManager after dupefilter factory failure"
-                        )
-                    except BaseException:
-                        pass
-            raise
+        except BaseException as exc:
+            factory_failure = exc
+        assert factory_failure is not None
+        cleanup_error = _cleanup_factory_filter_and_manager(
+            membership_filter,
+            manager,
+            manager_lease,
+            owns_manager=owns_manager,
+        )
+        if cleanup_error is not None:
+            try:
+                logger.error("Failed to clean up dupefilter after factory failure")
+            except BaseException:
+                pass
+        raise factory_failure
+
+    def _abort_factory_failure(self) -> BaseException | None:
+        """Close an unpublished candidate without hiding its factory error."""
+        return _cleanup_factory_filter_and_manager(
+            self._filter,
+            self.connection_manager,
+            self._connection_manager_lease,
+            owns_manager=self._owns_connection_manager,
+        )
 
     @classmethod
     def from_crawler(cls, crawler: Crawler) -> BackendDupeFilter:
@@ -737,6 +819,7 @@ class BackendDupeFilter:
             A new BackendDupeFilter instance.
         """
         dupefilter = cls.from_settings(crawler.settings)
+        factory_failure: BaseException | None = None
         try:
             dupefilter._fingerprinter = getattr(crawler, "request_fingerprinter", None)
             # Default-on observability: wire a ScrapyStatsMonitor when crawler.stats is
@@ -752,17 +835,18 @@ class BackendDupeFilter:
                 if dupefilter.connection_manager is not None:
                     dupefilter.connection_manager.set_monitor(dupefilter._monitor)
             return dupefilter
-        except BaseException:
+        except BaseException as exc:
+            factory_failure = exc
+        assert factory_failure is not None
+        cleanup_error = dupefilter._abort_factory_failure()
+        if cleanup_error is not None:
             try:
-                dupefilter.close("crawler-factory-failed")
+                logger.error(
+                    "Failed to clean up dupefilter after crawler factory failure"
+                )
             except BaseException:
-                try:
-                    logger.exception(
-                        "Failed to release ConnectionManager after dupefilter crawler factory failure"
-                    )
-                except BaseException:
-                    pass
-            raise
+                pass
+        raise factory_failure
 
     def open(self, spider: Spider | None = None) -> None:
         """Reserve, execute, and publish one filter open outside the lifecycle lock."""
@@ -827,7 +911,7 @@ class BackendDupeFilter:
             self._open_owner_token = None
 
     def _resolve_spider_key(self, spider: Spider) -> None:
-        """Substitute ``{spider}`` in :attr:`key` with ``spider.name``, propagating
+        """Substitute identity placeholders in :attr:`key`, propagating
         to the underlying membership filter.
 
         No-op when the key does not contain the placeholder. Only backend-backed
@@ -836,10 +920,22 @@ class BackendDupeFilter:
         filters (memory/bloom/cuckoo) ignore the key entirely, so the placeholder
         has no effect there — consistent with their per-process scope.
         """
-        if "{spider}" not in self.key:
+        if "{spider}" not in self.key and "{project}" not in self.key:
             return
         templated = self.key
-        resolved = templated.replace("{spider}", spider.name)
+        resolved = resolve_identity_template(
+            templated,
+            spider_name=spider.name,
+            project_name=project_name_from_spider(spider),
+        )
+        try:
+            _validate_key_name(resolved, "SCRAPY_DUPEFILTER_KEY")
+        except ValueError as exc:
+            raise ConfigurationError(
+                str(exc),
+                setting_name="SCRAPY_DUPEFILTER_KEY",
+                setting_value=templated,
+            ) from exc
         self.key = resolved
         # Propagate to backend-backed filters that expose a writable ``key``. The
         # filter was built from the same templated key, so only rewrite when its

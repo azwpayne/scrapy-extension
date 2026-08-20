@@ -91,7 +91,9 @@ def _backend(mocker: Any) -> tuple[ElasticSearchBackend, Any]:
     backend = ElasticSearchBackend(config)
     client = mocker.MagicMock()
     client.options.return_value = client
-    shards = {"total": 1, "successful": 1, "failed": 0}
+    # Model a real one-node yellow mutation/refresh response: the primary is
+    # acknowledged while the configured replica is unassigned.
+    shards = {"total": 2, "successful": 1, "failed": 0}
     client.index.side_effect = lambda **kwargs: {
         "_index": kwargs["index"],
         "_id": kwargs["id"],

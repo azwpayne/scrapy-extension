@@ -28,7 +28,7 @@ class TestBackendDupeFilterInit:
         dupefilter = BackendDupeFilter(connection_manager=mock_connection_manager)
 
         assert dupefilter.connection_manager is mock_connection_manager
-        assert dupefilter.key == "dupefilter"
+        assert dupefilter.key == "dupefilter:{project}:{spider}"
         assert dupefilter.debug is False
 
     def test_init_with_custom_key(self, mock_connection_manager):
@@ -194,6 +194,35 @@ class TestBackendDupeFilterClassMethods:
 
         dupefilter = BackendDupeFilter.from_crawler(mock_crawler)
         assert dupefilter._fingerprinter is None
+
+
+class TestDefaultDupeFilterIdentityIsolation:
+    """Factory defaults must isolate fingerprints by project and spider."""
+
+    def test_two_spiders_get_distinct_default_keys(self, mocker):
+        from scrapy.settings import Settings
+
+        from scrapy_extension.backends.connectors import ConnectionManager
+
+        manager = mocker.Mock()
+        _patch_acquire_lease(mocker, ConnectionManager, manager)
+        settings = Settings({"SCRAPY_BACKEND_TYPE": "redis", "BOT_NAME": "project"})
+
+        first = BackendDupeFilter.from_settings(settings)
+        second = BackendDupeFilter.from_settings(settings)
+        first_spider = mocker.Mock(name="first")
+        first_spider.name = "alpha"
+        first_spider.crawler.settings = settings
+        second_spider = mocker.Mock(name="second")
+        second_spider.name = "beta"
+        second_spider.crawler.settings = settings
+
+        first.open(first_spider)
+        second.open(second_spider)
+
+        assert first.key == "dupefilter:project:alpha"
+        assert second.key == "dupefilter:project:beta"
+        assert first.key != second.key
 
 
 class TestBackendDupeFilterOpenClose:

@@ -246,6 +246,26 @@ class TestBackendPipelineFromSettings:
 
         assert pipeline.key_prefix == "items"
         assert pipeline.ttl is None
+        assert pipeline.max_storage_errors == 10
+
+    def test_from_settings_explicit_none_opts_into_best_effort(self, mocker):
+        from scrapy.settings import Settings as ScrapySettings
+
+        from scrapy_extension.backends.connectors import ConnectionManager
+
+        manager = mocker.Mock()
+        mocker.patch.object(ConnectionManager, "get_manager", return_value=manager)
+
+        pipeline = BackendPipeline.from_settings(
+            ScrapySettings(
+                {
+                    "SCRAPY_BACKEND_TYPE": "redis",
+                    "SCRAPY_PIPELINE_MAX_STORAGE_ERRORS": None,
+                }
+            )
+        )
+
+        assert pipeline.max_storage_errors is None
 
     def test_from_settings_zero_ttl_becomes_none(self, mocker):
         """Test that SCRAPY_PIPELINE_TTL=0 is converted to None."""
@@ -1546,20 +1566,16 @@ class TestBackendPipelineStorageStrategy:
 
 
 class TestBackendPipelineStorageEscalation:
-    """C2 (round 2): opt-in loud-fail after N consecutive storage errors.
+    """C2: fail-loud storage errors with explicit best-effort opt-in."""
 
-    Default (``max_storage_errors=None``) preserves the swallow-and-stat
-    behavior — zero compat break. When set to an int N, the pipeline tracks
-    consecutive storage failures and re-raises a fixed ``BackendError``
-    once the consecutive count exceeds N, so a persistent storage outage
-    surfaces loudly instead of being silently swallowed as success.
-    """
-
-    def test_default_none_preserves_swallow_and_stat(
+    def test_explicit_none_preserves_swallow_and_stat(
         self, mock_connection_manager, mocker
     ):
-        """Default (None) = current best-effort behavior: raise → item returned + stat."""
-        pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+        """Best-effort loss is available only through an explicit None opt-in."""
+        pipeline = BackendPipeline(
+            connection_manager=mock_connection_manager,
+            max_storage_errors=None,
+        )
         pipeline._storage_supported = True
 
         mock_storage = mock_connection_manager.get_storage_backend()
@@ -1575,6 +1591,31 @@ class TestBackendPipelineStorageEscalation:
         mock_spider.crawler.stats.inc_value.assert_called_with(
             "pipeline/storage_errors"
         )
+
+    def test_default_uses_reliability_safe_threshold(self, mock_connection_manager):
+        pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+        assert pipeline.max_storage_errors == 10
+
+    def test_default_surfaces_the_eleventh_consecutive_failure(
+        self, mock_connection_manager, mocker
+    ):
+        pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+        pipeline._storage_supported = True
+        mock_connection_manager.get_storage_backend().store.side_effect = RuntimeError(
+            "backend down"
+        )
+        spider = mocker.Mock()
+        spider.name = "s"
+
+        for index in range(10):
+            assert pipeline.process_item(
+                SampleItem(name=str(index), value=index), spider
+            )["name"] == str(index)
+        with pytest.raises(
+            BackendError,
+            match=r"^Pipeline storage failure threshold exceeded\.$",
+        ):
+            pipeline.process_item(SampleItem(name="eleven", value=11), spider)
 
     def test_escalation_raises_after_threshold_exceeded(
         self, mock_connection_manager, mocker

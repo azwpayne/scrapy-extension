@@ -18,6 +18,11 @@ from scrapy_extension.backends.circuit_breaker import (
 )
 from scrapy_extension.exceptions.base import ConfigurationError
 from scrapy_extension.settings._redacted import RedactedBaseSettings
+from scrapy_extension.utils.policy import DEFAULT_PIPELINE_MAX_STORAGE_ERRORS
+from scrapy_extension.utils.reactor import (
+    DEFAULT_REACTOR_IO_TIMEOUT_S,
+    MAX_REACTOR_IO_TIMEOUT_S,
+)
 
 
 class Settings(RedactedBaseSettings):
@@ -128,6 +133,18 @@ class Settings(RedactedBaseSettings):
         ge=0,
         description="Delay between retry attempts in seconds",
     )
+    reactor_io_timeout: float = Field(
+        default=DEFAULT_REACTOR_IO_TIMEOUT_S,
+        gt=0,
+        le=MAX_REACTOR_IO_TIMEOUT_S,
+        description=(
+            "Maximum wait budget for one reactor-facing lifecycle, pipeline, or "
+            "acknowledgement operation. Scheduler enqueue/next_request remain "
+            "Scrapy's synchronous API and additionally bound connection retry "
+            "backoff to this budget; configure the selected backend's own socket "
+            "timeout to bound an individual synchronous RPC."
+        ),
+    )
     queue_max_item_bytes: int = Field(
         default=1_048_576,
         gt=0,
@@ -200,14 +217,15 @@ class Settings(RedactedBaseSettings):
         ),
     )
     pipeline_max_storage_errors: int | None = Field(
-        default=None,
+        default=DEFAULT_PIPELINE_MAX_STORAGE_ERRORS,
+        ge=0,
         description=(
-            "C2 escalation: max consecutive storage errors before the pipeline "
-            "re-raises (wrapped as BackendError) instead of swallowing. ``None`` "
-            "(default) preserves the best-effort swallow-and-stat behavior — zero "
-            "compat break. When set to N, the consecutive counter is reset to 0 on "
-            "every successful store; a persistent outage surfaces loudly after N+1 "
-            "consecutive failures instead of being silently absorbed as success."
+            "Reliability-safe ceiling on consecutive storage errors before the "
+            "pipeline re-raises (wrapped as BackendError) instead of swallowing. "
+            "The default is 10 (the eleventh consecutive failure is surfaced). "
+            "Set explicitly to ``None`` only to opt into best-effort loss, which "
+            "swallows errors and records ``pipeline/storage_errors``. The counter "
+            "resets to 0 after every successful store."
         ),
     )
     circuit_breaker_enabled: bool = Field(

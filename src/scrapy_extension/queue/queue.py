@@ -46,6 +46,12 @@ from scrapy_extension.queue.strategies.base import (
     normalize_queue_timeout,
 )
 from scrapy_extension.queue.strategies.passthrough import PassthroughQueueStrategy
+from scrapy_extension.utils.identity import project_name_from_spider
+from scrapy_extension.utils.reactor import (
+    DEFAULT_REACTOR_IO_TIMEOUT_S,
+    defer_to_thread_ordered,
+    reactor_is_running,
+)
 
 if TYPE_CHECKING:
     from scrapy import Spider
@@ -61,6 +67,13 @@ _QUEUE_PUSH_SERIALIZATION_FAILURE = "Failed to serialize request."
 _QUEUE_POP_SERIALIZATION_FAILURE = "Failed to deserialize request."
 _QUEUE_PUSH_MONITOR_FAILURE = "Queue push serialization failed."
 _QUEUE_POP_MONITOR_FAILURE = "Queue pop deserialization failed."
+_ENVELOPE_PROJECT_FIELD = "_scrapy_extension_project"
+_ENVELOPE_SPIDER_FIELD = "_scrapy_extension_spider"
+
+
+class _EnvelopeIdentityMismatch(QueueError):
+    """A valid request envelope belongs to another project/spider."""
+
 
 _STRATEGY_CLEANUP_NOT_STARTED = "not-started"
 _STRATEGY_CLEANUP_STARTED = "started"
@@ -156,6 +169,8 @@ class BackendQueue:
         queue_name: str,
         *,
         spider: Spider | None = None,
+        project_name: str | None = None,
+        allow_cross_spider: bool = False,
         queue_strategy: QueueStrategy | None = None,
         max_item_bytes: int = DEFAULT_QUEUE_MAX_ITEM_BYTES,
         monitor: Monitor | None = None,
@@ -166,6 +181,7 @@ class BackendQueue:
         snapshot_connection_manager: ConnectionManager | None = None,
         snapshot_max_bytes: int | None = None,
         snapshot_chunk_bytes: int = DEFAULT_SNAPSHOT_CHUNK_BYTES,
+        reactor_io_timeout: float = DEFAULT_REACTOR_IO_TIMEOUT_S,
     ) -> None:
         """Initialize the backend queue.
 
@@ -174,6 +190,11 @@ class BackendQueue:
             queue_name: Name of the queue.
             spider: Optional spider reference for restoring callback/errback
                 functions during request deserialization.
+            project_name: Project identity stamped into request envelopes. When
+                omitted, Scrapy's ``BOT_NAME`` is read from the spider crawler.
+            allow_cross_spider: Explicit opt-in for a deliberately shared legacy
+                queue. When false, stamped envelopes for another identity are
+                rejected and left available for the owning consumer.
             queue_strategy: Optional queue-semantics strategy. When ``None``
                 (default), a ``PassthroughQueueStrategy`` delegates push/pop to the
                 QueueBackend unchanged — preserving the pre-strategy behavior.
@@ -223,10 +244,15 @@ class BackendQueue:
             snapshot_chunk_bytes: Maximum immutable generation chunk size. Defaults
                 to and cannot exceed the universal backend-safe cap of 256 KiB;
                 it also must not exceed ``snapshot_max_bytes``.
+            reactor_io_timeout: Caller-visible wait budget for reactor-safe
+                replacement acknowledgements. Synchronous queue operations remain
+                synchronous when no reactor is running.
         """
         self.connection_manager = connection_manager
         self.queue_name = queue_name
         self._spider = spider
+        self._project_name = project_name or project_name_from_spider(spider)
+        self._allow_cross_spider = allow_cross_spider
         self.max_item_bytes = max_item_bytes
         self.depth_sample_every = max(1, int(depth_sample_every))
         self._pop_rate_window_s = pop_rate_window_s
@@ -238,6 +264,12 @@ class BackendQueue:
         # Set when startup could not read an eligible legacy checkpoint. Until a
         # successful replacement commit, close must keep that legacy state reachable.
         self._defer_legacy_retirement = False
+        # A current-format manifest is the authoritative checkpoint. If its
+        # manifest or chunks cannot be read, a clean-start snapshot is not safe to
+        # publish: it could overwrite the only recoverable copy. The fence remains
+        # set until an operator explicitly authorizes a replacement via
+        # ``reset_snapshot``.
+        self._snapshot_persistence_fenced = False
         resolved_snapshot_max_bytes = (
             _MAX_SNAPSHOT_BYTES if snapshot_max_bytes is None else snapshot_max_bytes
         )
@@ -291,6 +323,8 @@ class BackendQueue:
         self._close_attempt_outcomes: dict[int, bool] = {}
         self._close_attempt_terminal: dict[int, bool] = {}
         self._close_attempt_waiters: dict[int, set[object]] = {}
+        self._reactor_io_timeout = reactor_io_timeout
+        self._pending_replacement_settlements: set[Any] = set()
         self._begin_close_complete = False
         self._checkpoint_complete = False
         # Destructive strategy cleanup is at-most-once. ``started`` is published
@@ -400,6 +434,10 @@ class BackendQueue:
         }
         request_dict["body"] = body_value
         request_dict["meta"] = serialized_meta
+        spider_name = getattr(self._spider, "name", None)
+        if isinstance(spider_name, str) and spider_name:
+            request_dict[_ENVELOPE_PROJECT_FIELD] = self._project_name
+            request_dict[_ENVELOPE_SPIDER_FIELD] = spider_name
         if body_value is not None:
             request_dict[_BODY_CODEC_FIELD] = _BODY_CODEC_BASE64_V1
         return request_dict
@@ -629,34 +667,37 @@ class BackendQueue:
         # without silently losing its delay or source semantics.
         request.meta.pop("delay", None)
         request.meta.pop("source", None)
-        replacement_ack_failed = False
         if replacement_ack_token is not None:
-            # This push already owns an operation lease. Use the admitted primitive
-            # directly so a concurrent close cannot reject the terminal ack between
-            # the replacement enqueue and completion of this push.
-            try:
-                self._ack(token=replacement_ack_token)
-            except Exception:  # noqa: BLE001 - replacement is already committed
-                # The strategy push is the commit boundary. Reclassifying this as a
-                # failed enqueue makes the scheduler roll back its dedup reservation
-                # and can let the broker's source redelivery publish a second
-                # replacement. Keep the token unresolved, report the terminal failure,
-                # and return success for the durable replacement. A later redelivery
-                # carrying its own token is durably handed off again before that token
-                # is acked; this can replay work but cannot lose the source delivery.
-                replacement_ack_failed = True
+            # This push already owns an operation lease. Keep the source settlement
+            # behind the commit boundary. Group child tokens only record completion;
+            # their group performs the broker settlement through the scheduler's
+            # adapter, so invoking them here is reactor-safe and registers that
+            # authoritative operation before this push returns.
+            if reactor_is_running() and not getattr(
+                replacement_ack_token,
+                "_reactor_safe_settlement",
+                False,
+            ):
+                self._schedule_replacement_ack(request, replacement_ack_token)
             else:
-                request.meta.pop(BACKEND_ACK_TOKEN_META_KEY, None)
-        if replacement_ack_failed:
-            self._inc_stat("scheduler/ack_error")
-            # The replacement commit is already visible. A broken logging handler
-            # must not reclassify that committed enqueue as a failed push.
-            try:
-                logger.error(
-                    "Failed to acknowledge source delivery after replacement committed"
-                )
-            except BaseException:
-                pass
+                replacement_ack_failed = False
+                try:
+                    self._ack(token=replacement_ack_token)
+                except Exception:  # noqa: BLE001 - replacement is already committed
+                    # The strategy push is the commit boundary. Reclassifying this
+                    # as a failed enqueue makes the scheduler roll back its dedup
+                    # reservation and can let the broker's source redelivery publish
+                    # a second replacement. Keep the token unresolved, report the
+                    # terminal failure, and return success for the durable replacement.
+                    replacement_ack_failed = True
+                else:
+                    if (
+                        request.meta.get(BACKEND_ACK_TOKEN_META_KEY)
+                        is replacement_ack_token
+                    ):
+                        request.meta.pop(BACKEND_ACK_TOKEN_META_KEY, None)
+                if replacement_ack_failed:
+                    self._record_replacement_ack_failure()
         push_monitor_failed = False
         try:
             self._monitor.on_push(self.queue_name, priority)
@@ -835,9 +876,35 @@ class BackendQueue:
                     f"queued request must be a JSON object, got {type(decoded).__name__}"
                 )
             request_dict = cast("dict[str, Any]", decoded)
+            # Validate this field before identity routing. A foreign envelope with
+            # malformed priority is poison, not a delivery that may be republished.
+            self._validate_serialized_priority(request_dict)
+            self._validate_envelope_identity(request_dict)
             self._decode_body(request_dict)
             self._validate_request_dict(request_dict)
             request = self._request_from_dict(request_dict)
+        except _EnvelopeIdentityMismatch:
+            # The queue is deliberately shared, but this delivery belongs to a
+            # different spider. Leave it available for the owning consumer rather
+            # than acknowledging it as poison data. Ack-capable brokers use nack;
+            # atomic pop backends have no nack, so re-publish the untouched bytes.
+            try:
+                if ack_token is not None:
+                    self._nack(token=ack_token)
+                else:
+                    self._strategy.push(
+                        self.queue_name,
+                        data,
+                        priority=request_dict.get("priority", 0.0),
+                    )
+            except Exception:
+                raise QueueError(
+                    "Unable to return a foreign request envelope to the queue.",
+                    queue_name=self.queue_name,
+                    operation="push",
+                ) from None
+            self._inc_stat("scheduler/queue/foreign_envelope")
+            return None
         except Exception:
             # The fixed error/poison handling below deliberately runs after this
             # suite. Custom stats and logging hooks must not recover a malformed
@@ -944,6 +1011,50 @@ class BackendQueue:
             )
             request_dict["body"] = legacy_bytes
 
+    def _validate_envelope_identity(self, request_dict: dict[str, Any]) -> None:
+        """Fence current envelopes to this queue's project and spider.
+
+        Envelopes written before identity stamping remain readable for rolling
+        upgrades. A stamped mismatch is a routing error, not poison data, so the
+        caller nacks it and lets the correct consumer retry it.
+        """
+        expected_spider = getattr(self._spider, "name", None)
+        if self._allow_cross_spider or not isinstance(expected_spider, str):
+            return
+        envelope_spider = request_dict.get(_ENVELOPE_SPIDER_FIELD)
+        envelope_project = request_dict.get(_ENVELOPE_PROJECT_FIELD)
+        if envelope_spider is None and envelope_project is None:
+            return
+        if not isinstance(envelope_spider, str) or not isinstance(
+            envelope_project, str
+        ):
+            raise _EnvelopeIdentityMismatch(
+                "queued request envelope identity is malformed"
+            )
+        if envelope_spider != expected_spider or envelope_project != self._project_name:
+            raise _EnvelopeIdentityMismatch(
+                "queued request envelope belongs to another spider/project"
+            )
+
+    @staticmethod
+    def _validate_serialized_priority(request_dict: dict[str, Any]) -> None:
+        """Validate and normalize the wire priority before routing decisions."""
+        if "priority" not in request_dict or request_dict["priority"] is None:
+            return
+        priority = request_dict["priority"]
+        try:
+            valid = (
+                not isinstance(priority, bool)
+                and isinstance(priority, (int, float))
+                and math.isfinite(priority)
+                and float(priority).is_integer()
+            )
+        except (OverflowError, TypeError, ValueError):
+            valid = False
+        if not valid:
+            raise TypeError("queued request field 'priority' must be a finite integer")
+        request_dict["priority"] = int(priority)
+
     @staticmethod
     def _validate_request_dict(request_dict: dict[str, Any]) -> None:
         """Reject wire-type drift before Scrapy silently coerces request fields."""
@@ -999,20 +1110,9 @@ class BackendQueue:
                         f"queued request header {name!r} must be text/bytes or a list of them"
                     )
 
-        if "priority" in request_dict and request_dict["priority"] is not None:
-            priority = request_dict["priority"]
-            if (
-                isinstance(priority, bool)
-                or not isinstance(priority, (int, float))
-                or not math.isfinite(priority)
-                or not float(priority).is_integer()
-            ):
-                raise TypeError(
-                    "queued request field 'priority' must be a finite integer"
-                )
-            # Legacy payloads may contain 0.0; normalize only after strict numeric
-            # validation so strings and fractional values cannot change semantics.
-            request_dict["priority"] = int(priority)
+        # Legacy payloads may contain 0.0; normalize only after strict numeric
+        # validation so strings and fractional values cannot change semantics.
+        BackendQueue._validate_serialized_priority(request_dict)
 
     def _request_from_dict(self, request_dict: dict[str, Any]) -> Request:
         """Rebuild an allowlisted Request class without queue-controlled imports."""
@@ -1278,6 +1378,60 @@ class BackendQueue:
         request.meta.pop(BACKEND_ACK_TOKEN_META_KEY, None)
         self._inc_stat("scheduler/queue/replacement_poison_dropped")
 
+    def _record_replacement_ack_failure(self) -> None:
+        """Report a post-commit source-ack failure without changing the result."""
+        self._inc_stat("scheduler/ack_error")
+        try:
+            logger.error(
+                "Failed to acknowledge source delivery after replacement committed"
+            )
+        except BaseException:
+            pass
+
+    def _track_replacement_settlement(self, operation: Any) -> None:
+        """Fence queue close until an authoritative replacement settlement ends."""
+        with self._operation_gate:
+            self._pending_replacement_settlements.add(operation)
+
+        def complete(result: Any) -> Any:
+            with self._operation_gate:
+                self._pending_replacement_settlements.discard(operation)
+                self._operation_gate.notify_all()
+            return result
+
+        # The callback is attached after releasing the gate: a test adapter may
+        # return an already-fired Deferred and invoke it synchronously.
+        operation.addBoth(complete)
+        operation.addErrback(lambda _failure: None)
+
+    def _schedule_replacement_ack(self, request: Request, token: Any) -> None:
+        """Acknowledge a committed replacement without blocking the reactor."""
+        operation, bounded = defer_to_thread_ordered(
+            self._ack,
+            token=token,
+            timeout=self._reactor_io_timeout,
+            operation="queue replacement ack",
+        )
+
+        def authoritative_success(value: Any) -> Any:
+            if request.meta.get(BACKEND_ACK_TOKEN_META_KEY) is token:
+                request.meta.pop(BACKEND_ACK_TOKEN_META_KEY, None)
+            return value
+
+        # The bounded result may time out before the worker returns. Metadata is
+        # finalized from the authoritative operation, not from that public view.
+        operation.addCallback(authoritative_success)
+        self._track_replacement_settlement(operation)
+
+        def settled_success(_value: Any) -> bool:
+            return True
+
+        def settled_failure(_failure: Any) -> bool:
+            self._record_replacement_ack_failure()
+            return False
+
+        bounded.addCallbacks(settled_success, settled_failure)
+
     def _inc_stat(self, stat_name: str) -> None:
         """Increment a Scrapy stat, tolerating missing spider/crawler/stats.
 
@@ -1426,14 +1580,41 @@ class BackendQueue:
         if self._close_owner_token is owner_token:
             self._publish_close_attempt(attempt, owner_token, succeeded=succeeded)
 
+    def reset_snapshot(self) -> None:
+        """Explicitly authorize replacing an unreadable snapshot checkpoint.
+
+        Startup keeps a current-format checkpoint authoritative when its manifest
+        or chunks cannot be read. Call this operator-controlled recovery method
+        only after deciding that the in-memory strategy state is the intended
+        replacement; the next ordinary ``close`` may then publish it. The method
+        does not delete the old manifest before replacement, so a failed commit
+        still leaves the prior checkpoint available.
+        """
+        with self._operation_gate:
+            if self._close_complete:
+                raise QueueError(
+                    "Cannot reset snapshot persistence after the queue is closed.",
+                    queue_name=self.queue_name,
+                    operation="snapshot-reset",
+                )
+            if self._close_in_progress:
+                raise QueueError(
+                    "Cannot reset snapshot persistence while queue close is in progress.",
+                    queue_name=self.queue_name,
+                    operation="snapshot-reset",
+                )
+            self._snapshot_persistence_fenced = False
+
     def close(self, *, lossy: bool = False) -> None:
         """Transactionally checkpoint and close the strategy.
 
         A checkpoint failure leaves strategy state and both managers usable for a
         later close retry. Callers waiting on the same attempt observe a fresh,
-        redacted failure rather than a false success. ``lossy=True`` is the explicit
-        abort path for discarding nonempty state when no durable checkpoint can be
-        made.
+        redacted failure rather than a false success. If startup could not read a
+        current-format checkpoint, normal close is fenced until
+        :meth:`reset_snapshot` explicitly authorizes replacement. ``lossy=True``
+        remains the explicit abort path for discarding nonempty state while
+        retaining the last authoritative checkpoint.
         """
         owner_token = _CloseOwnerToken()
         attempt = 0
@@ -1479,6 +1660,12 @@ class BackendQueue:
                     self._begin_close_complete = True
                 with self._operation_gate:
                     while self._active_operations > 0:
+                        self._operation_gate.wait()
+                with self._operation_gate:
+                    while (
+                        self._active_operations > 0
+                        or self._pending_replacement_settlements
+                    ):
                         self._operation_gate.wait()
                 if not self._checkpoint_complete:
                     if not lossy:
@@ -1668,6 +1855,17 @@ class BackendQueue:
         legacy_key: str | None = None
         tombstone_key = ""
         try:
+            if self._snapshot_persistence_fenced:
+                try:
+                    logger.error(
+                        "Current strategy snapshot is unreadable; close is fenced"
+                    )
+                except BaseException:
+                    pass
+                raise QueueError(
+                    "Strategy snapshot persistence is fenced; call reset_snapshot() "
+                    "after verifying the replacement state."
+                ) from None
             snapshot_failed = False
             try:
                 state = self._strategy.snapshot()
@@ -1773,15 +1971,32 @@ class BackendQueue:
         tombstone_key = ""
         try:
             read_failed = False
+            fence_current_snapshot = False
             try:
                 snapshot_key = self._snapshot_key()
                 result = repository.read(snapshot_key)
                 snapshot_key = ""
-            except SnapshotRepositoryError:
+            except SnapshotRepositoryError as error:
                 read_failed = True
+                # An auto-mocked/non-bytes storage value is not a current-format
+                # checkpoint and has no recoverable authority to protect. Real
+                # manifest retrieval, validation, and chunk failures retain the
+                # fence so a clean-start fallback cannot overwrite a checkpoint.
+                fence_current_snapshot = str(error) != (
+                    "Snapshot manifest has an invalid type."
+                )
             if read_failed:
+                if fence_current_snapshot:
+                    # Do not let the clean-start fallback overwrite the current
+                    # manifest. It may still be the only readable copy after a
+                    # transient backend/read failure or a partially corrupt chunk.
+                    self._snapshot_persistence_fenced = True
                 try:
-                    logger.error("Failed to read strategy snapshot; starting clean")
+                    logger.error(
+                        "Failed to read current strategy snapshot; persistence fenced"
+                        if fence_current_snapshot
+                        else "Current strategy snapshot value is not usable; starting clean"
+                    )
                 except BaseException:
                     pass
                 return

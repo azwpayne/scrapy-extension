@@ -12,11 +12,14 @@ import pytest
 from elastic_transport import ApiResponseMeta, BaseNode, HttpHeaders, NodeConfig
 from elastic_transport import ConnectionError as ElasticConnectionError
 from elastic_transport._node import NodeApiResponse
-from elasticsearch import Elasticsearch, RequestError
+from elasticsearch import Elasticsearch, RequestError, TransportError
 from hypothesis import example, given, seed, settings
 from hypothesis import strategies as st
 
-from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
+from scrapy_extension.backends.elasticsearch import (
+    ElasticSearchBackend,
+    _ElasticSearchResponseError,
+)
 from scrapy_extension.exceptions import (
     BackendConnectionError,
     QueueError,
@@ -86,7 +89,7 @@ class _RetryProbeNode(BaseNode):
                 "_index": index,
                 "_id": document_id,
                 "result": "created",
-                "_shards": {"total": 1, "successful": 1, "failed": 0},
+                "_shards": {"total": 2, "successful": 1, "failed": 0},
             }
             status = 201
         elif operation == "delete":
@@ -94,7 +97,7 @@ class _RetryProbeNode(BaseNode):
                 "_index": index,
                 "_id": document_id,
                 "result": "deleted",
-                "_shards": {"total": 1, "successful": 1, "failed": 0},
+                "_shards": {"total": 2, "successful": 1, "failed": 0},
             }
             status = 200
         elif operation == "delete_by_query":
@@ -114,7 +117,7 @@ class _RetryProbeNode(BaseNode):
             }
             status = 200
         elif operation == "refresh":
-            response = {"_shards": {"total": 1, "successful": 1, "failed": 0}}
+            response = {"_shards": {"total": 2, "successful": 1, "failed": 0}}
             status = 200
         elif operation == "count":
             response = {
@@ -286,25 +289,31 @@ def test_mutation_view_with_unrelated_transport_fails_generation_closed(
     assert exc_info.value.backend_type == "elasticsearch"
 
 
-_SHARDS = {"total": 1, "successful": 1, "failed": 0}
-_REFRESH_RESPONSE = {"_shards": _SHARDS}
+_MUTATION_SHARDS = {"total": 2, "successful": 1, "failed": 0}
+_READ_SHARDS = {"total": 1, "successful": 1, "failed": 0}
+_REFRESH_RESPONSE = {"_shards": _MUTATION_SHARDS}
 
 
 def _mock_backend(mocker: Any) -> tuple[ElasticSearchBackend, Any]:
     backend = ElasticSearchBackend(ElasticSearchSettings())
     client = mocker.MagicMock()
     client.options.return_value = client
+    client.indices.create.side_effect = lambda **kwargs: {
+        "acknowledged": True,
+        "shards_acknowledged": True,
+        "index": kwargs["index"],
+    }
     client.index.side_effect = lambda **kwargs: {
         "_index": kwargs["index"],
         "_id": kwargs["id"],
         "result": "created",
-        "_shards": _SHARDS,
+        "_shards": _MUTATION_SHARDS,
     }
     client.delete.side_effect = lambda **kwargs: {
         "_index": kwargs["index"],
         "_id": kwargs["id"],
         "result": "deleted",
-        "_shards": _SHARDS,
+        "_shards": _MUTATION_SHARDS,
     }
     client.indices.refresh.return_value = _REFRESH_RESPONSE
     client.delete_by_query.return_value = {
@@ -332,7 +341,7 @@ def _mock_backend(mocker: Any) -> tuple[ElasticSearchBackend, Any]:
         {},
         {
             "timed_out": True,
-            "_shards": _SHARDS,
+            "_shards": _READ_SHARDS,
             "hits": {"total": {"value": 0, "relation": "eq"}, "hits": []},
         },
         {
@@ -342,12 +351,12 @@ def _mock_backend(mocker: Any) -> tuple[ElasticSearchBackend, Any]:
         },
         {
             "timed_out": False,
-            "_shards": _SHARDS,
+            "_shards": _READ_SHARDS,
             "hits": {"total": {"value": 10_000, "relation": "gte"}, "hits": []},
         },
         {
             "timed_out": False,
-            "_shards": _SHARDS,
+            "_shards": _READ_SHARDS,
             "hits": {"total": {"value": 1, "relation": "eq"}, "hits": []},
         },
     ),
@@ -370,10 +379,6 @@ _INVALID_REFRESH_RESPONSES = (
     pytest.param(
         {"_shards": {"total": True, "successful": 1, "failed": 0}},
         id="non-exact-total",
-    ),
-    pytest.param(
-        {"_shards": {"total": 2, "successful": 1, "failed": 0}},
-        id="partial-success",
     ),
     pytest.param(
         {
@@ -450,7 +455,7 @@ def test_count_rejects_partial_or_malformed_refresh_before_count(
 @pytest.mark.parametrize("count", (None, -1, True, 1.5))
 def test_count_requires_exact_nonnegative_integer(mocker: Any, count: object) -> None:
     backend, client = _mock_backend(mocker)
-    client.count.return_value = {"count": count, "_shards": _SHARDS}
+    client.count.return_value = {"count": count, "_shards": _READ_SHARDS}
 
     with pytest.raises(QueueError, match="queue length read failed"):
         backend.queue_len("jobs")
@@ -652,22 +657,83 @@ def test_clear_families_reject_indeterminate_documented_responses(
     assert exc_info.value.__cause__ is None
 
 
+def test_clear_refreshes_before_and_after_delete_by_query(mocker: Any) -> None:
+    """Clear uses a refresh barrier both before and after the deletion."""
+    backend, client = _mock_backend(mocker)
+    calls: list[str] = []
+    refresh_response = _REFRESH_RESPONSE
+
+    def refresh(**_kwargs: Any) -> object:
+        calls.append("refresh")
+        return refresh_response
+
+    def delete_by_query(**_kwargs: Any) -> object:
+        calls.append("delete_by_query")
+        return client.delete_by_query.return_value
+
+    client.indices.refresh.side_effect = refresh
+    client.delete_by_query.side_effect = delete_by_query
+
+    backend.clear_queue("jobs")
+
+    assert calls == ["refresh", "delete_by_query", "refresh"]
+
+
+@pytest.mark.parametrize(
+    "failure_at",
+    ("before", "after"),
+)
+def test_clear_refresh_barrier_failure_is_indeterminate(
+    mocker: Any, failure_at: str
+) -> None:
+    """A failed visibility barrier never reports a definite clear success."""
+    backend, client = _mock_backend(mocker)
+    calls: list[str] = []
+    refresh_count = 0
+    refresh_error = TransportError(f"{failure_at} refresh failed")
+
+    def refresh(**_kwargs: Any) -> object:
+        nonlocal refresh_count
+        refresh_count += 1
+        calls.append("refresh")
+        if (failure_at == "before" and refresh_count == 1) or (
+            failure_at == "after" and refresh_count == 2
+        ):
+            raise refresh_error
+        return _REFRESH_RESPONSE
+
+    def delete_by_query(**_kwargs: Any) -> object:
+        calls.append("delete_by_query")
+        return client.delete_by_query.return_value
+
+    client.indices.refresh.side_effect = refresh
+    client.delete_by_query.side_effect = delete_by_query
+
+    with pytest.raises(QueueOutcomeIndeterminateError):
+        backend.clear_queue("jobs")
+
+    if failure_at == "before":
+        assert calls == ["refresh"]
+    else:
+        assert calls == ["refresh", "delete_by_query", "refresh"]
+
+
 @pytest.mark.parametrize(
     ("operation", "response", "expected_error"),
     (
         (
             "push",
-            {"result": "updated", "_shards": _SHARDS},
+            {"result": "updated", "_shards": _MUTATION_SHARDS},
             QueueOutcomeIndeterminateError,
         ),
         (
             "set",
-            {"result": "updated", "_shards": _SHARDS},
+            {"result": "updated", "_shards": _MUTATION_SHARDS},
             SetOutcomeIndeterminateError,
         ),
         (
             "store",
-            {"result": "noop", "_shards": _SHARDS},
+            {"result": "noop", "_shards": _MUTATION_SHARDS},
             StorageOutcomeIndeterminateError,
         ),
         (
@@ -726,7 +792,7 @@ def test_mutation_rejects_acknowledgement_for_another_document(
         "_index": "wrong-index",
         "_id": "wrong-id",
         "result": "deleted" if operation == "delete" else "created",
-        "_shards": _SHARDS,
+        "_shards": _MUTATION_SHARDS,
     }
     if operation == "delete":
         client.delete.side_effect = None
@@ -764,7 +830,19 @@ def test_index_setup_accepts_only_structured_resource_already_exists(
     structured = _request_error(
         {"error": {"type": "resource_already_exists_exception"}}
     )
-    client.indices.create.side_effect = [structured, None, None]
+    client.indices.create.side_effect = [
+        structured,
+        {
+            "acknowledged": True,
+            "shards_acknowledged": True,
+            "index": "scrapy_set",
+        },
+        {
+            "acknowledged": True,
+            "shards_acknowledged": True,
+            "index": "scrapy_storage",
+        },
+    ]
 
     backend._ensure_indices(client=client)
 
@@ -779,3 +857,166 @@ def test_index_setup_rejects_resource_exists_text_without_structured_type(
 
     with pytest.raises(RequestError):
         backend._ensure_indices(client=client)
+
+
+@pytest.mark.parametrize(
+    "response",
+    (
+        None,
+        {},
+        {"acknowledged": False, "shards_acknowledged": True, "index": "scrapy_queue"},
+        {"acknowledged": True, "shards_acknowledged": False, "index": "scrapy_queue"},
+        {"acknowledged": True, "shards_acknowledged": True, "index": "other-index"},
+    ),
+)
+def test_index_setup_rejects_unproven_create_acknowledgement(
+    mocker: Any, response: object
+) -> None:
+    """Create success requires the SDK's complete acknowledgement payload."""
+    backend, client = _mock_backend(mocker)
+    client.indices.create.side_effect = lambda **_kwargs: response
+
+    with pytest.raises(_ElasticSearchResponseError):
+        backend._ensure_indices(client=client)
+
+    client.indices.create.assert_called_once_with(index="scrapy_queue")
+
+
+# === New focused tests for ES Semantics fix ===
+
+
+def test_write_operation_green_replicas_single_shard() -> None:
+    """Write operation succeeds with replicas=0 (green) cluster, single shard.
+
+    Verifies that a normal write with total=1, successful=1, failed=0 is accepted
+    for write operations, representing a green-cluster single-node scenario.
+    """
+    from scrapy_extension.backends.elasticsearch import _validate_shards
+
+    response = {"_shards": {"total": 1, "successful": 1, "failed": 0}}
+    try:
+        _validate_shards(response, require_success=True)
+    except _ElasticSearchResponseError:
+        pytest.fail("Green replica write should be accepted")
+
+
+def test_write_operation_yellow_replicas_single_node() -> None:
+    """Write operation succeeds with replicas=1 (yellow) single-node cluster.
+
+    Verifies that a write with total=2, successful=1, failed=0 (yellow cluster
+    single-node) is accepted for write operations, as the unassigned replica
+    is not a shard failure.
+    """
+    from scrapy_extension.backends.elasticsearch import _validate_shards
+
+    response = {"_shards": {"total": 2, "successful": 1, "failed": 0}}
+    try:
+        _validate_shards(response, require_success=True)
+    except _ElasticSearchResponseError:
+        pytest.fail("Yellow cluster write should be accepted")
+
+
+def test_write_operation_rejects_actual_shard_failure() -> None:
+    """Write operation is rejected when shards report actual failures.
+
+    Verifies that total=1, successful=0, failed=1 is rejected for write
+    operations, preserving conservative classification for failed shards.
+    """
+    from scrapy_extension.backends.elasticsearch import _validate_shards
+
+    response = {"_shards": {"total": 1, "successful": 0, "failed": 1}}
+    with pytest.raises(_ElasticSearchResponseError):
+        _validate_shards(response, require_success=True)
+
+
+def test_read_operation_rejects_yellow_cluster() -> None:
+    """Read operation is rejected for yellow cluster shard acknowledgement.
+
+    Verifies that total=2, successful=1, failed=0 (yellow cluster) is rejected
+    for read operations (count, search, pop), preserving conservative
+    classification.
+    """
+    from scrapy_extension.backends.elasticsearch import _validate_shards
+
+    response = {"_shards": {"total": 2, "successful": 1, "failed": 0}}
+    with pytest.raises(_ElasticSearchResponseError):
+        _validate_shards(response, require_success=False)
+
+
+def test_read_operation_accepts_green_replicas() -> None:
+    """Read operation succeeds with green replicas (replicas=0).
+
+    Verifies that total=1, successful=1, failed=0 is accepted for read
+    operations.
+    """
+    from scrapy_extension.backends.elasticsearch import _validate_shards
+
+    response = {"_shards": {"total": 1, "successful": 1, "failed": 0}}
+    try:
+        _validate_shards(response, require_success=False)
+    except _ElasticSearchResponseError:
+        pytest.fail("Green replica read should be accepted")
+
+
+def test_read_operation_rejects_shard_failure() -> None:
+    """Read operation is rejected when shards report failures.
+
+    Verifies that total=1, successful=0, failed=1 is rejected for read
+    operations, preserving conservative classification for failed shards.
+    """
+    from scrapy_extension.backends.elasticsearch import _validate_shards
+
+    response = {"_shards": {"total": 1, "successful": 0, "failed": 1}}
+    with pytest.raises(_ElasticSearchResponseError):
+        _validate_shards(response, require_success=False)
+
+
+def test_refresh_accepts_yellow_cluster() -> None:
+    """Refresh operation accepts yellow cluster shard acknowledgement.
+
+    Verifies that total=2, successful=1, failed=0 (yellow cluster) is accepted
+    for refresh operations, as refresh just flushes the indexing buffer.
+    """
+    from scrapy_extension.backends.elasticsearch import _validate_refresh_response
+
+    response = {"_shards": {"total": 2, "successful": 1, "failed": 0}}
+    try:
+        _validate_refresh_response(response)
+    except _ElasticSearchResponseError:
+        pytest.fail("Yellow cluster refresh should be accepted")
+
+
+def test_refresh_rejects_actual_failure() -> None:
+    """Refresh operation is rejected when shards report failures.
+
+    Verifies that total=1, successful=0, failed=1 is rejected for refresh
+    operations, preserving conservative classification.
+    """
+    from scrapy_extension.backends.elasticsearch import _validate_refresh_response
+
+    response = {"_shards": {"total": 1, "successful": 0, "failed": 1}}
+    with pytest.raises(_ElasticSearchResponseError):
+        _validate_refresh_response(response)
+
+
+def test_malformed_shards_rejected() -> None:
+    """Malformed shards acknowledgement is rejected.
+
+    Verifies that various malformed shard responses are rejected for both
+    read and write operations.
+    """
+    from scrapy_extension.backends.elasticsearch import _validate_shards
+
+    malformed_responses = [
+        {},  # missing shards
+        {"_shards": None},  # non-mapping shards
+        {"_shards": {"total": True, "successful": 1, "failed": 0}},  # non-exact total
+    ]
+
+    for response in malformed_responses:
+        # Write operations
+        with pytest.raises(_ElasticSearchResponseError):
+            _validate_shards(response, require_success=True)
+        # Read operations
+        with pytest.raises(_ElasticSearchResponseError):
+            _validate_shards(response, require_success=False)

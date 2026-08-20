@@ -66,6 +66,16 @@ def test_component_factory_documentation_matches_runtime_api() -> None:
     assert "`BackendQueue.spider` is a required keyword-only argument" not in _CHANGELOG
 
 
+def test_reliability_policy_and_identity_defaults_are_documented() -> None:
+    assert Settings().pipeline_max_storage_errors == 10
+    assert "SCRAPY_PIPELINE_MAX_STORAGE_ERRORS` defaults to **10**" in _README
+    assert "explicitly to `None` only to opt into best-effort loss" in _RUNBOOK
+    assert "default `10`, so the eleventh consecutive failure" in _RUNBOOK
+    assert "scheduler-queue:{project}:{spider}" in _README
+    assert "dupefilter:{project}:{spider}" in _RUNBOOK
+    assert "SCRAPY_QUEUE_ALLOW_CROSS_SPIDER" in _STABILITY
+
+
 def test_storage_strategy_names_are_documented_and_enforced_as_case_sensitive() -> None:
     assert create_storage_strategy("passthrough").__class__.__name__ == (
         "PassthroughStorageStrategy"
@@ -184,12 +194,23 @@ def test_configuration_error_families_match_runtime_boundaries() -> None:
     assert manager_error.value.setting_value is None
 
 
+class _FakeElasticSearchIndices:
+    def __init__(self, owner: _FakeElasticSearchClient) -> None:
+        self._owner = owner
+
+    def refresh(self, **kwargs: Any) -> dict[str, Any]:
+        self._owner.refresh_calls.append(kwargs)
+        return {"_shards": {"total": 1, "successful": 1, "failed": 0}}
+
+
 class _FakeElasticSearchClient:
     def __init__(self) -> None:
         self.transport = object()
         self.options_calls: list[dict[str, Any]] = []
         self.index_calls: list[dict[str, Any]] = []
         self.delete_by_query_calls: list[dict[str, Any]] = []
+        self.refresh_calls: list[dict[str, Any]] = []
+        self.indices = _FakeElasticSearchIndices(self)
         self.closed = False
 
     def options(self, **kwargs: Any) -> _FakeElasticSearchClient:
@@ -286,6 +307,10 @@ def test_es_push_benchmark_uses_production_backend_and_cleans_up_without_network
             "index": backend.config.queue_index,
             "query": {"term": {"queue_name.keyword": "benchmark-contract"}},
         }
+    ]
+    assert client.refresh_calls == [
+        {"index": backend.config.queue_index},
+        {"index": backend.config.queue_index},
     ]
     assert client.closed is True
     assert backend.is_connected() is False

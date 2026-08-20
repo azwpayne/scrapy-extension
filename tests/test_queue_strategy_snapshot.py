@@ -998,6 +998,72 @@ def test_backends_queue_uses_injected_snapshot_manager_only_for_snapshot_io():
     snapshot_manager.close.assert_not_called()
 
 
+@pytest.mark.parametrize("failure_kind", ["manifest", "chunk"])
+def test_current_snapshot_read_failure_fences_close_until_explicit_reset(
+    failure_kind: str,
+) -> None:
+    """A current checkpoint remains authoritative across a failed startup read."""
+    storage, state = _stateful_storage({})
+    repository = SnapshotRepository(storage)
+    repository.commit(_SNAPSHOT_KEY, b"authoritative")
+    authoritative_manifest = state[_SNAPSHOT_KEY]
+    manifest = json.loads(authoritative_manifest)
+    chunk_key = repository._chunk_key(_SNAPSHOT_KEY, manifest["generation"], 0)
+    failed_key = _SNAPSHOT_KEY if failure_kind == "manifest" else chunk_key
+    original_retrieve = storage.retrieve.side_effect
+
+    def fail_current_checkpoint(key: str) -> object:
+        if key == failed_key:
+            raise RuntimeError("injected current checkpoint read failure")
+        return original_retrieve(key)
+
+    storage.retrieve.side_effect = fail_current_checkpoint
+    strategy = MagicMock(name="Strategy")
+    strategy.snapshot.return_value = b"replacement"
+    queue = BackendQueue(
+        connection_manager=_wired_cm(storage=storage),
+        queue_name="q",
+        queue_strategy=strategy,
+        monitor=MagicMock(),
+    )
+
+    assert queue._snapshot_persistence_fenced is True
+    with pytest.raises(QueueError, match="fenced"):
+        queue.close()
+    assert state[_SNAPSHOT_KEY] == authoritative_manifest
+    strategy.snapshot.assert_not_called()
+    strategy.close.assert_not_called()
+
+    # Explicit operator recovery authorizes a replacement without deleting the
+    # old manifest first; a failed replacement would therefore remain recoverable.
+    storage.retrieve.side_effect = lambda key: state.get(key)
+    queue.reset_snapshot()
+    queue.close()
+
+    assert SnapshotRepository(storage).read(_SNAPSHOT_KEY).state == b"replacement"
+    strategy.close.assert_called_once_with()
+
+
+def test_reset_snapshot_rejects_a_closed_queue() -> None:
+    queue = BackendQueue(
+        connection_manager=_wired_cm(), queue_name="q", monitor=MagicMock()
+    )
+    queue.close()
+
+    with pytest.raises(QueueError, match="after the queue is closed"):
+        queue.reset_snapshot()
+
+
+def test_reset_snapshot_rejects_a_concurrent_close() -> None:
+    queue = BackendQueue(
+        connection_manager=_wired_cm(), queue_name="q", monitor=MagicMock()
+    )
+    queue._close_in_progress = True
+
+    with pytest.raises(QueueError, match="close is in progress"):
+        queue.reset_snapshot()
+
+
 def test_restored_snapshot_survives_crash_until_clean_checkpoint():
     source = _delay(clock_value=100.0)
     source.push("q", b"recovered", delay=10.0)

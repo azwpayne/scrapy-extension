@@ -36,9 +36,12 @@ def _assert_package_traceback_locals_are_redacted(
         trace = trace.tb_next
 
 
-_SHARDS = {"total": 1, "successful": 1, "failed": 0}
-_INDEX_RESPONSE = {"result": "created", "_shards": _SHARDS}
-_DELETE_RESPONSE = {"result": "deleted", "_shards": _SHARDS}
+# A mutation/refresh response from a one-node yellow cluster includes the
+# unassigned replica in ``total``. Reads use green exact accounting below.
+_MUTATION_SHARDS = {"total": 2, "successful": 1, "failed": 0}
+_READ_SHARDS = {"total": 1, "successful": 1, "failed": 0}
+_INDEX_RESPONSE = {"result": "created", "_shards": _MUTATION_SHARDS}
+_DELETE_RESPONSE = {"result": "deleted", "_shards": _MUTATION_SHARDS}
 _DELETE_BY_QUERY_RESPONSE = {
     "took": 3,
     "timed_out": False,
@@ -58,7 +61,7 @@ _DELETE_BY_QUERY_RESPONSE = {
 def _search_response(hits):
     return {
         "timed_out": False,
-        "_shards": _SHARDS,
+        "_shards": _READ_SHARDS,
         "hits": {
             "total": {"value": len(hits), "relation": "eq"},
             "hits": hits,
@@ -67,11 +70,17 @@ def _search_response(hits):
 
 
 def _count_response(count):
-    return {"count": count, "_shards": _SHARDS}
+    return {"count": count, "_shards": _READ_SHARDS}
 
 
 def _adapt_elasticsearch_client_mock(client):
     client.options.return_value = client
+    if client.indices.create.side_effect is None:
+        client.indices.create.side_effect = lambda **kwargs: {
+            "acknowledged": True,
+            "shards_acknowledged": True,
+            "index": kwargs["index"],
+        }
     return client
 
 
@@ -89,7 +98,7 @@ def _mock_backend(mocker, **settings_kwargs):
         "_index": kwargs["index"],
         "_id": kwargs["id"],
     }
-    backend._client.indices.refresh.return_value = {"_shards": _SHARDS}
+    backend._client.indices.refresh.return_value = {"_shards": _MUTATION_SHARDS}
     backend._client.delete_by_query.return_value = _DELETE_BY_QUERY_RESPONSE
     backend._connection_snapshot = backend._capture_connection_snapshot()
     return backend
@@ -430,7 +439,8 @@ class TestQueue:
 
         assert b.pop("q") == b"item"
         # delete no longer passes refresh= — read-your-writes moved to a pre-search
-        # indices.refresh (see #42 perf fix). The mock's indices.refresh auto-creates.
+        # indices.refresh (see #42 perf fix). The fixture returns a protocol-shaped
+        # mutation/refresh acknowledgement, including a yellow-cluster primary.
         b._client.delete.assert_called_once_with(
             index="scrapy_queue",
             id="1",

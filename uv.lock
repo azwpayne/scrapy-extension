@@ -2214,6 +2214,7 @@ sqs = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "packaging" },
     { name = "poethepoet" },
     { name = "ruff" },
 ]
@@ -2225,6 +2226,7 @@ test = [
     { name = "hypothesis" },
     { name = "kafka-python-ng" },
     { name = "mypy" },
+    { name = "packaging" },
     { name = "pika" },
     { name = "pulsar-client" },
     { name = "pymemcache" },
@@ -2267,13 +2269,14 @@ requires-dist = [
     { name = "redis", marker = "extra == 'redis'", specifier = ">=8.1.0,<9" },
     { name = "rocketmq-python-client", marker = "extra == 'all'", specifier = ">=5.1.1,<6" },
     { name = "rocketmq-python-client", marker = "extra == 'rocketmq'", specifier = ">=5.1.1,<6" },
-    { name = "scrapy", specifier = ">=2.14.2,<3" },
+    { name = "scrapy", specifier = ">=2.17.0,<3" },
     { name = "typing-extensions", specifier = ">=4.16.0,<5" },
 ]
 provides-extras = ["redis", "mongodb", "kafka", "rabbitmq", "elasticsearch", "rocketmq", "pulsar", "memcached", "sqs", "dynamodb", "all"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "packaging", specifier = ">=26.0,<27" },
     { name = "poethepoet" },
     { name = "ruff" },
 ]
@@ -2285,6 +2288,7 @@ test = [
     { name = "hypothesis", specifier = ">=6.165.2,<7" },
     { name = "kafka-python-ng", specifier = ">=2.2.2,<3" },
     { name = "mypy" },
+    { name = "packaging", specifier = ">=26.0,<27" },
     { name = "pika", specifier = ">=1.4.4,<2" },
     { name = "pulsar-client", specifier = ">=3.13.0,<4" },
     { name = "pymemcache", specifier = ">=4.0,<5" },

@@ -9,11 +9,19 @@ from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
 from scrapy_extension.exceptions import BackendConnectionError, QueueError, StorageError
 from scrapy_extension.settings.elasticsearch import ElasticSearchSettings
 
-_SHARDS = {"total": 1, "successful": 1, "failed": 0}
+# Mutation/refresh responses from a one-node yellow cluster. Read response
+# fixtures intentionally use exact green shard accounting where needed.
+_SHARDS = {"total": 2, "successful": 1, "failed": 0}
 
 
 def _adapt_elasticsearch_client_mock(client):
     client.options.return_value = client
+    if client.indices.create.side_effect is None:
+        client.indices.create.side_effect = lambda **kwargs: {
+            "acknowledged": True,
+            "shards_acknowledged": True,
+            "index": kwargs["index"],
+        }
     return client
 
 
@@ -541,6 +549,7 @@ class TestDeleteByQuery:
                 create=mocker.MagicMock(),
             ),
         )
+        mock_client.indices.refresh.return_value = {"_shards": _SHARDS}
         mock_client.delete_by_query.side_effect = TransportError("Delete failed")
         mocker.patch(
             "scrapy_extension.backends.elasticsearch.Elasticsearch",

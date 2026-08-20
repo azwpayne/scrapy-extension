@@ -34,6 +34,7 @@ from scrapy_extension.settings import (
     ElasticSearchSettings,
     MemcachedSettings,
 )
+from tests._trace_subprocess import run_trace_probe_in_subprocess
 
 _KEY = "queue:snapshot:v3:0::1:q"
 _MARKER = "snapshot_private_backend_marker"
@@ -130,6 +131,21 @@ def _assert_package_frame_payloads_cleared(error: BaseException) -> None:
         trace = trace.tb_next
 
 
+def _first_traceable_line_after(instructions: list[dis.Instruction], index: int) -> int:
+    """Find a source-line trace boundary after an assignment.
+
+    CPython 3.12 may not emit opcode events for a short traced frame, while line
+    events remain stable. The returned offset still lies strictly after the
+    sensitive local has taken ownership.
+    """
+    if sys.version_info[:2] != (3, 12):
+        return instructions[index + 1].offset
+    for candidate in instructions[index + 1 :]:
+        if candidate.starts_line is not None:
+            return candidate.offset
+    return instructions[index + 1].offset
+
+
 def _instruction_after_result_assignment(function: object) -> int:
     instructions = list(dis.get_instructions(function))
     stores = [
@@ -138,7 +154,7 @@ def _instruction_after_result_assignment(function: object) -> int:
         if instruction.opname == "STORE_FAST" and instruction.argval == "result"
     ]
     assert len(stores) >= 2
-    return instructions[stores[1] + 1].offset
+    return _first_traceable_line_after(instructions, stores[1])
 
 
 def _instruction_after_snapshot_state_assignment() -> int:
@@ -149,7 +165,7 @@ def _instruction_after_snapshot_state_assignment() -> int:
         if instruction.opname == "STORE_FAST" and instruction.argval == "state"
     ]
     assert len(stores) >= 2
-    return instructions[stores[1] + 1].offset
+    return _first_traceable_line_after(instructions, stores[1])
 
 
 class _SnapshotControlFlow(BaseException):
@@ -225,8 +241,13 @@ def _queue(storage: _Storage, strategy: MagicMock | None = None) -> BackendQueue
     ids=["repository-read", "queue-restore"],
 )
 def test_snapshot_result_assignment_interruption_clears_owned_payload(
-    function: object, invoke: Any
+    function: object,
+    invoke: Any,
+    request: pytest.FixtureRequest,
 ) -> None:
+    if run_trace_probe_in_subprocess(request):
+        return
+
     storage = _Storage()
     strategy = MagicMock(name="QueueStrategy")
     queue = _queue(storage, strategy)
@@ -238,22 +259,28 @@ def test_snapshot_result_assignment_interruption_clears_owned_payload(
     def inject(frame: object, event: str, _arg: object) -> object:
         if getattr(frame, "f_code", None) is getattr(function, "__code__", None):
             frame.f_trace_opcodes = True  # type: ignore[attr-defined]
-            if event == "opcode" and frame.f_lasti == target_offset:  # type: ignore[attr-defined]
+            if event in {"opcode", "line"} and frame.f_lasti == target_offset:  # type: ignore[attr-defined]
                 raise interruption
         return inject
 
+    previous_trace = sys.gettrace()
     sys.settrace(inject)
     try:
         with pytest.raises(_SnapshotControlFlow) as exc_info:
             invoke(repository, queue)
     finally:
-        sys.settrace(None)
+        sys.settrace(previous_trace)
 
     assert exc_info.value is interruption
     _assert_package_frame_payloads_cleared(interruption)
 
 
-def test_snapshot_acquisition_assignment_interruption_clears_owned_payload() -> None:
+def test_snapshot_acquisition_assignment_interruption_clears_owned_payload(
+    request: pytest.FixtureRequest,
+) -> None:
+    if run_trace_probe_in_subprocess(request):
+        return
+
     strategy = MagicMock(name="QueueStrategy")
     strategy.snapshot.return_value = _MARKER.encode()
     queue = _queue(_Storage(), strategy)
@@ -263,16 +290,17 @@ def test_snapshot_acquisition_assignment_interruption_clears_owned_payload() -> 
     def inject(frame: object, event: str, _arg: object) -> object:
         if getattr(frame, "f_code", None) is BackendQueue._persist_snapshot.__code__:
             frame.f_trace_opcodes = True  # type: ignore[attr-defined]
-            if event == "opcode" and frame.f_lasti == target_offset:  # type: ignore[attr-defined]
+            if event in {"opcode", "line"} and frame.f_lasti == target_offset:  # type: ignore[attr-defined]
                 raise interruption
         return inject
 
+    previous_trace = sys.gettrace()
     sys.settrace(inject)
     try:
         with pytest.raises(_SnapshotControlFlow) as exc_info:
             queue.close()
     finally:
-        sys.settrace(None)
+        sys.settrace(previous_trace)
 
     assert exc_info.value is interruption
     _assert_package_frame_payloads_cleared(interruption)

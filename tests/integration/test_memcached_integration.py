@@ -15,7 +15,7 @@ Running
 Skipped by default. To run, point at a memcached you don't mind throwaway
 ``inttest:*`` keys landing in::
 
-    SCRAPY_TEST_INTEGRATION=1 SCRAPY_TEST_MEMCACHED_HOST=localhost \
+    SCRAPY_TEST_INTEGRATION=1 SCRAPY_TEST_MEMCACHED_HOST=127.0.0.1 \
       uv run --no-sync pytest tests/integration/test_memcached_integration.py -q \\
         --allow-hosts=localhost,127.0.0.1,::1
 
@@ -39,7 +39,7 @@ pytestmark = [
     pytest.mark.skipif(
         not os.environ.get("SCRAPY_TEST_MEMCACHED_HOST"),
         reason=(
-            "Set SCRAPY_TEST_MEMCACHED_HOST (e.g. localhost) to run Memcached "
+            "Set SCRAPY_TEST_MEMCACHED_HOST (e.g. 127.0.0.1) to run Memcached "
             "integration tests against a live instance."
         ),
     ),

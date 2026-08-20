@@ -152,7 +152,16 @@ def _exact_nonnegative_int(value: object) -> int:
 
 
 def _validate_shards(response: object, *, require_success: bool) -> None:
-    """Reject missing, malformed, partial, or failed shard acknowledgements."""
+    """Validate the shard accounting for one Elasticsearch response.
+
+    Elasticsearch reports the configured shard copies in ``total``.  On a
+    single-node yellow cluster that includes an unassigned replica, so a normal
+    primary write/refresh can legitimately be ``total=2, successful=1,
+    failed=0``.  Mutation and refresh responses therefore require a successful
+    primary and no failures, but do not require every configured replica to be
+    acknowledged.  Reads retain exact accounting: accepting a partial search or
+    count would make an incomplete result look authoritative.
+    """
     response_body = _response_mapping(response)
     shards = response_body.get("_shards")
     if not isinstance(shards, Mapping):
@@ -161,18 +170,48 @@ def _validate_shards(response: object, *, require_success: bool) -> None:
     successful = _exact_nonnegative_int(shards.get("successful"))
     failed = _exact_nonnegative_int(shards.get("failed"))
     skipped = _exact_nonnegative_int(shards.get("skipped", 0))
-    if failed != 0 or successful + failed != total or skipped > successful:
-        raise _ElasticSearchResponseError
-    if require_success and successful == 0:
+
+    # These checks apply to every operation.  In particular, a response cannot
+    # claim more successful or failed shards than were targeted, and a failure
+    # detail is never an acceptable proof of a mutation outcome.
+    if failed != 0 or successful + failed > total or skipped > successful:
         raise _ElasticSearchResponseError
     failures = shards.get("failures", [])
     if not isinstance(failures, list) or failures:
         raise _ElasticSearchResponseError
 
+    if require_success:
+        # Primary acknowledgement is sufficient for writes and refreshes.  This
+        # is the real single-node yellow response (2 configured copies, 1 active
+        # primary), not a malformed partial response.
+        if successful == 0:
+            raise _ElasticSearchResponseError
+    elif successful + failed != total:
+        # Search/count/pop must prove that every targeted shard was accounted for.
+        raise _ElasticSearchResponseError
+
 
 def _validate_refresh_response(response: object) -> None:
-    """Require refresh to acknowledge every targeted shard without failures."""
+    """Require refresh to acknowledge a successful primary without failures."""
     _validate_shards(response, require_success=True)
+
+
+def _validate_index_create_response(response: object, *, expected_index: str) -> None:
+    """Require the SDK's index-create acknowledgement to prove readiness.
+
+    ``acknowledged=False`` or ``shards_acknowledged=False`` means the create
+    request timed out before Elasticsearch proved the cluster-state/shard
+    transition.  The index may eventually exist, but connection startup must not
+    claim it is ready.  The returned index name is checked as an additional guard
+    against a response for a different request or a malformed test/SDK payload.
+    """
+    response_body = _response_mapping(response)
+    if (
+        response_body.get("acknowledged") is not True
+        or response_body.get("shards_acknowledged") is not True
+        or response_body.get("index") != expected_index
+    ):
+        raise _ElasticSearchResponseError
 
 
 def _validate_mutation_identity(
@@ -861,7 +900,9 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         so the existence-check path raised ``BadRequestError`` on every connect.
         Try-create is version-robust: ES replies ``resource_already_exists_exception``
         (HTTP 400) when the index is already there, which is the idempotent
-        success path; any other 400 (invalid name, mapping error) is re-raised.
+        success path.  For a newly created index, the SDK response must confirm
+        ``acknowledged``, ``shards_acknowledged``, and the expected index name;
+        any other 400 (invalid name, mapping error) is re-raised.
         """
         active_client = client if client is not None else self._client
         if active_client is None:
@@ -876,7 +917,8 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             snapshot.storage_index,
         ):
             try:
-                active_client.indices.create(index=name)
+                response = active_client.indices.create(index=name)
+                _validate_index_create_response(response, expected_index=name)
             except RequestError as e:
                 # HTTP 400 resource_already_exists_exception = idempotent success
                 # (index created by a prior connect or a peer worker). Anything else
@@ -2052,6 +2094,17 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
         index: str,
         query: dict[str, Any],
     ) -> None:
-        """Delete matching documents using only the supplied generation."""
+        """Delete matching documents with visibility barriers on both sides.
+
+        The pre-delete refresh makes all successful writes eligible for the
+        delete-by-query snapshot.  The post-delete refresh keeps the deletion
+        visible to subsequent searches/counts immediately.  Both barriers are
+        validated; a malformed or failed barrier is not treated as a successful
+        clear.
+        """
+        refresh_response = generation.client.indices.refresh(index=index)
+        _validate_refresh_response(refresh_response)
         response = generation.mutation_client.delete_by_query(index=index, query=query)
         _validate_delete_by_query_response(response)
+        refresh_response = generation.client.indices.refresh(index=index)
+        _validate_refresh_response(refresh_response)

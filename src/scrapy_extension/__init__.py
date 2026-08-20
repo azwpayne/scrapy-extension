@@ -38,6 +38,7 @@ from scrapy_extension.dupefilter.filters.set_filter import SetMembershipFilter
 from scrapy_extension.exceptions import (
     BackendConnectionError,
     BackendError,
+    BackendOperationTimeout,
     ConfigurationError,
     QueueError,
     QueueOutcomeIndeterminateError,
@@ -277,6 +278,7 @@ __all__ = [
     "BackendDupeFilter",
     # Exceptions
     "BackendError",
+    "BackendOperationTimeout",
     "BackendPipeline",
     # Components
     "BackendQueue",

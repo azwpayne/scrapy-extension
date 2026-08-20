@@ -38,6 +38,20 @@ class BackendError(Exception):
     """
 
 
+class BackendOperationTimeout(BackendError):
+    """A bounded reactor-facing backend operation exceeded its wait budget.
+
+    The worker performing a synchronous third-party SDK call may still be
+    unwinding after this error is delivered to the reactor. Callers must keep
+    operation ordering/ownership fences in place until that worker completes.
+    """
+
+    def __init__(self, operation: str, timeout: float) -> None:
+        super().__init__(f"Backend operation timed out: {operation}.")
+        self.operation = operation
+        self.timeout = timeout
+
+
 class BackendConnectionError(BackendError):
     """Exception raised for connection-related errors.
 

@@ -12,9 +12,10 @@ from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
 from scrapy_extension.exceptions import BackendConnectionError, QueueError
 from scrapy_extension.settings.elasticsearch import ElasticSearchSettings
 
-_SHARDS = {"total": 1, "successful": 1, "failed": 0}
-_INDEX_RESPONSE = {"result": "created", "_shards": _SHARDS}
-_DELETE_RESPONSE = {"result": "deleted", "_shards": _SHARDS}
+_MUTATION_SHARDS = {"total": 2, "successful": 1, "failed": 0}
+_READ_SHARDS = {"total": 1, "successful": 1, "failed": 0}
+_INDEX_RESPONSE = {"result": "created", "_shards": _MUTATION_SHARDS}
+_DELETE_RESPONSE = {"result": "deleted", "_shards": _MUTATION_SHARDS}
 
 
 def _index_response(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -35,6 +36,12 @@ def _delete_response(kwargs: dict[str, Any]) -> dict[str, Any]:
 
 def _adapt_elasticsearch_client_mock(client: Any) -> Any:
     client.options.return_value = client
+    if client.indices.create.side_effect is None:
+        client.indices.create.side_effect = lambda **kwargs: {
+            "acknowledged": True,
+            "shards_acknowledged": True,
+            "index": kwargs["index"],
+        }
     return client
 
 
@@ -52,7 +59,7 @@ def _injected_backend(mocker: Any, **settings: Any) -> tuple[ElasticSearchBacken
     client = _adapt_elasticsearch_client_mock(mocker.MagicMock())
     client.index.side_effect = lambda **kwargs: _index_response(kwargs)
     client.delete.side_effect = lambda **kwargs: _delete_response(kwargs)
-    client.indices.refresh.return_value = {"_shards": _SHARDS}
+    client.indices.refresh.return_value = {"_shards": _MUTATION_SHARDS}
     backend._client = client
     backend._connection_snapshot = backend._capture_connection_snapshot()
     return backend, client
@@ -111,7 +118,7 @@ def test_pop_search_delete_uses_one_generation_lease(mocker: Any) -> None:
         assert release_search.wait(timeout=2)
         return {
             "timed_out": False,
-            "_shards": _SHARDS,
+            "_shards": _READ_SHARDS,
             "hits": {
                 "total": {"value": 1, "relation": "eq"},
                 "hits": [

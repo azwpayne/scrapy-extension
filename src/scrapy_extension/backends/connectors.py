@@ -24,6 +24,7 @@ import math
 import os
 import sys
 import threading
+import time
 from abc import ABC
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping
@@ -86,6 +87,10 @@ from scrapy_extension.utils._config import (
     parse_float_setting,
     parse_int_setting,
 )
+from scrapy_extension.utils.reactor import (
+    DEFAULT_REACTOR_IO_TIMEOUT_S,
+    MAX_REACTOR_IO_TIMEOUT_S,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -125,15 +130,17 @@ _BUNDLED_BACKEND_TYPES: frozenset[str] = frozenset(
     backend_type.value for backend_type in BackendType
 )
 _CONNECTION_MANAGER_SETTING_NAMES: frozenset[str] = frozenset(
-    {"retry_attempts", "retry_delay"}
+    {"retry_attempts", "retry_delay", "reactor_io_timeout"}
 )
 _CONNECTION_MANAGER_INTERNAL_KEYS: dict[str, str] = {
     "retry_attempts": "__connection_manager_retry_attempts",
     "retry_delay": "__connection_manager_retry_delay",
+    "reactor_io_timeout": "__connection_manager_reactor_io_timeout",
 }
 _CONNECTION_MANAGER_DIRECT_KEYS: dict[str, str] = {
     "retry_attempts": "manager_retry_attempts",
     "retry_delay": "manager_retry_delay",
+    "reactor_io_timeout": "manager_reactor_io_timeout",
 }
 # Registry-only discriminator used by components whose backend owns mutable
 # consumer state tied to one logical queue. It participates in ``_registry_key``
@@ -149,10 +156,12 @@ _CONSUMER_SCOPED_BACKENDS = CONSUMER_SCOPED_BACKENDS
 _CONNECTION_MANAGER_SCRAPY_KEYS: dict[str, str] = {
     "retry_attempts": "SCRAPY_RETRY_ATTEMPTS",
     "retry_delay": "SCRAPY_RETRY_DELAY",
+    "reactor_io_timeout": "SCRAPY_REACTOR_IO_TIMEOUT",
 }
 _CONNECTION_MANAGER_DEFAULTS: dict[str, int | float] = {
     "retry_attempts": 3,
     "retry_delay": 1.0,
+    "reactor_io_timeout": DEFAULT_REACTOR_IO_TIMEOUT_S,
 }
 _CONNECTION_MANAGER_CIRCUIT_BREAKER_INTERNAL_KEYS: dict[str, str] = {
     "enabled": "__connection_manager_circuit_breaker_enabled",
@@ -180,6 +189,7 @@ _CONNECTION_MANAGER_BACKEND_EXCLUDED_KEYS: frozenset[str] = frozenset(
 _MANAGER_CONFIGURATION_SETTING_NAMES: frozenset[str] = frozenset(
     {
         "SCRAPY_BACKEND_TYPE",
+        "SCRAPY_REACTOR_IO_TIMEOUT",
         "SCRAPY_CIRCUIT_BREAKER_ENABLED",
         "SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD",
         "SCRAPY_CIRCUIT_BREAKER_RESET_TIMEOUT",
@@ -187,11 +197,13 @@ _MANAGER_CONFIGURATION_SETTING_NAMES: frozenset[str] = frozenset(
         "backend_settings",
         "retry_attempts",
         "retry_delay",
+        "reactor_io_timeout",
     }
 )
 _RESOLVED_BACKEND_SETTING_NAMES: frozenset[str] = frozenset(
     {
         "SCRAPY_BACKEND_TYPE",
+        "SCRAPY_REACTOR_IO_TIMEOUT",
         "SCRAPY_QUEUE_BACKEND_TYPE",
         "SCRAPY_SET_BACKEND_TYPE",
         "SCRAPY_STORAGE_BACKEND_TYPE",
@@ -1846,7 +1858,17 @@ class ConnectionManagerLease:
 
     def release(self) -> None:
         """Release this exact acquire; repeated calls are idempotent."""
-        self._manager._release_acquire(self._token)
+        try:
+            self._manager._release_acquire(self._token)
+        except BaseException:
+            # The lease object may be lost immediately after a factory rollback.
+            # Keep it reachable through the manager/registry until a later owner
+            # can retry the same opaque token; never turn an active users=1 hold
+            # into an unreachable leak.
+            self._manager._retain_failed_lease(self)
+            raise
+        else:
+            self._manager._forget_failed_lease(self)
 
 
 class ConnectionManager:
@@ -1888,6 +1910,13 @@ class ConnectionManager:
     # One-shot guard for the "registry over cap with all entries live" warning
     # so we don't spam logs on every get_manager() once the cap is saturated.
     _over_cap_warned: ClassVar[bool] = False
+    # Failed factory rollback must not make an exact lease unreachable. These
+    # package-owned records keep the manager alive until a later registry pass
+    # can retry the same token; they are intentionally separate from active
+    # registry entries and never consume a peer's acquire.
+    _pending_release_leases: ClassVar[list[ConnectionManagerLease]] = []
+    _pending_release_managers: ClassVar[list[ConnectionManager]] = []
+    _pending_release_retry_threads: ClassVar[set[int]] = set()
     #: Cap on the registry size. 32 is comfortably above any realistic
     #: single-process multi-backend coexistence (10 bundled backends x 3
     #: components) while bounding the worst-case leak from settings churn to
@@ -1988,6 +2017,7 @@ class ConnectionManager:
         self._registry_backend_type: str | None = None
         self._registry_settings: dict[str, Any] | None = None
         self._backend: Backend | None = None
+        self._connection_generation = 0
         self._lock = threading.Lock()
         # Serialize the complete create/connect/publish transaction. The lazy
         # ``backend`` property already elects one owner among property callers, but
@@ -2011,6 +2041,9 @@ class ConnectionManager:
         # count only and is always synchronized from ``_active_acquires``.
         self._active_acquires: set[object] = set()
         self._legacy_acquires: list[object] = []
+        # ``get_manager`` retains this per-thread handoff briefly so a composite
+        # owner that needs exact rollback can adopt the token it just acquired.
+        self._legacy_acquire_handoffs: dict[int, list[object]] = {}
         self._users: int = 0
         # Retirement is a repairable generation state.  Removing the final token
         # and publishing ``_retired`` happen atomically under ``_registry_lock``;
@@ -2074,18 +2107,108 @@ class ConnectionManager:
         return self.settings
 
     @classmethod
+    def _retain_failed_lease(cls, lease: ConnectionManagerLease) -> None:
+        """Keep one failed exact release reachable for a later retry."""
+        with cls._registry_lock:
+            if not any(existing is lease for existing in cls._pending_release_leases):
+                cls._pending_release_leases.append(lease)
+
+    @classmethod
+    def _forget_failed_lease(cls, lease: ConnectionManagerLease) -> None:
+        """Drop a failed-release record after the exact token is settled."""
+        with cls._registry_lock:
+            cls._pending_release_leases = [
+                existing
+                for existing in cls._pending_release_leases
+                if existing is not lease
+            ]
+
+    @classmethod
+    def _retain_failed_manager(cls, manager: ConnectionManager) -> None:
+        """Keep a legacy manager finalizer reachable after interruption."""
+        with cls._registry_lock:
+            if not any(
+                existing is manager for existing in cls._pending_release_managers
+            ):
+                cls._pending_release_managers.append(manager)
+
+    @classmethod
+    def _forget_failed_manager(cls, manager: ConnectionManager) -> None:
+        """Drop a legacy finalizer record after retirement is published."""
+        with cls._registry_lock:
+            cls._pending_release_managers = [
+                existing
+                for existing in cls._pending_release_managers
+                if existing is not manager
+            ]
+
+    @classmethod
+    def retry_pending_releases(cls) -> None:
+        """Retry exact factory rollbacks without consuming unrelated holds."""
+        thread_id = threading.get_ident()
+        with cls._registry_lock:
+            if thread_id in cls._pending_release_retry_threads:
+                return
+            cls._pending_release_retry_threads.add(thread_id)
+            leases = tuple(cls._pending_release_leases)
+            managers = tuple(cls._pending_release_managers)
+        try:
+            for lease in leases:
+                try:
+                    lease.release()
+                except BaseException:
+                    pass
+            for manager in managers:
+                try:
+                    manager.close()
+                except BaseException:
+                    pass
+        finally:
+            with cls._registry_lock:
+                cls._pending_release_retry_threads.discard(thread_id)
+
+    @classmethod
     def get_manager(
         cls,
         backend_type: str,
         settings: dict[str, Any] | None = None,
     ) -> ConnectionManager:
         """Get a shared manager and register one legacy ``close()`` acquire."""
-        manager, _ = cls._get_manager_with_token(
+        manager, token = cls._get_manager_with_token(
             backend_type,
             settings,
             legacy=True,
         )
         return manager
+
+    @classmethod
+    def _adopt_latest_legacy_lease(
+        cls,
+        manager: ConnectionManager,
+    ) -> ConnectionManagerLease | None:
+        """Adopt the current thread's just-created legacy token exactly once."""
+        if not isinstance(manager, cls):
+            return None
+        try:
+            handoffs = manager._legacy_acquire_handoffs
+        except AttributeError:
+            return None
+        with cls._registry_lock:
+            handoff = handoffs.get(threading.get_ident())
+            while handoff:
+                token = handoff.pop()
+                if token in manager._active_acquires:
+                    try:
+                        manager._legacy_acquires.remove(token)
+                    except ValueError:
+                        pass
+                    if not handoff:
+                        manager._legacy_acquire_handoffs.pop(
+                            threading.get_ident(), None
+                        )
+                    return ConnectionManagerLease(manager, token)
+            manager._legacy_acquire_handoffs.pop(threading.get_ident(), None)
+        return None
 
     @classmethod
     def acquire_lease(
@@ -2110,6 +2233,7 @@ class ConnectionManager:
         legacy: bool,
     ) -> tuple[ConnectionManager, object]:
         """Acquire one pooled manager and publish one opaque ownership token."""
+        cls.retry_pending_releases()
         thread_id = threading.get_ident()
         acquire_token = object()
         with cls._registry_lock:
@@ -2317,6 +2441,9 @@ class ConnectionManager:
         manager._active_acquires.add(token)
         if legacy:
             manager._legacy_acquires.append(token)
+            manager._legacy_acquire_handoffs.setdefault(
+                threading.get_ident(), []
+            ).append(token)
         manager._users = len(manager._active_acquires)
 
     @classmethod
@@ -2375,6 +2502,7 @@ class ConnectionManager:
         with cls._registry_lock:
             manager._active_acquires.clear()
             manager._legacy_acquires.clear()
+            manager._legacy_acquire_handoffs.clear()
             manager._users = 0
             manager._retired = True
             manager._retirement_event.set()
@@ -2653,8 +2781,7 @@ class ConnectionManager:
             # ``finally`` while that failure was being propagated.
             lazy_terminal_error: BaseException | None = None
             try:
-                with self._connect_lock:
-                    self._connect_with_retries(monitor_events)
+                self._run_connect_transaction(monitor_events)
             except BaseException as error:
                 lazy_terminal_error = error
             else:
@@ -2678,8 +2805,7 @@ class ConnectionManager:
 
         terminal_error: BaseException | None = None
         try:
-            with self._connect_lock:
-                self._connect_with_retries(monitor_events)
+            self._run_connect_transaction(monitor_events)
         except BaseException as error:
             # Capture every terminal result, including control-flow exceptions, so
             # the handler ends before user-extensible monitor callbacks run. A
@@ -2769,71 +2895,71 @@ class ConnectionManager:
             backend_type=str(self._backend_type_for_operations()),
         )
 
-    def _connect_with_retries(self, monitor_events: list[_MonitorEvent]) -> None:
-        """Run one serialized transaction and record deferred monitor events."""
-        stale_backend: Backend | None = None
-        retired_adapter: _DeferredAckPluginQueueBackend | None = None
-        retired_source: tuple[Backend, CircuitBreaker | None] | None = None
+    def _detach_stale_backend(self) -> tuple[Backend | None, int | None]:
+        """Detach an unhealthy generation without invoking its driver callback."""
+        with self._lock:
+            if self._retired:
+                raise BackendConnectionError(
+                    "Cannot connect a released ConnectionManager",
+                    backend_type=str(self._backend_type_for_operations()),
+                )
+            backend = self._backend
+            generation = self._connection_generation
+        if backend is None:
+            return None, None
+
+        health_check_failed = False
+        try:
+            connected = backend.is_connected()
+        except Exception:
+            connected = False
+            health_check_failed = True
+        if health_check_failed:
+            _log_diagnostic(
+                logger.debug,
+                "Backend health check failed before reconnect",
+            )
+
+        with self._lock:
+            if self._retired:
+                raise BackendConnectionError(
+                    "Cannot connect a released ConnectionManager",
+                    backend_type=str(self._backend_type_for_operations()),
+                )
+            # The probe ran unlocked. Reconcile by identity and generation rather
+            # than applying a stale health result to a replacement candidate.
+            if (
+                self._backend is not backend
+                or self._connection_generation != generation
+            ):
+                return None, None
+            if connected:
+                return None, None
+            self._backend = None
+            retired_adapter, retired_source = (
+                self._detach_plugin_queue_backend_under_lock()
+            )
+            # Keep these strong locals alive until this method returns and the
+            # state-lock critical section is over; token destructors are plugin code.
+            if self._breaker is not None:
+                self._breaker = self._breaker.new_generation()
+            self._connection_generation += 1
+            return backend, self._connection_generation
+
+    def _run_connect_transaction(self, monitor_events: list[_MonitorEvent]) -> None:
+        """Serialize connection work, but disconnect stale generations unlocked."""
         while True:
-            with self._lock:
-                if self._retired:
-                    raise BackendConnectionError(
-                        "Cannot connect a released ConnectionManager",
-                        backend_type=str(self._backend_type_for_operations()),
-                    )
-                backend = self._backend
-            if backend is None:
-                break
-
-            # A published object can outlive its network connection. Run the health
-            # probe outside ``_lock`` because Redis/MongoDB/ElasticSearch probes may
-            # perform network I/O; holding the shared state lock here would block
-            # close() and peer access for the entire timeout window.
-            health_check_failed = False
-            try:
-                connected = backend.is_connected()
-            except Exception:
-                connected = False
-                health_check_failed = True
-            if health_check_failed:
-                # Leave the health-probe handler before diagnostics.  Logging handlers
-                # are application code and must not inherit the driver's raw failure
-                # through ``sys.exc_info()``.
-                _log_diagnostic(
-                    logger.debug,
-                    "Backend health check failed before reconnect",
+            with self._connect_lock:
+                stale_backend, stale_generation = self._connect_with_retries(
+                    monitor_events,
+                    defer_stale_disconnect=True,
                 )
+            if stale_backend is None:
+                return
 
-            with self._lock:
-                if self._retired:
-                    raise BackendConnectionError(
-                        "Cannot connect a released ConnectionManager",
-                        backend_type=str(self._backend_type_for_operations()),
-                    )
-                # Re-check identity after the unlocked health probe. A lifecycle race
-                # may have detached the inspected backend; retry against current state
-                # instead of publishing a decision about an obsolete object.
-                if self._backend is not backend:
-                    continue
-                if connected:
-                    return
-                self._backend = None
-                retired_adapter, retired_source = (
-                    self._detach_plugin_queue_backend_under_lock()
-                )
-                # Backend and breaker form one connection generation. Replace the
-                # breaker while holding the same state lock that detaches the backend
-                # so interface accessors can validate a coherent pair. Performing this
-                # later, after disconnect(), exposes ``None/old-breaker`` and then
-                # ``replacement/old-breaker`` windows to racing accessors.
-                if self._breaker is not None:
-                    self._breaker = self._breaker.new_generation()
-                stale_backend = backend
-                break
-
-        # Drop token-owning adapter state only after the generation lock is free.
-        del retired_adapter, retired_source
-        if stale_backend is not None:
+            # Driver teardown is arbitrary application I/O.  In particular it may
+            # recursively call connect() or close(); neither may wait on this
+            # manager's non-reentrant connect lock.
             stale_disconnect_failed = False
             try:
                 stale_backend.disconnect()
@@ -2844,9 +2970,57 @@ class ConnectionManager:
             monitor_events.append(
                 ("on_disconnect", (str(self._backend_type_for_operations()), None))
             )
+            with self._lock:
+                if self._retired:
+                    raise BackendConnectionError(
+                        "ConnectionManager was released while reconnecting",
+                        backend_type=str(self._backend_type_for_operations()),
+                    )
+                # A recursive/concurrent connect may have published a fresh
+                # generation while disconnect ran. The next serialized pass then
+                # health-checks that exact candidate instead of overwriting it.
+                if (
+                    stale_generation is not None
+                    and self._connection_generation != stale_generation
+                ):
+                    continue
+
+    def _connect_with_retries(
+        self,
+        monitor_events: list[_MonitorEvent],
+        *,
+        defer_stale_disconnect: bool = False,
+    ) -> tuple[Backend | None, int | None]:
+        """Run one transaction and optionally return stale work to its owner."""
+        stale_backend, stale_generation = self._detach_stale_backend()
+        if stale_backend is not None:
+            if defer_stale_disconnect:
+                return stale_backend, stale_generation
+            stale_disconnect_failed = False
+            try:
+                stale_backend.disconnect()
+            except Exception:
+                stale_disconnect_failed = True
+            if stale_disconnect_failed:
+                _log_diagnostic(logger.warning, "Error disconnecting stale backend")
+            monitor_events.append(
+                ("on_disconnect", (str(self._backend_type_for_operations()), None))
+            )
+        with self._lock:
+            if self._retired:
+                raise BackendConnectionError(
+                    "Cannot connect a released ConnectionManager",
+                    backend_type=str(self._backend_type_for_operations()),
+                )
+            if self._backend is not None:
+                return None, None
 
         retry_attempts, retry_delay = self._retry_policy()
         total_attempts = retry_attempts + 1
+        # Scheduler-facing synchronous APIs cannot yield while the manager is
+        # reconnecting. Bound only the retry *wait* here; the selected backend's
+        # own socket/RPC timeout remains responsible for bounding one attempt.
+        retry_deadline = time.monotonic() + self._reactor_io_timeout()
 
         failed_attempt = False
         for attempt in range(total_attempts):
@@ -2894,9 +3068,15 @@ class ConnectionManager:
                             (str(self._backend_type_for_operations()), attempt + 1),
                         )
                     )
+                    remaining = retry_deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
                     interrupted = _wait_for_retry_backoff(
                         self._retirement_event,
-                        compute_full_jitter_backoff(attempt, retry_delay),
+                        min(
+                            remaining,
+                            compute_full_jitter_backoff(attempt, retry_delay),
+                        ),
                     )
                     if interrupted:
                         break
@@ -2909,7 +3089,7 @@ class ConnectionManager:
             monitor_events.append(
                 ("on_connect", (str(self._backend_type_for_operations()),))
             )
-            return
+            return None, None
 
         if failed_attempt:
             attempt_word = "attempt" if total_attempts == 1 else "attempts"
@@ -2917,6 +3097,7 @@ class ConnectionManager:
                 f"Failed to connect after {total_attempts} {attempt_word}.",
                 backend_type=str(self._backend_type_for_operations()),
             )
+        return None, None
 
     def _retry_policy(self) -> tuple[int, float]:
         """Normalize and validate generic connection retry controls.
@@ -3025,6 +3206,41 @@ class ConnectionManager:
             raise policy_error
         return retry_attempts, retry_delay
 
+    def _reactor_io_timeout(self) -> float:
+        """Read the finite manager retry-wait budget.
+
+        This is deliberately separate from ``_retry_policy`` so existing
+        third-party callers/tests that consume its two-value return contract do
+        not change. The setting is also consumed by the Deferred adapters for
+        lifecycle and pipeline calls.
+        """
+        settings = self._settings_for_operations()
+        raw_timeout = settings.get(
+            _CONNECTION_MANAGER_INTERNAL_KEYS["reactor_io_timeout"],
+            settings.get(
+                _CONNECTION_MANAGER_DIRECT_KEYS["reactor_io_timeout"],
+                settings.get(
+                    "reactor_io_timeout",
+                    _CONNECTION_MANAGER_DEFAULTS["reactor_io_timeout"],
+                ),
+            ),
+        )
+        try:
+            if isinstance(raw_timeout, bool):
+                raise ValueError
+            timeout = float(raw_timeout)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ConfigurationError(
+                "reactor_io_timeout must be finite and between 0 and 60 seconds",
+                setting_name="SCRAPY_REACTOR_IO_TIMEOUT",
+            ) from exc
+        if not math.isfinite(timeout) or not 0 < timeout <= MAX_REACTOR_IO_TIMEOUT_S:
+            raise ConfigurationError(
+                "reactor_io_timeout must be finite and between 0 and 60 seconds",
+                setting_name="SCRAPY_REACTOR_IO_TIMEOUT",
+            )
+        return timeout
+
     def _attempt_connection(self) -> None:
         """Attempt a single connection.
 
@@ -3066,6 +3282,7 @@ class ConnectionManager:
         with self._lock:
             if not self._retired:
                 self._backend = backend
+                self._connection_generation += 1
                 return
 
         # The final holder released while backend.connect() was in flight. Dispose
@@ -3103,22 +3320,38 @@ class ConnectionManager:
                     return
                 self._retired = True
                 self._retirement_event.set()
-            self._finalize_retirement()
+            try:
+                self._finalize_retirement()
+            except BaseException:
+                cls._retain_failed_manager(self)
+                raise
             return
 
         should_finalize = False
-        with cls._registry_lock:
-            # Claim and consume the exact legacy token in one registry transaction.
-            # Two concurrent close() calls therefore cannot both select the same
-            # token and accidentally leave a distinct legacy acquire active.
-            legacy_token = self._legacy_acquires[0] if self._legacy_acquires else None
-            if legacy_token is not None:
-                should_finalize = self._release_acquire_under_lock(legacy_token)
-            elif self._retired:
-                # Repair a prior final-release interruption without consuming a peer.
-                should_finalize = not self._retirement_complete
+        try:
+            with cls._registry_lock:
+                # Claim and consume the exact legacy token in one registry
+                # transaction. Two concurrent close() calls therefore cannot both
+                # select the same token and accidentally leave a distinct legacy
+                # acquire active.
+                legacy_token = (
+                    self._legacy_acquires[0] if self._legacy_acquires else None
+                )
+                if legacy_token is not None:
+                    should_finalize = self._release_acquire_under_lock(legacy_token)
+                elif self._retired:
+                    # Repair a prior final-release interruption without consuming a
+                    # peer.
+                    should_finalize = not self._retirement_complete
+        except BaseException:
+            cls._retain_failed_manager(self)
+            raise
         if should_finalize:
-            self._finalize_retirement()
+            try:
+                self._finalize_retirement()
+            except BaseException:
+                cls._retain_failed_manager(self)
+                raise
 
     def _is_acquire_released(self, acquire_token: object) -> bool:
         """Return whether one opaque acquire token is no longer authoritative."""
@@ -3135,6 +3368,12 @@ class ConnectionManager:
             self._legacy_acquires.remove(acquire_token)
         except ValueError:
             pass
+        for thread_id, handoff in tuple(self._legacy_acquire_handoffs.items()):
+            self._legacy_acquire_handoffs[thread_id] = [
+                token for token in handoff if token is not acquire_token
+            ]
+            if not self._legacy_acquire_handoffs[thread_id]:
+                self._legacy_acquire_handoffs.pop(thread_id, None)
         self._users = len(self._active_acquires)
         if self._active_acquires:
             return False
@@ -3166,6 +3405,7 @@ class ConnectionManager:
             retired_source = self._retiring_adapter_source
             self._retiring_adapter = None
             self._retiring_adapter_source = None
+        type(self)._forget_failed_manager(self)
         # Plugin token destruction must remain outside the manager lock.
         del retired_adapter, retired_source
 
@@ -3207,6 +3447,7 @@ class ConnectionManager:
                 if self._retiring_backend is None and self._backend is not None:
                     self._retiring_backend = self._backend
                     self._backend = None
+                    self._connection_generation += 1
                 if self._retiring_adapter is None:
                     (
                         self._retiring_adapter,
@@ -3240,6 +3481,7 @@ class ConnectionManager:
                     if self._retiring_backend is None and self._backend is not None:
                         self._retiring_backend = self._backend
                         self._backend = None
+                        self._connection_generation += 1
                     if self._retiring_adapter is None:
                         (
                             self._retiring_adapter,
@@ -3317,6 +3559,7 @@ class ConnectionManager:
             for manager in managers:
                 manager._active_acquires.clear()
                 manager._legacy_acquires.clear()
+                manager._legacy_acquire_handoffs.clear()
                 manager._users = 0
                 manager._retired = True
                 manager._retirement_event.set()
@@ -3927,3 +4170,23 @@ class ConnectionManager:
         from scrapy_extension.backends.circuit_breaker import wrap_storage_backend
 
         return wrap_storage_backend(backend, breaker)
+
+
+def release_manager_acquire(owner: Any, *, exact: bool = False) -> None:
+    """Rollback one factory acquire while preserving the primary failure.
+
+    Release can fail before its token is consumed or after retirement has taken
+    effect. The opaque lease/manager APIs are idempotent, so one immediate retry
+    is safe and repairs both windows. If both attempts fail, the connection layer
+    retains the exact owner for a later registry retry; callers still receive the
+    first cleanup error so it cannot replace the factory's primary exception.
+    """
+    release = owner.release if exact else owner.close
+    try:
+        release()
+    except BaseException as first_error:
+        try:
+            release()
+        except BaseException:
+            pass
+        raise first_error

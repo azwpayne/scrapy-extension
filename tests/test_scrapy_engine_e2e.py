@@ -244,14 +244,15 @@ def test_response_then_callback_error_has_one_terminal_transition(
     assert not _events(engine_probe, "nack", url="/callback-error")
 
 
-def test_failed_push_rolls_back_dedup_reservation(
+def test_failed_push_is_not_reported_as_request_dropped(
     engine_probe: dict[str, Any],
 ) -> None:
+    """A transient push failure is not converted into request_dropped."""
     _only_event(engine_probe, "push_rejected", url="/dedup-push-failure")
-    _only_event(engine_probe, "push", url="/dedup-push-failure")
-    _only_event(engine_probe, "callback", url="/dedup-push-failure")
-    assert engine_probe["http_attempts"]["/dedup-push-failure"] == 1
-    assert len(_events(engine_probe, "request_dropped", url="/dedup-push-failure")) == 1
+    assert not _events(engine_probe, "push", url="/dedup-push-failure")
+    assert not _events(engine_probe, "callback", url="/dedup-push-failure")
+    assert engine_probe["http_attempts"].get("/dedup-push-failure", 0) == 0
+    assert not _events(engine_probe, "request_dropped", url="/dedup-push-failure")
 
 
 def test_engine_owns_dupefilter_lifecycle_once(

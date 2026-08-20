@@ -964,7 +964,11 @@ class TestEnqueueDedupReservation:
         scheduler._queue = queue
         request = Request("https://example.com/retry")
 
-        assert scheduler.enqueue_request(request) is False
+        if isinstance(push_error, SerializationError):
+            assert scheduler.enqueue_request(request) is False
+        else:
+            with pytest.raises(QueueError, match="not dropped"):
+                scheduler.enqueue_request(request)
         assert len(membership_filter) == 0
 
         assert scheduler.enqueue_request(request) is True
@@ -992,7 +996,8 @@ class TestEnqueueDedupReservation:
         request = Request("https://example.com/reentrant-reservation")
         monitor.bind(dupefilter, request)
 
-        assert scheduler.enqueue_request(request) is False
+        with pytest.raises(QueueError, match="not dropped"):
+            scheduler.enqueue_request(request)
         assert monitor.nested_results == [True]
         assert len(membership_filter) == 0
 
@@ -1025,7 +1030,8 @@ class TestEnqueueDedupReservation:
         )
         monitor.bind(scheduler, request)
 
-        assert scheduler.enqueue_request(request) is False
+        with pytest.raises(QueueError, match="not dropped"):
+            scheduler.enqueue_request(request)
         assert monitor.nested_results == [False]
         queue.ack.assert_not_called()
         assert request.meta["_backend_ack_token"] == "source-token"
@@ -1426,7 +1432,8 @@ class TestEnqueueDedupReservation:
         )
         request = Request("https://example.com/class-patched-push")
 
-        assert scheduler.enqueue_request(request) is False
+        with pytest.raises(QueueError, match="not dropped"):
+            scheduler.enqueue_request(request)
 
         patched_push.assert_called_once_with(request, priority=0)
         strategy.push.assert_not_called()
@@ -1549,7 +1556,8 @@ class TestEnqueueDedupReservation:
         scheduler._queue = queue
         request = Request("https://example.com/rollback-retry")
 
-        assert scheduler.enqueue_request(request) is False
+        with pytest.raises(QueueError, match="not dropped"):
+            scheduler.enqueue_request(request)
         membership_filter.add.assert_not_called()
         membership_filter.remove.assert_not_called()
 
@@ -1587,7 +1595,8 @@ class TestEnqueueDedupReservation:
         request = Request("https://example.com/degraded-reentry")
         monitor.bind(dupefilter, request)
 
-        assert scheduler.enqueue_request(request) is False
+        with pytest.raises(QueueError, match="not dropped"):
+            scheduler.enqueue_request(request)
         assert monitor.nested_results == [True]
         membership_filter.remove.assert_not_called()
 
@@ -1762,7 +1771,8 @@ class TestEnqueueDedupReservation:
         scheduler._queue = queue
 
         request = Request("https://example.com/no-reservation")
-        assert scheduler.enqueue_request(request) is False
+        with pytest.raises(QueueError, match="not dropped"):
+            scheduler.enqueue_request(request)
         membership_filter.add.assert_not_called()
         membership_filter.remove.assert_not_called()
 
@@ -1854,7 +1864,8 @@ class TestEnqueueDedupReservation:
         queue.push.side_effect = QueueError("queue unavailable")
         scheduler._queue = queue
 
-        assert scheduler.enqueue_request(Request("https://example.com/custom")) is False
+        with pytest.raises(QueueError, match="not dropped"):
+            scheduler.enqueue_request(Request("https://example.com/custom"))
         assert counts.get("scheduler/dupefilter_rollback_error") == 1
         assert counts.get("scheduler/queue_error") == 1
 
@@ -1961,10 +1972,14 @@ def test_dedup_outage_fallback_preserves_result_through_diagnostic_fault(
     else:
         stats.inc_value.side_effect = diagnostic_error
 
-    assert (
-        scheduler.enqueue_request(Request("https://example.com/dedup-fallback"))
-        is fallback_succeeds
-    )
+    if fallback_succeeds:
+        assert (
+            scheduler.enqueue_request(Request("https://example.com/dedup-fallback"))
+            is True
+        )
+    else:
+        with pytest.raises(QueueError, match="not dropped"):
+            scheduler.enqueue_request(Request("https://example.com/dedup-fallback"))
     queue.push.assert_called_once()
 
 
@@ -2007,7 +2022,8 @@ def test_enqueue_ordinary_rollback_failure_survives_diagnostic_fault(
     else:
         stats.inc_value.side_effect = diagnostic_error
 
-    assert scheduler.enqueue_request(Request("https://example.com/rollback")) is False
+    with pytest.raises(QueueError, match="not dropped"):
+        scheduler.enqueue_request(Request("https://example.com/rollback"))
     queue.push.assert_called_once()
 
 

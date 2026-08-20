@@ -55,7 +55,7 @@ class TestMemcachedBackendType:
     def test_settings_defaults(self) -> None:
         s = MemcachedSettings()
         assert s.mode is MemcachedMode.STANDALONE
-        assert s.host == "localhost"
+        assert s.host == "127.0.0.1"
         assert s.port == 11211
         assert s.allow_remote_plaintext is False
         assert s.connect_timeout == 5.0
@@ -124,7 +124,7 @@ class TestMemcachedConnect:
     def test_connect_creates_client_and_stats(self, mocker) -> None:
         b, client = _connected(mocker)
         memcached_mod.MemcachedClient.assert_called_once_with(
-            ("localhost", 11211),
+            ("127.0.0.1", 11211),
             connect_timeout=5.0,
             timeout=30.0,
             default_noreply=False,
@@ -192,7 +192,7 @@ class TestMemcachedConnect:
         b.connect()
 
         memcached_mod.MemcachedClient.assert_called_once_with(
-            ("localhost", 11211),
+            ("127.0.0.1", 11211),
             connect_timeout=5.0,
             timeout=30.0,
             default_noreply=False,

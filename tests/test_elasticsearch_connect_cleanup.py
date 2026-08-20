@@ -20,6 +20,12 @@ from scrapy_extension.settings.elasticsearch import ElasticSearchSettings
 
 def _adapt_elasticsearch_client_mock(client):
     client.options.return_value = client
+    if client.indices.create.side_effect is None:
+        client.indices.create.side_effect = lambda **kwargs: {
+            "acknowledged": True,
+            "shards_acknowledged": True,
+            "index": kwargs["index"],
+        }
     return client
 
 

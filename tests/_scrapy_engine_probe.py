@@ -333,8 +333,7 @@ class EngineProbeSpider(Spider):
             "/download-failure",
             "/download-failure-handled",
             "/download-failure-unhandled",
-            "/dedup-push-failure",
-            "/dedup-push-failure",
+            "/dedup-push-trigger",
         ):
             if path == "/download-failure-unhandled":
                 errback = None
@@ -358,6 +357,13 @@ class EngineProbeSpider(Spider):
         )
         if path == "/callback-error":
             raise RuntimeError("scripted callback failure")
+        if path == "/dedup-push-trigger":
+            yield Request(
+                f"{self.base_url}/dedup-push-failure",
+                callback=self.parse_response,
+                errback=self.download_error,
+            )
+            return
         yield {"url": response.url}
 
     def download_error(self, failure: Any) -> None:
@@ -420,6 +426,7 @@ def main() -> None:
 
         def capture_crawl_failure(failure: Any) -> None:
             crawl_failures.append(failure.getTraceback())
+            STATE.record("crawl_failure", error_type=type(failure.value).__name__)
 
         crawl_deferred.addErrback(capture_crawl_failure)
         process.start(install_signal_handlers=False)
@@ -428,10 +435,11 @@ def main() -> None:
         server.server_close()
         server_thread.join(timeout=2)
 
-    if crawl_failures:
-        raise RuntimeError("Crawler failed:\n" + "\n".join(crawl_failures))
-
+    # A terminal queue push failure is surfaced by the scheduler rather than
+    # converted into request_dropped. Keep any engine-level failure observable
+    # without turning this probe's process teardown into an opaque harness error.
     result = STATE.snapshot()
+    result["crawl_failure_count"] = len(crawl_failures)
     result["in_flight_tokens"] = BACKEND.in_flight_tokens()
     print(f"ENGINE_PROBE_RESULT={json.dumps(result, sort_keys=True)}")
 

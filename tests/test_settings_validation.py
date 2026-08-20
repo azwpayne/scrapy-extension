@@ -57,6 +57,33 @@ from scrapy_extension.settings.rabbitmq import RabbitMQMode
 from scrapy_extension.settings.rocketmq import RocketMQSettings
 from scrapy_extension.settings.sqs import SqsSettings
 
+
+class TestReactorLatencyPolicy:
+    """The synchronous Scrapy contract has an explicit bounded latency budget."""
+
+    def test_default_and_explicit_timeout(self) -> None:
+        assert Settings().reactor_io_timeout == 5.0
+        assert Settings(reactor_io_timeout=1.25).reactor_io_timeout == 1.25
+
+    @pytest.mark.parametrize("value", [0, -1, 60.1, float("inf")])
+    def test_timeout_is_bounded(self, value: float) -> None:
+        with pytest.raises(ValidationError):
+            Settings(reactor_io_timeout=value)
+
+
+class TestPipelineStorageErrorPolicy:
+    """The public settings model uses the fail-loud default consistently."""
+
+    def test_default_is_reliability_safe(self) -> None:
+        assert Settings().pipeline_max_storage_errors == 10
+
+    def test_none_requires_explicit_opt_in(self) -> None:
+        assert (
+            Settings(pipeline_max_storage_errors=None).pipeline_max_storage_errors
+            is None
+        )
+
+
 # ---------------------------------------------------------------------------
 # SV1 — Literal enum types (10 fields)
 # ---------------------------------------------------------------------------

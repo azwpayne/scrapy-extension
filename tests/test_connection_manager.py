@@ -2375,7 +2375,9 @@ def test_retirement_interrupts_retry_backoff_before_second_backend(mocker, teard
     wait_entered = threading.Event()
 
     def observed_wait(retirement_event, delay):
-        assert delay == 60
+        # Reactor-facing manager retries cap each wait to the configured
+        # SCRAPY_REACTOR_IO_TIMEOUT default (5s), even when retry_delay is 60s.
+        assert 0 < delay <= 5.0
         wait_entered.set()
         return retirement_event.wait(delay)
 

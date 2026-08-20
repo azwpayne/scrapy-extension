@@ -21,6 +21,58 @@ def _lease(mocker: MockerFixture, manager: object) -> object:
     return lease
 
 
+def test_default_queue_template_is_project_and_spider_namespaced() -> None:
+    from scrapy_extension.schedule.scheduler import _QueueComponentConfig
+
+    settings = ScrapySettings({"BOT_NAME": "acme"})
+    config = _QueueComponentConfig.from_early_settings(settings).with_queue_key(
+        settings,
+        spider_name="alpha",
+    )
+
+    assert config.queue_key == "scheduler-queue:acme:alpha"
+    assert config.project_name == "acme"
+    assert config.allow_cross_spider is False
+
+
+def test_identity_template_supports_deferred_spider_resolution() -> None:
+    from scrapy_extension.utils.identity import resolve_identity_template
+
+    assert (
+        resolve_identity_template(
+            "queue:{project}:{spider}",
+            project_name="acme",
+            spider_name=None,
+        )
+        == "queue:acme:{spider}"
+    )
+    assert (
+        resolve_identity_template(
+            "queue:{project}:{spider}",
+            project_name=None,
+            spider_name="alpha",
+        )
+        == "queue:{project}:alpha"
+    )
+
+
+def test_shared_queue_identity_fence_requires_explicit_opt_in() -> None:
+    from scrapy_extension.schedule.scheduler import _QueueComponentConfig
+
+    settings = ScrapySettings(
+        {
+            "BOT_NAME": "acme",
+            "SCRAPY_QUEUE_ALLOW_CROSS_SPIDER": True,
+        }
+    )
+    config = _QueueComponentConfig.from_early_settings(settings).with_queue_key(
+        settings,
+        spider_name="alpha",
+    )
+
+    assert config.allow_cross_spider is True
+
+
 def test_queue_component_config_parses_queue_values_immutably() -> None:
     """The staged snapshot retains every value passed to the queue seam."""
     from scrapy_extension.schedule.scheduler import _QueueComponentConfig

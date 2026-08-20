@@ -1883,9 +1883,12 @@ class TestConcurrentComponentGetters:
             ("get_queue", "scrapy_extension.queue.queue.BackendQueue"),
             (
                 "get_dupefilter",
-                "scrapy_extension.dupefilter.dupefilter.BackendDupeFilter",
+                "scrapy_extension.dupefilter.dupefilter.BackendDupeFilter.from_settings",
             ),
-            ("get_scheduler", "scrapy_extension.schedule.scheduler.BackendScheduler"),
+            (
+                "get_scheduler",
+                "scrapy_extension.schedule.scheduler.BackendScheduler.from_settings",
+            ),
         ),
     )
     def test_concurrent_getter_constructs_component_once(
@@ -1905,7 +1908,7 @@ class TestConcurrentComponentGetters:
         constructor_entered = threading.Event()
         release_constructor = threading.Event()
 
-        def construct(**_kwargs):
+        def construct(*_args, **_kwargs):
             constructor_entered.set()
             assert release_constructor.wait(timeout=2.0)
             return component
@@ -2139,19 +2142,20 @@ class TestCloseBackend:
         scheduler.close.side_effect = RuntimeError("scheduler failed")
         manager.close.side_effect = RuntimeError("manager failed")
 
-        spider.close_backend()
+        with pytest.raises(RuntimeError, match="disconnect failed"):
+            spider.close_backend()
 
-        assert spider._connected_signals is None
-        assert spider._signals_connected is False
-        assert spider._queue is None
-        assert spider._dupefilter is None
-        assert spider._scheduler is None
-        assert spider._connection_manager is None
+        assert spider._connected_signals is signal_manager
+        assert spider._signals_connected is True
+        assert spider._queue is queue
+        assert spider._dupefilter is dupefilter
+        assert spider._scheduler is scheduler
+        assert spider._connection_manager is manager
         assert signal_manager.disconnect.call_count == 2
         scheduler.close.assert_called_once_with("spider-mixin-close")
         queue.close.assert_called_once_with()
         dupefilter.close.assert_called_once_with("spider-mixin-close")
-        manager.close.assert_called_once_with()
+        manager.close.assert_not_called()
         assert caplog.text.count("Failed to disconnect backend lifecycle signal") == 2
 
     def test_continuation_logs_hide_active_teardown_errors_from_handlers(self, mocker):
@@ -2182,7 +2186,8 @@ class TestCloseBackend:
 
         spider_mixin_module.logger.addHandler(handler)
         try:
-            spider.close_backend()
+            with pytest.raises(RuntimeError, match=marker):
+                spider.close_backend()
 
             signal_spider = TestSpider()
             signal_spider.close_backend = mocker.MagicMock(  # type: ignore[method-assign]
@@ -2221,12 +2226,13 @@ class TestCloseBackend:
             side_effect=KeyboardInterrupt(),
         )
 
-        spider.close_backend()
+        with pytest.raises(RuntimeError, match="scheduler failed"):
+            spider.close_backend()
 
         scheduler.close.assert_called_once_with("spider-mixin-close")
         queue.close.assert_called_once_with()
         dupefilter.close.assert_called_once_with("spider-mixin-close")
-        manager.close.assert_called_once_with()
+        manager.close.assert_not_called()
 
     def test_close_backend_releases_manager_after_component_baseexception(self, mocker):
         """R47: Ctrl-C in one close hook cannot leak the shared manager acquire."""
@@ -2251,8 +2257,8 @@ class TestCloseBackend:
 
         queue.close.assert_called_once_with()
         dupefilter.close.assert_called_once_with("spider-mixin-close")
-        manager.close.assert_called_once_with()
-        assert spider._connection_manager is None
+        manager.close.assert_not_called()
+        assert spider._connection_manager is manager
 
     def test_close_backend_reraises_manager_baseexception_after_components(
         self, mocker
@@ -2710,17 +2716,10 @@ class TestSpiderMixinSnapshotPairing:
         assert queue._snapshot_connection_manager is None
         assert get_manager.call_count == 1
 
-    def test_get_scheduler_snapshot_pairing_remains_factory_path_only(
+    def test_get_scheduler_pairs_snapshot_manager_like_standard_factory(
         self, mocker, monkeypatch
     ) -> None:
-        """R135-C verification (SPEC): the mixin's get_scheduler builds
-        BackendScheduler directly rather than through the settings-driven
-        factory, so its scheduler carries no snapshot pairing — operators
-        pairing a stateful strategy with a queue-only backend through the
-        scheduler must use the SCHEDULER wiring (from_crawler ->
-        from_settings), which owns the pairing contract pinned in
-        test_scheduler_snapshot_storage_pairing.py. This test documents the
-        boundary; only get_queue pairs through the mixin."""
+        """R135-C: get_scheduler now shares the standard snapshot pairing path."""
         self._clear_env(monkeypatch)
         queue_manager = mocker.MagicMock(name="queue-manager", spec=ConnectionManager)
         get_manager = mocker.patch.object(
@@ -2743,8 +2742,9 @@ class TestSpiderMixinSnapshotPairing:
         spider.setup_backend()
         scheduler = spider.get_scheduler()
 
-        assert scheduler._snapshot_connection_manager is None
+        assert scheduler._snapshot_connection_manager is not None
         assert get_manager.call_count == 1
+        spider.close_backend()
 
 
 class TestIntegration:

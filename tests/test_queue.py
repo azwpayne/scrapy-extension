@@ -1,5 +1,6 @@
 """Tests for BackendQueue component."""
 
+import json
 import math
 from typing import Any, cast
 
@@ -15,7 +16,11 @@ from scrapy_extension.backends.base import (
 )
 from scrapy_extension.exceptions import QueueError, SerializationError
 from scrapy_extension.queue.queue import BackendQueue
-from scrapy_extension.queue.strategies.base import QueueStrategy, _PreparedQueuePush
+from scrapy_extension.queue.strategies.base import (
+    QueueStrategy,
+    _BoundQueueAckToken,
+    _PreparedQueuePush,
+)
 from scrapy_extension.queue.strategies.delay import DelayQueueStrategy
 from scrapy_extension.queue.strategies.priority import PriorityQueueStrategy
 from scrapy_extension.queue.strategies.ring_buffer import RingBufferQueueStrategy
@@ -248,6 +253,175 @@ class TestBackendQueueRequestToDict:
         assert result["priority"] == 0
         assert result["dont_filter"] is False
         assert result["flags"] == []
+
+    def test_request_envelope_is_fenced_to_spider_and_legacy_is_readable(
+        self, mock_connection_manager
+    ):
+        """Current envelopes cannot cross spiders; identity-free legacy data can."""
+        first = Spider(name="alpha")
+        second = Spider(name="beta")
+        first_queue = BackendQueue(
+            connection_manager=mock_connection_manager,
+            queue_name="shared-legacy",
+            spider=first,
+            project_name="project",
+        )
+        second_queue = BackendQueue(
+            connection_manager=mock_connection_manager,
+            queue_name="shared-legacy",
+            spider=second,
+            project_name="project",
+        )
+
+        envelope = first_queue._request_to_dict(Request("https://example.com"))
+        assert envelope["_scrapy_extension_project"] == "project"
+        assert envelope["_scrapy_extension_spider"] == "alpha"
+        with pytest.raises(QueueError, match="another spider/project"):
+            second_queue._validate_envelope_identity(envelope)
+
+        legacy_envelope = dict(envelope)
+        legacy_envelope.pop("_scrapy_extension_project")
+        legacy_envelope.pop("_scrapy_extension_spider")
+        second_queue._validate_envelope_identity(legacy_envelope)
+
+        shared_queue = BackendQueue(
+            connection_manager=mock_connection_manager,
+            queue_name="shared-legacy",
+            spider=second,
+            project_name="project",
+            allow_cross_spider=True,
+        )
+        shared_queue._validate_envelope_identity(envelope)
+
+        # Atomic-pop backends cannot nack, so the queue returns the untouched
+        # bytes to the same logical queue rather than consuming the other spider's
+        # request.
+        backend = mock_connection_manager.get_queue_backend()
+        backend.pop.return_value = second_queue._serializer.serialize(envelope)
+        assert second_queue.pop() is None
+        backend.push.assert_called_once()
+
+    def test_foreign_ack_delivery_is_nacked_for_its_owner(
+        self, mock_connection_manager, mocker
+    ):
+        first = Spider(name="alpha")
+        second = Spider(name="beta")
+        first_queue = BackendQueue(
+            connection_manager=mock_connection_manager,
+            queue_name="shared-legacy",
+            spider=first,
+            project_name="project",
+        )
+        second_queue = BackendQueue(
+            connection_manager=mock_connection_manager,
+            queue_name="shared-legacy",
+            spider=second,
+            project_name="project",
+        )
+        envelope = first_queue._request_to_dict(Request("https://example.com"))
+        data = second_queue._serializer.serialize(envelope)
+        token = _BoundQueueAckToken(
+            mock_connection_manager.get_queue_backend(),
+            "shared-legacy",
+            object(),
+        )
+        mocker.patch.object(second_queue, "_pop_with_ack", return_value=(data, token))
+
+        assert second_queue.pop() is None
+        mock_connection_manager.get_queue_backend().nack.assert_called_once()
+        assert token.state == "nacked"
+
+    @pytest.mark.parametrize("priority", [7, -3, 0])
+    def test_foreign_atomic_delivery_republishes_serialized_priority(
+        self, mock_connection_manager, priority
+    ):
+        owner = Spider(name="owner")
+        consumer = Spider(name="consumer")
+        owner_queue = BackendQueue(
+            connection_manager=mock_connection_manager,
+            queue_name="shared-legacy",
+            spider=owner,
+            project_name="project",
+        )
+        consumer_queue = BackendQueue(
+            connection_manager=mock_connection_manager,
+            queue_name="shared-legacy",
+            spider=consumer,
+            project_name="project",
+        )
+        envelope = owner_queue._request_to_dict(
+            Request("https://example.com/foreign", priority=priority)
+        )
+        data = consumer_queue._serializer.serialize(envelope)
+        backend = mock_connection_manager.get_queue_backend()
+        backend.pop.return_value = data
+
+        assert consumer_queue.pop() is None
+
+        backend.push.assert_called_once_with("shared-legacy", data, priority)
+        assert backend.push.call_args.args[2] == priority
+
+    @pytest.mark.parametrize(
+        "priority", [True, False, "bad", float("nan"), float("inf"), float("-inf")]
+    )
+    def test_foreign_malformed_priority_uses_poison_contract(
+        self, mock_connection_manager, priority
+    ):
+        consumer = Spider(name="consumer")
+        queue = BackendQueue(
+            connection_manager=mock_connection_manager,
+            queue_name="shared-legacy",
+            spider=consumer,
+            project_name="project",
+        )
+        data = json.dumps(
+            {
+                "_scrapy_extension_project": "other-project",
+                "_scrapy_extension_spider": "owner",
+                "priority": priority,
+            },
+            allow_nan=True,
+        ).encode()
+        backend = mock_connection_manager.get_queue_backend()
+        backend.pop.return_value = data
+
+        with pytest.raises(SerializationError):
+            queue.pop()
+
+        backend.push.assert_not_called()
+
+    def test_foreign_broker_delivery_is_nacked_without_republish(
+        self, mock_connection_manager, mocker
+    ):
+        owner = Spider(name="owner")
+        consumer = Spider(name="consumer")
+        owner_queue = BackendQueue(
+            connection_manager=mock_connection_manager,
+            queue_name="shared-legacy",
+            spider=owner,
+            project_name="project",
+        )
+        consumer_queue = BackendQueue(
+            connection_manager=mock_connection_manager,
+            queue_name="shared-legacy",
+            spider=consumer,
+            project_name="project",
+        )
+        envelope = owner_queue._request_to_dict(
+            Request("https://example.com/foreign", priority=-9)
+        )
+        data = consumer_queue._serializer.serialize(envelope)
+        token = _BoundQueueAckToken(
+            mock_connection_manager.get_queue_backend(),
+            "shared-legacy",
+            object(),
+        )
+        mocker.patch.object(consumer_queue, "_pop_with_ack", return_value=(data, token))
+
+        assert consumer_queue.pop() is None
+
+        mock_connection_manager.get_queue_backend().nack.assert_called_once()
+        mock_connection_manager.get_queue_backend().push.assert_not_called()
 
     def test_request_to_dict_strips_non_serializable_ack_token(
         self, mock_connection_manager, mock_spider

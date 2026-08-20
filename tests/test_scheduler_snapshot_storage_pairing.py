@@ -8,6 +8,7 @@ changing normal queue traffic or the legacy all-in-one backend behavior.
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import call
 
 import pytest
@@ -23,6 +24,14 @@ def _lease(mocker, manager):
     lease.manager = manager
     lease.release.side_effect = manager.close
     return lease
+
+
+def _assert_unresolved_queue_scope(acquire_call: Any) -> None:
+    assert acquire_call.kwargs["backend_type"] == "kafka"
+    scope = acquire_call.kwargs["settings"]["__connection_manager_queue_scope"]
+    assert isinstance(scope, str)
+    assert scope.startswith("unresolved-")
+    assert len(scope) == len("unresolved-") + 32
 
 
 def _settings(**overrides: object) -> Settings:
@@ -55,13 +64,8 @@ def test_queue_only_stateful_strategy_acquires_storage_snapshot_manager(
         _settings(SCRAPY_QUEUE_STRATEGY=strategy)
     )
 
-    assert get_manager.call_args_list == [
-        call(
-            backend_type="kafka",
-            settings={"__connection_manager_queue_scope": "scheduler-queue"},
-        ),
-        call(backend_type="redis", settings={}),
-    ]
+    _assert_unresolved_queue_scope(get_manager.call_args_list[0])
+    assert get_manager.call_args_list[1] == call(backend_type="redis", settings={})
     assert scheduler._snapshot_connection_manager is snapshot_manager
     assert scheduler._owns_snapshot_connection_manager is True
     scheduler.close("test-finished")
@@ -83,10 +87,8 @@ def test_passthrough_queue_only_strategy_does_not_acquire_snapshot_manager(
         _settings(SCRAPY_QUEUE_STRATEGY="passthrough")
     )
 
-    get_manager.assert_called_once_with(
-        backend_type="kafka",
-        settings={"__connection_manager_queue_scope": "scheduler-queue"},
-    )
+    assert get_manager.call_count == 1
+    _assert_unresolved_queue_scope(get_manager.call_args_list[0])
     assert scheduler._snapshot_connection_manager is None
     scheduler.close("test-finished")
     queue_manager.close.assert_called_once_with()
@@ -132,10 +134,8 @@ def test_legacy_queue_only_global_backend_keeps_best_effort_snapshot_skip(
         )
     )
 
-    get_manager.assert_called_once_with(
-        backend_type="kafka",
-        settings={"__connection_manager_queue_scope": "scheduler-queue"},
-    )
+    assert get_manager.call_count == 1
+    _assert_unresolved_queue_scope(get_manager.call_args_list[0])
     assert scheduler._snapshot_connection_manager is None
     scheduler.close("test-finished")
 
@@ -153,10 +153,8 @@ def test_explicit_storage_backend_without_storage_capability_stays_fail_fast(
     with pytest.raises(ConfigurationError, match="does not support the storage"):
         BackendScheduler.from_settings(_settings(SCRAPY_STORAGE_BACKEND_TYPE="kafka"))
 
-    get_manager.assert_called_once_with(
-        backend_type="kafka",
-        settings={"__connection_manager_queue_scope": "scheduler-queue"},
-    )
+    assert get_manager.call_count == 1
+    _assert_unresolved_queue_scope(get_manager.call_args_list[0])
     queue_manager.close.assert_called_once_with()
 
 

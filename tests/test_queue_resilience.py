@@ -193,6 +193,9 @@ def test_close_releases_strategy_after_snapshot_baseexception() -> None:
     queue = BackendQueue(
         connection_manager=_cm(), queue_name="q", queue_strategy=strategy
     )
+    # The auto-mocked storage value is an unreadable current checkpoint in this
+    # seam test; explicitly authorize the intended snapshot attempt first.
+    queue.reset_snapshot()
 
     with pytest.raises(KeyboardInterrupt) as raised:
         queue.close()

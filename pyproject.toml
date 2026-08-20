@@ -45,7 +45,7 @@ dependencies = [
     "pyasn1>=0.6.4,<0.7",
     "pydantic>=2.13.4,<3",
     "pydantic-settings>=2.15.0,<3",
-    "scrapy>=2.14.2,<3",
+    "scrapy>=2.17.0,<3",
     "typing-extensions>=4.16.0,<5",
 ]
 
@@ -84,10 +84,12 @@ all = [
 
 [dependency-groups]
 dev = [
+    "packaging>=26.0,<27",
     "poethepoet",
     "ruff",
 ]
 test = [
+    "packaging>=26.0,<27",
     "pytest",
     # Referenced by the root collection gate and warning policy, so the test
     # group must be independently runnable from an extracted sdist.

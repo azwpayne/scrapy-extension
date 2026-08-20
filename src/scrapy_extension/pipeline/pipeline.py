@@ -14,6 +14,9 @@ from functools import cached_property, wraps
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
 from itemadapter import ItemAdapter, is_item
+from twisted.internet.defer import Deferred, succeed
+from twisted.internet.threads import deferToThread
+from twisted.python.failure import Failure as TwistedFailure
 
 from scrapy_extension.backends.base import JSONSerializer, _validate_key_name
 from scrapy_extension.exceptions import (
@@ -37,13 +40,24 @@ from scrapy_extension.storage.strategies.passthrough import (
     PassthroughStorageStrategy,
 )
 from scrapy_extension.utils._config import parse_float_setting, parse_int_setting
+from scrapy_extension.utils.policy import DEFAULT_PIPELINE_MAX_STORAGE_ERRORS
+from scrapy_extension.utils.reactor import (
+    DEFAULT_REACTOR_IO_TIMEOUT_S,
+    MAX_REACTOR_IO_TIMEOUT_S,
+    bounded_deferred,
+    defer_to_thread_ordered,
+    reactor_is_running,
+)
 
 if TYPE_CHECKING:
     from scrapy import Spider
     from scrapy.crawler import Crawler
     from scrapy.settings import Settings
 
-    from scrapy_extension.backends.connectors import ConnectionManager
+    from scrapy_extension.backends.connectors import (
+        ConnectionManager,
+        ConnectionManagerLease,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +75,7 @@ DEFAULT_PIPELINE_MAX_ITEM_BYTES = 1_048_576
 #: outage loudly after 11 consecutive failures while tolerating transient
 #: blips. Operators who want the old infinite-swallow behavior can pass
 #: ``max_storage_errors=None`` to the constructor directly.
-DEFAULT_MAX_STORAGE_ERRORS = 10
+DEFAULT_MAX_STORAGE_ERRORS = DEFAULT_PIPELINE_MAX_STORAGE_ERRORS
 
 _PIPELINE_STORAGE_FAILURE_MESSAGE = "Pipeline storage operation failed."
 _PIPELINE_STORAGE_THRESHOLD_MESSAGE = "Pipeline storage failure threshold exceeded."
@@ -144,10 +158,10 @@ class BackendPipeline:
         storage_strategy: Strategy layer governing how items reach the backend
             (passthrough default — byte-identical to pre-strategy behavior;
             ``batched`` buffers + flushes on threshold/close).
-        max_storage_errors: C2 escalation threshold. ``None`` (default) keeps the
-            best-effort swallow-and-stat behavior; an int N re-raises a fixed
-            :class:`~scrapy_extension.exceptions.BackendError`
-            once consecutive failures exceed N (counter resets on a successful
+        max_storage_errors: C2 escalation threshold. ``10`` (default) re-raises a
+            fixed :class:`~scrapy_extension.exceptions.BackendError` after the
+            eleventh consecutive failure. Pass ``None`` explicitly to opt into
+            best-effort swallow-and-stat behavior (counter resets on a successful
             store).
     """
 
@@ -159,9 +173,11 @@ class BackendPipeline:
         max_item_bytes: int = DEFAULT_PIPELINE_MAX_ITEM_BYTES,
         storage_strategy: StorageStrategy | None = None,
         *,
-        max_storage_errors: int | None = None,
+        max_storage_errors: int | None = DEFAULT_MAX_STORAGE_ERRORS,
         monitor: Monitor | None = None,
         owns_connection_manager: bool = True,
+        connection_manager_lease: ConnectionManagerLease | None = None,
+        reactor_io_timeout: float = DEFAULT_REACTOR_IO_TIMEOUT_S,
     ) -> None:
         """Initialize the pipeline.
 
@@ -177,14 +193,13 @@ class BackendPipeline:
                 :class:`PassthroughStorageStrategy` (byte-identical to the
                 pre-strategy store call). Selected via ``SCRAPY_STORAGE_STRATEGY``
                 in :meth:`from_settings`.
-            max_storage_errors: C2 escalation. ``None`` (default) preserves the
-                best-effort behavior (storage errors swallowed, item returned,
-                ``pipeline/storage_errors`` stat incremented). When set to N, the
-                pipeline tracks consecutive storage failures and re-raises a fixed
-                :class:`~scrapy_extension.exceptions.BackendError`
-                once the consecutive count exceeds N — surfacing a persistent
-                storage outage loudly instead of silently reporting success.
-                Counter resets to 0 on every successful store.
+            max_storage_errors: C2 escalation. ``10`` (default) tracks consecutive
+                failures and re-raises a fixed
+                :class:`~scrapy_extension.exceptions.BackendError` on the eleventh
+                failure. Pass ``None`` explicitly to opt into best-effort behavior
+                (storage errors swallowed, item returned,
+                ``pipeline/storage_errors`` stat incremented). The counter resets
+                to 0 on every successful store.
             monitor: Optional observability monitor. When ``None`` (default),
                 :class:`~scrapy_extension.monitor.base.NullMonitor` (no-op). Wired
                 to a :class:`~scrapy_extension.monitor.ScrapyStatsMonitor` in
@@ -194,6 +209,9 @@ class BackendPipeline:
             owns_connection_manager: Whether close releases the supplied manager.
                 Composite owners can pass ``False`` and release their shared acquire
                 after all borrowed components are closed.
+            reactor_io_timeout: Maximum caller-visible wait for a synchronous backend
+                operation moved to Twisted's thread pool. The underlying operation
+                remains ordered until its worker returns if this budget expires.
         """
         _validate_key_name(key_prefix, "key_prefix")
         self.connection_manager = connection_manager
@@ -210,13 +228,31 @@ class BackendPipeline:
         self._storage_supported: bool | None = None
         self._monitor: Monitor = monitor if monitor is not None else NullMonitor()
         self._owns_connection_manager = owns_connection_manager
+        self._connection_manager_lease = connection_manager_lease
+        self._reactor_io_timeout = reactor_io_timeout
+        self._async_tail: Deferred[Any] = Deferred()
+        self._async_tail.callback(None)
         self._manager_released = False
         self._lifecycle_lock = threading.Lock()
+        self._store_condition = threading.Condition(self._lifecycle_lock)
         self._opened = False
         self._opened_spider: Spider | None = None
         self._crawler: Crawler | None = None
         self._closed = False
         self._closing = False
+        self._close_owner_thread_id: int | None = None
+        self._close_async_pending = False
+        self._close_waiting_for_stores = False
+        self._pending_close_error: BaseException | None = None
+        self._active_store_count = 0
+        self._active_store_threads: dict[int, int] = {}
+        self._lifecycle_generation = 0
+        self._opening_generation: int | None = None
+        self._opening_owner_thread_id: int | None = None
+        self._open_close_requested = False
+        self._opening = False
+        self._opening_operation: Deferred[None] | None = None
+        self._opening_failure: TwistedFailure | None = None
         set_monitor = getattr(self.storage_strategy, "set_monitor", None)
         if callable(set_monitor):
             set_monitor(self._monitor)
@@ -244,6 +280,7 @@ class BackendPipeline:
         """
         from scrapy_extension.backends.connectors import (
             ConnectionManager,
+            release_manager_acquire,
             resolve_backend_config,
         )
 
@@ -258,6 +295,7 @@ class BackendPipeline:
             backend_type=backend_type,
             settings=backend_settings,
         )
+        manager_lease = ConnectionManager._adopt_latest_legacy_lease(manager)
         try:
             storage_strategy_name = settings.get(
                 "SCRAPY_STORAGE_STRATEGY", "passthrough"
@@ -313,19 +351,26 @@ class BackendPipeline:
                     setting_value=storage_strategy_name,
                 ) from exc
             raw_max_errors = settings.get("SCRAPY_PIPELINE_MAX_STORAGE_ERRORS")
-            # Risk 5: default to a sane ceiling (DEFAULT_MAX_STORAGE_ERRORS) when unset
-            # so a persistent outage surfaces instead of being silently swallowed. An
-            # explicit int from settings still wins; ``None`` (infinite swallow) is
-            # reachable only via the constructor kwarg, not via the env var.
-            max_storage_errors = (
-                parse_int_setting(
+            # The reliability-safe ceiling is the public default. An explicitly
+            # stored None is the documented opt-in to best-effort loss; distinguish
+            # it from an unset Scrapy setting.
+            try:
+                max_errors_priority = settings.getpriority(
+                    "SCRAPY_PIPELINE_MAX_STORAGE_ERRORS"
+                )
+            except (AttributeError, TypeError):
+                max_errors_priority = None
+            explicitly_configured = isinstance(max_errors_priority, int)
+            if explicitly_configured and raw_max_errors is None:
+                max_storage_errors = None
+            elif explicitly_configured:
+                max_storage_errors = parse_int_setting(
                     raw_max_errors,
                     "SCRAPY_PIPELINE_MAX_STORAGE_ERRORS",
                     minimum=0,
                 )
-                if raw_max_errors is not None
-                else DEFAULT_MAX_STORAGE_ERRORS
-            )
+            else:
+                max_storage_errors = DEFAULT_MAX_STORAGE_ERRORS
             ttl_raw = settings.get("SCRAPY_PIPELINE_TTL", 0)
             ttl = parse_int_setting(
                 ttl_raw,
@@ -339,6 +384,16 @@ class BackendPipeline:
                 ),
                 "SCRAPY_PIPELINE_MAX_ITEM_BYTES",
                 minimum=1,
+            )
+            reactor_io_timeout = parse_float_setting(
+                settings.get(
+                    "SCRAPY_REACTOR_IO_TIMEOUT",
+                    DEFAULT_REACTOR_IO_TIMEOUT_S,
+                ),
+                "SCRAPY_REACTOR_IO_TIMEOUT",
+                minimum=0.0,
+                minimum_exclusive=True,
+                maximum=MAX_REACTOR_IO_TIMEOUT_S,
             )
             key_prefix = settings.get("SCRAPY_PIPELINE_KEY_PREFIX", "items")
             if not isinstance(key_prefix, str):
@@ -362,13 +417,18 @@ class BackendPipeline:
                 max_item_bytes=max_item_bytes,
                 storage_strategy=storage_strategy,
                 max_storage_errors=max_storage_errors,
+                connection_manager_lease=manager_lease,
+                reactor_io_timeout=reactor_io_timeout,
             )
         except BaseException:
             # A successful get_manager() is an acquire. No partially-built component
             # exists to own that reference, so the factory must release it here even
             # for cancellation-style BaseException subclasses.
             try:
-                manager.close()
+                if manager_lease is not None:
+                    release_manager_acquire(manager_lease, exact=True)
+                else:
+                    release_manager_acquire(manager)
             except BaseException:
                 try:
                     logger.exception(
@@ -441,8 +501,7 @@ class BackendPipeline:
 
     def _close_after_factory_failure(self) -> None:
         """Close an unpublished pipeline when ``from_crawler`` cannot return it."""
-        with self._lifecycle_lock:
-            self._close_locked(force_manager_release=True)
+        self._close_locked(force_manager_release=True)
 
     def _resolve_spider(self, spider: Spider | None) -> Spider:
         """Resolve old explicit-spider and new crawler-owned Scrapy calls."""
@@ -458,7 +517,87 @@ class BackendPipeline:
             )
         return crawler_spider
 
-    def open_spider(self, spider: Spider | None = None) -> None:
+    def open_spider(self, spider: Spider | None = None) -> Deferred[None] | None:
+        """Open synchronously outside the reactor, or return a bounded Deferred.
+
+        Scrapy accepts a Deferred lifecycle hook.  The synchronous backend
+        capability probe is therefore moved to the thread pool while the legacy
+        direct-call contract remains unchanged outside a running reactor.
+        """
+        try:
+            if reactor_is_running():
+                result = self._open_spider_async(spider)
+                del spider
+                return result
+            self._open_spider_sync(spider)
+        except BaseException:
+            del self
+            del spider
+            raise
+        del spider
+        return None
+
+    def _open_spider_async(self, spider: Spider | None) -> Deferred[None]:
+        with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("pipeline is closed")
+            if self._closing or self._opening:
+                raise RuntimeError(
+                    "pipeline lifecycle transition is already in progress"
+                )
+            resolved_spider = self._resolve_spider(spider)
+            self._lifecycle_generation += 1
+            opening_generation = self._lifecycle_generation
+            self._opening = True
+            self._opening_generation = opening_generation
+            self._opening_owner_thread_id = None
+            self._open_close_requested = False
+            self._opening_failure = None
+        operation = deferToThread(
+            self._open_spider_sync,
+            resolved_spider,
+            opening_generation,
+        )
+        with self._lifecycle_lock:
+            if self._opening_generation == opening_generation and self._opening:
+                self._opening_operation = operation
+        # Attach the ownership fence before the caller-facing timeout adapter. A
+        # slow SDK call must not let a timeout callback expose an apparently-open
+        # pipeline while its worker still owns the manager.
+        operation.addBoth(self._finish_async_open)
+        bounded = bounded_deferred(
+            operation,
+            timeout=self._reactor_io_timeout,
+            operation="pipeline open",
+        )
+        # No lifecycle owner is attached to a timed-out open view itself. Keep a
+        # terminal observer on the dropped worker while _finish_async_open retains
+        # its Failure for a close request that is already fencing the operation.
+        operation.addErrback(lambda _failure: None)
+        return bounded
+
+    def _finish_async_open(self, result: Any) -> Any:
+        # _open_spider_sync owns the opening token and clears it only after its
+        # callbacks and rollback have finished.  This observer must not publish a
+        # second, earlier lifecycle transition on behalf of a timed-out worker.
+        with self._lifecycle_lock:
+            if isinstance(result, TwistedFailure):
+                self._opening_failure = result
+                if self._opening:
+                    self._opening = False
+                    self._opening_generation = None
+                    self._opening_owner_thread_id = None
+                    self._opening_operation = None
+                    self._store_condition.notify_all()
+            elif self._opening is False and self._opening_operation is not None:
+                self._opening_operation = None
+        return result
+
+    def _open_spider_sync(
+        self,
+        spider: Spider | None = None,
+        opening_generation: int | None = None,
+    ) -> None:
         """Called when a spider opens.
 
         Detects whether the configured backend supports storage. If not
@@ -476,62 +615,200 @@ class BackendPipeline:
         with self._lifecycle_lock:
             if self._closed:
                 raise RuntimeError("pipeline is closed")
-            if self._closing:
+            if self._closing and opening_generation is None:
                 raise RuntimeError("pipeline close must be retried")
-            spider = self._resolve_spider(spider)
+            resolved_spider = self._resolve_spider(spider)
             if self._opened:
-                if spider is self._opened_spider:
+                if resolved_spider is self._opened_spider:
                     return
                 raise RuntimeError("pipeline is already open for a different spider")
-            open_diagnostic: str | None = None
-            open_failure: BaseException | None = None
+            if opening_generation is None:
+                self._lifecycle_generation += 1
+                opening_generation = self._lifecycle_generation
+                self._opening_generation = opening_generation
+                self._open_close_requested = False
+            elif self._opening_generation != opening_generation:
+                raise RuntimeError("pipeline open attempt is no longer current")
+            # Admission is fenced while extension callbacks run, but the callbacks
+            # themselves must never run while this non-reentrant state lock is held.
+            self._opening = True
+            self._opening_owner_thread_id = threading.get_ident()
+
+        open_diagnostic: str | None = None
+        open_failure: BaseException | None = None
+        try:
+            _validate_key_name(resolved_spider.name, "spider.name")
+            self.storage_strategy.open()
             try:
-                _validate_key_name(spider.name, "spider.name")
-                self.storage_strategy.open()
+                self.connection_manager.get_storage_backend()
+                self._storage_supported = True
+            except NotImplementedError:
+                self._storage_supported = False
+                open_diagnostic = "unsupported_storage"
+            except BackendConnectionError:
+                open_diagnostic = "unreachable_storage"
+        except BaseException as exc:
+            with self._lifecycle_lock:
+                if self._opening_generation == opening_generation:
+                    self._opening = False
+                    self._opening_generation = None
+                    self._opening_owner_thread_id = None
+                    self._opening_operation = None
+                    self._store_condition.notify_all()
+            open_failure = exc
+
+        if open_failure is not None:
+            cleanup_failed = False
+            try:
+                # No item can enter before open succeeds. Rollback runs after the
+                # exception suite has unwound so callbacks cannot inspect it.
+                self._close_locked(force_manager_release=True)
+            except BaseException:
+                cleanup_failed = True
+            if cleanup_failed:
                 try:
-                    self.connection_manager.get_storage_backend()
-                    self._storage_supported = True
-                except NotImplementedError:
-                    self._storage_supported = False
-                    open_diagnostic = "unsupported_storage"
-                except BackendConnectionError:
-                    open_diagnostic = "unreachable_storage"
-            except BaseException as exc:
-                open_failure = exc
-            if open_failure is not None:
-                cleanup_failed = False
-                try:
-                    # No item can enter before open succeeds while this lock is held.
-                    # Force-release the manager even if strategy rollback is broken.
-                    self._close_locked(force_manager_release=True)
+                    logger.error("Pipeline cleanup failed during open rollback")
                 except BaseException:
-                    cleanup_failed = True
-                if cleanup_failed:
-                    try:
-                        logger.error("Pipeline cleanup failed during open rollback")
-                    except BaseException:
-                        # Diagnostics must not replace the open failure being unwound.
-                        pass
-                raise open_failure
-            if open_diagnostic == "unsupported_storage":
-                # The expected capability exception has fully unwound. A custom handler
-                # must not recover it through ``sys.exc_info()``.
-                _emit_diagnostic(
-                    logger.warning,
-                    "Configured backend does not support storage; pipeline will not "
-                    "persist items.",
-                )
-            elif open_diagnostic == "unreachable_storage":
-                # Keep this operational continuation static and outside its catch
-                # suite; backend types and driver messages may be sensitive.
-                _emit_diagnostic(
-                    logger.warning,
-                    "Storage backend not reachable at spider open; pipeline will retry "
-                    "storage lazily on each item.",
-                )
-            self._opened = True
-            self._opened_spider = spider
-            _emit_diagnostic(logger.info, "Pipeline opened for spider %s", spider.name)
+                    # Diagnostics must not replace the open failure being unwound.
+                    pass
+            raise open_failure
+
+        with self._lifecycle_lock:
+            current = (
+                self._opening_generation == opening_generation
+                and not self._closed
+                and not self._closing
+                and not self._open_close_requested
+            )
+            if current:
+                self._opened = True
+                self._opened_spider = resolved_spider
+            if self._opening_generation == opening_generation:
+                self._opening = False
+                self._opening_generation = None
+                self._opening_owner_thread_id = None
+                self._opening_operation = None
+                self._store_condition.notify_all()
+                self._open_close_requested = False
+        if not current:
+            # A close that arrived during open owns the terminal transition.  Do
+            # not resurrect OPENED after the callback returns; finish teardown now
+            # (or let the already-running close finish it).
+            if not self._closed and not self._close_async_pending:
+                self._close_locked(force_manager_release=True)
+            return
+        if open_diagnostic == "unsupported_storage":
+            # The expected capability exception has fully unwound. A custom handler
+            # must not recover it through ``sys.exc_info()``.
+            _emit_diagnostic(
+                logger.warning,
+                "Configured backend does not support storage; pipeline will not "
+                "persist items.",
+            )
+        elif open_diagnostic == "unreachable_storage":
+            # Keep this operational continuation static and outside its catch
+            # suite; backend types and driver messages may be sensitive.
+            _emit_diagnostic(
+                logger.warning,
+                "Storage backend not reachable at spider open; pipeline will retry "
+                "storage lazily on each item.",
+            )
+        _emit_diagnostic(
+            logger.info,
+            "Pipeline opened for spider %s",
+            resolved_spider.name,
+        )
+
+    def close_spider(self, spider: Spider | None = None) -> Deferred[None] | None:
+        """Close synchronously outside the reactor, or return a bounded Deferred."""
+        try:
+            if reactor_is_running():
+                result = self._close_spider_async(spider)
+                del spider
+                return result
+            self._close_spider_sync(spider)
+        except BaseException:
+            del self
+            del spider
+            raise
+        del spider
+        return None
+
+    def _close_spider_async(self, spider: Spider | None) -> Deferred[None]:
+        with self._lifecycle_lock:
+            if self._closed:
+                return succeed(None)
+            opening_operation = self._opening_operation
+            if self._opening and opening_operation is not None:
+                self._open_close_requested = True
+                self._close_async_pending = True
+
+                # A caller may time out waiting for open while its worker is still
+                # probing the backend. Queue close behind that exact operation so
+                # manager ownership cannot race the probe. Preserve a late open
+                # failure as the close result after teardown completes.
+                def continue_after_open(_ignored: Any) -> Any:
+                    close_result = self._close_spider_async(spider)
+                    opening_failure = self._opening_failure
+                    if opening_failure is None:
+                        return close_result
+                    return close_result.addBoth(lambda _value: opening_failure)
+
+                return opening_operation.addBoth(continue_after_open)
+            if self._opening:
+                raise RuntimeError("pipeline open is still in progress")
+            current_thread = threading.get_ident()
+            if self._closing:
+                if self._close_owner_thread_id == current_thread:
+                    # A storage callback recursively closing the same pipeline is
+                    # already covered by the outer attempt.
+                    return succeed(None)
+                raise RuntimeError("pipeline close is already in progress")
+            self._closing = True
+            self._close_async_pending = True
+            resolved_spider = self._resolve_spider(spider) if self._opened else None
+
+        # ``_async_tail`` is an operation-completion chain, not the caller-facing
+        # timeout Deferred. This preserves FIFO writes and prevents close from
+        # releasing the manager while a timed-out worker is still using it.
+        public_result: Deferred[None] = Deferred()
+
+        def start_close(_ignored: Any) -> Deferred[None]:
+            def run_reserved_close() -> None:
+                with self._lifecycle_lock:
+                    self._close_async_pending = False
+                    # Transfer the reserved close to _close_locked rather than
+                    # making it look like a recursive callback from its owner.
+                    self._close_owner_thread_id = None
+                self._close_spider_sync(resolved_spider)
+
+            operation, bounded = defer_to_thread_ordered(
+                run_reserved_close,
+                timeout=self._reactor_io_timeout,
+                operation="pipeline close",
+            )
+
+            def publish_success(value: Any) -> Any:
+                if not public_result.called:
+                    public_result.callback(value)
+                return value
+
+            def publish_failure(failure: Any) -> None:
+                if not public_result.called:
+                    public_result.errback(failure)
+                # The internal bounded view is no longer exposed; consume its
+                # failure after publishing the same Failure to the caller.
+                return None
+
+            bounded.addCallbacks(publish_success, publish_failure)
+            # The authoritative tail still has to be observed after a public
+            # timeout/failure; otherwise a late close worker Failure is unhandled.
+            operation.addErrback(lambda _failure: None)
+            return operation
+
+        close_operation = self._async_tail.addBoth(start_close)
+        self._async_tail = close_operation
+        return public_result
 
     @storage_operation_error_boundary(
         "store",
@@ -539,7 +816,7 @@ class BackendPipeline:
         "storage-strategy",
         safe_messages=(_BATCHED_STORAGE_FLUSH_FAILURE_MESSAGE,),
     )
-    def close_spider(self, spider: Spider | None = None) -> None:
+    def _close_spider_sync(self, spider: Spider | None = None) -> None:
         """Called when a spider closes.
 
         Flushes any buffered items via the storage strategy before shutting the
@@ -552,8 +829,17 @@ class BackendPipeline:
         with self._lifecycle_lock:
             if self._closed:
                 return
+            if self._opening:
+                self._open_close_requested = True
+                if self._opening_owner_thread_id == threading.get_ident():
+                    # The opener cannot wait for itself.  Its completion checkpoint
+                    # owns the bounded re-entrant close policy and will tear down
+                    # after the open callback returns.
+                    return
+                while self._opening:
+                    self._store_condition.wait()
             try:
-                spider = self._resolve_spider(spider)
+                resolved_spider = self._resolve_spider(spider)
             except Exception:
                 # _resolve_spider raises when there is no opened spider and no
                 # crawler (direct/from_settings use, or after an open_spider
@@ -561,35 +847,63 @@ class BackendPipeline:
                 # the storage strategy and the connection manager. The spider
                 # name only feeds the diagnostic log below; mirror the
                 # log-handler guard so a resolution failure cannot skip it.
-                spider = None
-            self._close_locked()
-            try:
-                if spider is not None:
-                    logger.info("Pipeline closed for spider %s", spider.name)
-            except BaseException:
-                # This is diagnostic-only and follows the durability barrier and
-                # manager release, so a handler cannot alter lifecycle state.
-                pass
+                resolved_spider = None
+        # The strategy and manager are extension callbacks. _close_locked claims
+        # the state under the lock but invokes both callbacks after releasing it.
+        self._close_locked()
+        try:
+            if resolved_spider is not None:
+                logger.info("Pipeline closed for spider %s", resolved_spider.name)
+        except BaseException:
+            # This is diagnostic-only and follows the durability barrier and
+            # manager release, so a handler cannot alter lifecycle state.
+            pass
 
     def _close_locked(self, *, force_manager_release: bool = False) -> None:
-        """Release one pipeline lifecycle while ``_lifecycle_lock`` is held.
+        """Release one pipeline lifecycle, invoking callbacks without the lock.
 
         Normal close keeps manager ownership when strategy cleanup fails, allowing
         a later call to retry the durability barrier. Unpublished open/factory
         rollback has admitted no items, so ``force_manager_release`` prevents a
         broken strategy cleanup from leaking the manager acquire.
         """
-        if self._closed:
-            return
+        current_thread = threading.get_ident()
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            if self._closing:
+                if self._close_owner_thread_id == current_thread:
+                    if not self._close_waiting_for_stores:
+                        # Recursive close from strategy cleanup is covered by the
+                        # outer attempt and must not wait on its own lock.
+                        return
+                elif self._close_async_pending:
+                    raise RuntimeError("pipeline close is already in progress")
+                elif self._close_owner_thread_id is not None:
+                    raise RuntimeError("pipeline close is already in progress")
+            else:
+                self._closing = True
+                self._close_owner_thread_id = current_thread
+            self._close_async_pending = False
+            self._close_owner_thread_id = current_thread
+            while self._active_store_count:
+                if self._active_store_threads.get(current_thread, 0):
+                    # Same-thread close cannot wait for its own admitted store.
+                    # Leave closing latched; the store's finally block resumes
+                    # this teardown after the backend call returns.
+                    self._close_waiting_for_stores = True
+                    return
+                self._store_condition.wait()
+            self._close_waiting_for_stores = False
 
-        # Publish the admission fence before entering the durability barrier. If
-        # close fails, only another close attempt may use the retained strategy and
-        # manager capability; new spiders/items must not enter that retry lifecycle.
-        self._closing = True
         primary_error: BaseException | None = None
         try:
             self.storage_strategy.close()
         except BaseException as exc:
+            with self._lifecycle_lock:
+                self._close_owner_thread_id = None
+                self._close_waiting_for_stores = False
+                self._store_condition.notify_all()
             if not force_manager_release:
                 # A normal close failure may retain an unchanged batched retry tail.
                 # Do not publish terminal state or release its backend capability.
@@ -597,18 +911,32 @@ class BackendPipeline:
             primary_error = exc
 
         # Either the durability barrier succeeded or this unpublished lifecycle is
-        # being forcibly rolled back. Manager release is now terminal. Mark the
-        # attempt before calling extension code because a BaseException may occur
-        # after its refcount was decremented; retrying would risk a double release.
-        self._closed = True
-        self._closing = False
-        self._opened = False
-        self._opened_spider = None
+        # being forcibly rolled back. Publish terminal state before invoking the
+        # manager callback so re-entrant close is an idempotent no-op.
+        with self._lifecycle_lock:
+            self._closed = True
+            self._closing = False
+            self._close_async_pending = False
+            self._close_owner_thread_id = None
+            self._opened = False
+            self._opened_spider = None
+            self._open_close_requested = False
+            self._store_condition.notify_all()
+            release_manager = (
+                self._owns_connection_manager and not self._manager_released
+            )
+            if release_manager:
+                # A BaseException after the provider decrements its refcount must
+                # not cause a retry to release the same acquire twice.
+                self._manager_released = True
+
         secondary_manager_close_failed = False
-        if self._owns_connection_manager and not self._manager_released:
-            self._manager_released = True
+        if release_manager:
             try:
-                self.connection_manager.close()
+                if self._connection_manager_lease is not None:
+                    self._connection_manager_lease.release()
+                else:
+                    self.connection_manager.close()
             except BaseException as exc:
                 if primary_error is None:
                     primary_error = exc
@@ -623,6 +951,73 @@ class BackendPipeline:
         if primary_error is not None:
             raise primary_error
 
+    def process_item(self, item: Any, spider: Spider | None = None) -> Any:
+        """Process an item, moving synchronous storage off a running reactor."""
+        try:
+            if reactor_is_running():
+                result = self._process_item_async(item, spider)
+                del item
+                del spider
+                return result
+            result = self._process_item_sync(item, spider)
+        except BaseException:
+            del self
+            del item
+            del spider
+            raise
+        del item
+        del spider
+        return result
+
+    def _process_item_async(
+        self,
+        item: Any,
+        spider: Spider | None,
+    ) -> Deferred[Any]:
+        with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("pipeline is closed")
+            if self._closing:
+                raise RuntimeError("pipeline close must be retried")
+            if self._opening:
+                raise RuntimeError("pipeline open is still in progress")
+            resolved_spider = self._resolve_spider(spider)
+
+        # The adapter cannot be created until this item reaches the FIFO tail.
+        # Publish its bounded result through a placeholder, while the tail keeps
+        # the authoritative worker operation for ordering and late outcomes.
+        public_result: Deferred[Any] = Deferred()
+
+        def start(_ignored: Any) -> Deferred[Any]:
+            operation, bounded = defer_to_thread_ordered(
+                self._process_item_sync,
+                item,
+                resolved_spider,
+                timeout=self._reactor_io_timeout,
+                operation="pipeline store",
+            )
+
+            def publish_success(value: Any) -> Any:
+                if not public_result.called:
+                    public_result.callback(value)
+                return value
+
+            def publish_failure(failure: Any) -> None:
+                if not public_result.called:
+                    public_result.errback(failure)
+                # ``bounded`` is internal after its result has been published.
+                # Returning success here consumes its timeout/worker Failure so
+                # neither inner timeout nor late authoritative failure is lost.
+                return None
+
+            bounded.addCallbacks(publish_success, publish_failure)
+            operation.addErrback(lambda _failure: None)
+            return operation
+
+        operation = self._async_tail.addBoth(start)
+        self._async_tail = operation
+        return public_result
+
     @serialization_error_boundary(
         _PIPELINE_SERIALIZATION_FAILURE_MESSAGE,
         serializer="json",
@@ -631,15 +1026,57 @@ class BackendPipeline:
         logger=logger,
     )
     @_pipeline_store_error_boundary
-    def process_item(self, item: Any, spider: Spider | None = None) -> Any:
-        """Process one item while excluding concurrent terminal teardown."""
+    def _process_item_sync(self, item: Any, spider: Spider | None = None) -> Any:
+        """Process one admitted item while fencing terminal teardown."""
+        thread_id = threading.get_ident()
         with self._lifecycle_lock:
             if self._closed:
                 raise RuntimeError("pipeline is closed")
             if self._closing:
                 raise RuntimeError("pipeline close must be retried")
-            spider = self._resolve_spider(spider)
-            return self._process_item_unlocked(item, spider)
+            resolved_spider = self._resolve_spider(spider)
+            self._active_store_count += 1
+            self._active_store_threads[thread_id] = (
+                self._active_store_threads.get(thread_id, 0) + 1
+            )
+        try:
+            # Storage strategy, backend, monitor, stats, and logging hooks are all
+            # extension callbacks. Keep them outside the lifecycle state lock.
+            return self._process_item_unlocked(item, resolved_spider)
+        finally:
+            self._leave_store(thread_id)
+
+    def _leave_store(self, thread_id: int) -> None:
+        """Release one store admission and resume a re-entrant close if needed."""
+        resume_close = False
+        with self._lifecycle_lock:
+            self._active_store_count -= 1
+            remaining = self._active_store_threads.get(thread_id, 0) - 1
+            if remaining:
+                self._active_store_threads[thread_id] = remaining
+            else:
+                self._active_store_threads.pop(thread_id, None)
+            self._store_condition.notify_all()
+            if (
+                self._active_store_count == 0
+                and self._closing
+                and self._close_waiting_for_stores
+            ):
+                self._close_waiting_for_stores = False
+                self._close_owner_thread_id = None
+                resume_close = True
+        if resume_close:
+            try:
+                self._close_locked()
+            except BaseException as exc:
+                # The recursive caller has already returned its store result. Keep
+                # cleanup ownership retryable rather than masking that result from
+                # the admitted store.
+                with self._lifecycle_lock:
+                    self._pending_close_error = exc
+                    self._closing = False
+                    self._close_owner_thread_id = None
+                    self._store_condition.notify_all()
 
     def _process_item_unlocked(self, item: Any, spider: Spider) -> Any:
         """Process and store an item.
@@ -746,11 +1183,10 @@ class BackendPipeline:
                     logger.debug,
                     "Pipeline store monitor callback raised; ignored.",
                 )
-            # C2: opt-in loud-fail. Default (max_storage_errors=None) keeps the
-            # best-effort swallow-and-stat behavior — zero compat break. When set,
-            # track consecutive failures and re-raise a fixed error once the count
-            # exceeds N so a persistent storage outage surfaces instead of being
-            # silently absorbed as a success-shaped item return.
+            # C2: reliability-safe default is a finite ceiling. Track consecutive
+            # failures and re-raise a fixed error once the count exceeds N. The
+            # explicit ``max_storage_errors=None`` opt-in retains best-effort
+            # swallow-and-stat behavior for applications that accept item loss.
             if self.max_storage_errors is not None:
                 self._consecutive_storage_errors += 1
                 if self._consecutive_storage_errors > self.max_storage_errors:

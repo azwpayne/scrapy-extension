@@ -157,7 +157,7 @@ class TestQueueKeySpiderTemplating:
         scheduler.open(spider)
 
         assert isinstance(scheduler._queue, BackendQueue)
-        assert scheduler._queue.queue_name == "scheduler-queue"
+        assert scheduler._queue.queue_name == "scheduler-queue:default:foo"
 
     def test_queue_key_attribute_unchanged_when_no_template(self) -> None:
         """Without {spider}, the public queue_key attr stays the literal string."""
@@ -207,6 +207,9 @@ class TestQueueKeySpiderTemplating:
         scheduler.open(first_spider)
         assert scheduler._queue is not None
         assert scheduler._queue.queue_name == "q:spider_one"
+        # This seam uses an auto-mocked storage value, so explicitly authorize
+        # replacing its unreadable checkpoint before exercising scheduler close.
+        scheduler._queue.reset_snapshot()
         scheduler.close("first-finished")
 
         with pytest.raises(RuntimeError, match="closed"):
@@ -218,6 +221,29 @@ class TestQueueKeySpiderTemplating:
 
 # Keep an explicit Any alias so type-checkers don't gripe about the mock spider.
 _FakeSpiderType: Any = _FakeSpider
+
+
+class TestDefaultIdentityIsolation:
+    """Default scheduler keys must not be shared by different spiders."""
+
+    def test_two_spiders_get_distinct_default_queue_names(self) -> None:
+        manager = MagicMock(name="ConnectionManager")
+        manager.get_queue_backend.return_value = MagicMock(name="QueueBackend")
+        first = MagicMock(name="FirstSpider")
+        first.name = "alpha"
+        first.crawler = None
+        second = MagicMock(name="SecondSpider")
+        second.name = "beta"
+        second.crawler = None
+
+        first_scheduler = BackendScheduler(connection_manager=manager)
+        second_scheduler = BackendScheduler(connection_manager=manager)
+        first_scheduler.open(first)
+        second_scheduler.open(second)
+
+        assert first_scheduler._queue.queue_name == "scheduler-queue:default:alpha"
+        assert second_scheduler._queue.queue_name == "scheduler-queue:default:beta"
+        assert first_scheduler._queue.queue_name != second_scheduler._queue.queue_name
 
 
 class TestEnqueueBranchClosure:
@@ -632,12 +658,12 @@ class TestEnqueueBranchClosure:
         assert result is True
         queue.push.assert_called_once()  # fallback push fired (degrade-to-enqueue)
 
-    def test_G6_dedup_outage_then_fallback_push_fails_returns_false(self) -> None:
-        """G6: request_seen→QueueError AND fallback push→QueueError → return False.
+    def test_G6_dedup_outage_then_fallback_push_is_terminal(self) -> None:
+        """G6: a fallback queue outage propagates instead of request_dropped.
 
-        Covers the inner ``except (QueueError, SerializationError, BackendError)``
-        at 638-640 — the rare double-failure where BOTH the dedup check and the
-        fallback enqueue raise.
+        The dedup outage is still degraded to a fallback enqueue, but a second
+        transient queue failure is terminal. Returning False would make Scrapy
+        emit ``request_dropped`` without a retry.
         """
         manager = MagicMock(name="ConnectionManager")
         counts, stats = _stats_counter()
@@ -652,20 +678,38 @@ class TestEnqueueBranchClosure:
         queue.push.side_effect = QueueError("queue also down")
         scheduler._queue = queue
 
-        result = scheduler.enqueue_request(Request("https://example.com/a"))
-
-        assert result is False
+        with pytest.raises(QueueError, match="not dropped"):
+            scheduler.enqueue_request(Request("https://example.com/a"))
         assert (
             queue.push.call_count == 1
         )  # only the fallback push (initial never reached)
         # Outage stat WAS bumped (entered dedup-outage arm) before the fallback failed.
         assert counts.get("scheduler/dupefilter_error") == 1
 
-    def test_G7_push_phase_failure_bumps_queue_error(self) -> None:
-        """G7: dupefilter=None (phase=push), push→QueueError → queue_error stat.
+    def test_G6b_dedup_outage_then_fallback_serialization_is_false(self) -> None:
+        """G6b: deterministic fallback serialization remains a False outcome."""
+        manager = MagicMock(name="ConnectionManager")
+        counts, stats = _stats_counter()
+        dupefilter = MagicMock(name="DupeFilter")
+        dupefilter.request_seen.side_effect = QueueError("dedup down")
+        scheduler = BackendScheduler(
+            connection_manager=manager,
+            stats=stats,
+            dupefilter=dupefilter,
+        )
+        queue = MagicMock(name="BackendQueue")
+        queue.push.side_effect = SerializationError("cannot encode")
+        scheduler._queue = queue
 
-        Covers the ``phase == "push"`` arm (643-646) — distinct from the
-        dedup-outage arm because the failure is on the actual enqueue push.
+        assert scheduler.enqueue_request(Request("https://example.com/a")) is False
+        assert counts.get("scheduler/serialization_errors") == 1
+        assert counts.get("scheduler/queue_error") is None
+
+    def test_G7_push_phase_failure_is_terminal_and_bumps_queue_error(self) -> None:
+        """G7: a transient push failure is terminal, never request_dropped.
+
+        ``False`` is reserved for duplicate or deterministic serialization
+        rejection; a backend outage must reach the crawl's failure/retry policy.
         """
         manager = MagicMock(name="ConnectionManager")
         counts, stats = _stats_counter()
@@ -678,9 +722,8 @@ class TestEnqueueBranchClosure:
         queue.push.side_effect = QueueError("push failed")
         scheduler._queue = queue
 
-        result = scheduler.enqueue_request(Request("https://example.com/a"))
-
-        assert result is False
+        with pytest.raises(QueueError, match="not dropped"):
+            scheduler.enqueue_request(Request("https://example.com/a"))
         assert counts.get("scheduler/queue_error") == 1
 
     def test_G4b_serialization_error_without_stats(self) -> None:
@@ -703,12 +746,8 @@ class TestEnqueueBranchClosure:
 
         assert result is False
 
-    def test_G7b_push_phase_failure_without_stats(self) -> None:
-        """G7b: push-phase failure + stats=None → return False, no crash.
-
-        Covers the stats-None sub-branch of the push-phase arm (644->646) —
-        mirrors G4b/G5 for the third except-arm.
-        """
+    def test_G7b_push_phase_failure_without_stats_is_terminal(self) -> None:
+        """G7b: push outage remains terminal even without a stats collector."""
         manager = MagicMock(name="ConnectionManager")
         scheduler = BackendScheduler(
             connection_manager=manager,
@@ -719,9 +758,8 @@ class TestEnqueueBranchClosure:
         queue.push.side_effect = QueueError("push failed")
         scheduler._queue = queue
 
-        result = scheduler.enqueue_request(Request("https://example.com/a"))
-
-        assert result is False
+        with pytest.raises(QueueError, match="not dropped"):
+            scheduler.enqueue_request(Request("https://example.com/a"))
 
 
 class TestAckNackFailureObservability:

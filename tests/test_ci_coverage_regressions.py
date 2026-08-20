@@ -974,16 +974,15 @@ def test_dupefilter_close_preserves_filter_error_when_diagnostics_fail(
     manager.close.assert_called_once_with()
 
 
-def test_dupefilter_factory_rejects_non_string_key_after_manager_acquisition(
+def test_dupefilter_factory_rejects_non_string_key_without_manager_acquisition(
     monkeypatch,
 ) -> None:
-    manager = MagicMock(name="ConnectionManager")
-    lease = MagicMock(name="ConnectionManagerLease", manager=manager)
-    lease.release.side_effect = manager.close
+    """Manager-free strategies validate settings without acquiring a lease."""
+    acquire_lease = MagicMock(name="acquire_lease")
     monkeypatch.setattr(
         connectors_module.ConnectionManager,
         "acquire_lease",
-        MagicMock(return_value=lease),
+        acquire_lease,
     )
 
     with pytest.raises(ConfigurationError, match="must be a string"):
@@ -996,7 +995,7 @@ def test_dupefilter_factory_rejects_non_string_key_after_manager_acquisition(
             )
         )
 
-    manager.close.assert_called_once_with()
+    acquire_lease.assert_not_called()
 
 
 @pytest.mark.parametrize(

@@ -101,7 +101,8 @@ def test_release_failure_does_not_mask_original_factory_error(mocker: Any) -> No
         BackendPipeline.from_settings(_settings())
 
     assert exc_info.value is original_error
-    manager.close.assert_called_once_with()
+    manager.close.assert_called_with()
+    assert manager.close.call_count == 2
 
 
 def test_pipeline_factory_primary_control_error_survives_cleanup_log_failure(
@@ -121,7 +122,8 @@ def test_pipeline_factory_primary_control_error_survives_cleanup_log_failure(
         BackendPipeline.from_settings(_settings())
 
     assert exc_info.value is original_error
-    manager.close.assert_called_once_with()
+    manager.close.assert_called_with()
+    assert manager.close.call_count == 2
 
 
 def test_pipeline_from_crawler_failure_releases_acquired_manager(mocker: Any) -> None:
