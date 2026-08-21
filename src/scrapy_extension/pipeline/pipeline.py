@@ -33,6 +33,7 @@ from scrapy_extension.exceptions._redaction import (
 )
 from scrapy_extension.monitor.base import Monitor, NullMonitor
 from scrapy_extension.storage.strategies import (
+    BatchedStorageStrategy,
     StorageStrategy,
     create_storage_strategy,
 )
@@ -253,6 +254,8 @@ class BackendPipeline:
         self._opening = False
         self._opening_operation: Deferred[None] | None = None
         self._opening_failure: TwistedFailure | None = None
+        if isinstance(self.storage_strategy, BatchedStorageStrategy):
+            self.storage_strategy.attach_owner(self)
         set_monitor = getattr(self.storage_strategy, "set_monitor", None)
         if callable(set_monitor):
             set_monitor(self._monitor)
