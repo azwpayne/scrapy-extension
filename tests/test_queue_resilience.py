@@ -553,6 +553,34 @@ def test_failed_pop_reports_attempt_and_error_without_decrementing_depth() -> No
     assert bq._cached_depth == 3
 
 
+@pytest.mark.parametrize(
+    "monitor_failure",
+    [RuntimeError("monitor error"), KeyboardInterrupt("monitor interrupted")],
+    ids=["ordinary-monitor-error", "control-monitor-error"],
+)
+def test_failed_pop_monitor_error_does_not_mask_backend_error(
+    monitor_failure: BaseException,
+) -> None:
+    """The backend pop failure remains primary over monitor.on_error failure."""
+    qb = MagicMock(name="QueueBackend")
+    backend_failure = QueueError("backend pop unavailable")
+    qb.pop.side_effect = backend_failure
+    monitor = MagicMock()
+    monitor.on_error.side_effect = monitor_failure
+    bq = BackendQueue(
+        connection_manager=_cm(queue_backend=qb),
+        queue_name="q",
+        monitor=monitor,
+    )
+
+    with pytest.raises(QueueError) as raised:
+        bq.pop()
+
+    assert raised.value is backend_failure
+    monitor.on_error.assert_called_once_with("pop", backend_failure)
+    monitor.on_pop.assert_called_once_with("q")
+
+
 def test_push_survives_monitor_failure_after_enqueue() -> None:
     """Telemetry failure cannot turn a committed enqueue into caller failure."""
     qb = MagicMock(name="QueueBackend")

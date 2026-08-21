@@ -95,9 +95,10 @@ class ScrapyStatsMonitor(Monitor):
       under. Set to an int on EVERY depth sample (``0`` under threshold) — it
       is ``None`` only before the first sample, never "until the threshold is
       crossed" (the gauge follows depth, not threshold-crossing history).
-    - ``queue/pop_rate_1m`` (gauge) — rolling pops/sec over the trailing 60s
-      window (U2 operability). Sampled on the same cadence as the pop-path
-      depth probe; it may freeze at its last value when no further events occur.
+    - ``queue/pop_rate_1m`` / ``queue/pop_rate_{N}s`` (gauge) — rolling pops/sec
+      over the configured trailing window. Sampled on the same cadence as the
+      pop-path depth probe; it may freeze at its last value when no further
+      events occur.
     - ``queue/last_pop_epoch`` (gauge) — wall-clock epoch of the latest pop
       attempt. External observers subtract it from current wall time to detect a
       stall without requiring a queue-owned heartbeat thread.

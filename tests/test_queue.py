@@ -2638,6 +2638,32 @@ class TestBackendQueueDepthSampling:
         monitor.on_queue_depth.assert_called_once_with("test_queue", 1)
         assert backend.queue_len.call_count == 1
 
+    def test_pop_to_zero_keeps_next_depth_probe_fresh(
+        self, mock_connection_manager, mocker
+    ):
+        """A 1-to-0 pop boundary forces fresh probes after the transition."""
+        backend = mock_connection_manager.get_queue_backend()
+        backend.queue_len.side_effect = [1, 0, 7]
+        monitor = mocker.MagicMock()
+        queue = BackendQueue(
+            connection_manager=mock_connection_manager,
+            queue_name="test_queue",
+            monitor=monitor,
+            depth_sample_every=100,
+        )
+
+        assert len(queue) == 1
+        request = Request("https://example.com/depth-zero-boundary")
+        backend.pop.return_value = queue._serializer.serialize(
+            queue._request_to_dict(request)
+        )
+
+        assert queue.pop() is not None
+        monitor.on_queue_depth.assert_called_once_with("test_queue", 0)
+        assert queue._cached_depth == 0
+        assert len(queue) == 7
+        assert backend.queue_len.call_count == 3
+
     def test_len_uses_sampled_depth(self, mock_connection_manager, mock_spider):
         """U4: __len__ also benefits from sampling — repeated len() probes cache.
 
