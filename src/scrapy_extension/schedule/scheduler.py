@@ -779,6 +779,13 @@ def _push_queue_with_durability(
         _MISSING_STATIC_ATTRIBUTE,
     )
     if isinstance(queue, BackendQueue) and declared_push is canonical_push:
+        operation_context = getattr(queue, "_operation_context", None)
+        if isinstance(operation_context, threading.local):
+            return queue._push_with_durability(
+                request,
+                priority=priority,
+                _preserve_post_commit_marker=True,
+            )
         return queue._push_with_durability(request, priority=priority)
     push = getattr(queue, "push")
     push(request, priority=priority)
@@ -3390,8 +3397,11 @@ class BackendScheduler:
             # owner intent bookkeeping; the queue item remains authoritative and
             # the original signal remains observable to the caller.
             post_commit_push = False
-            if phase == "push":
-                consume_commit = getattr(queue, "_consume_post_commit_push", None)
+            if phase == "push" and _static_declaration_rank(
+                queue,
+                "_consume_post_commit_push",
+            ) is not None:
+                consume_commit = getattr(queue, "_consume_post_commit_push")
                 if callable(consume_commit):
                     post_commit_push = bool(consume_commit())
             try:

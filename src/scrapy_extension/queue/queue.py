@@ -489,6 +489,8 @@ class BackendQueue:
         self,
         request: Request,
         priority: float = 0.0,
+        *,
+        _preserve_post_commit_marker: bool = False,
     ) -> bool:
         """Push and report durability to the bundled scheduler.
 
@@ -501,8 +503,10 @@ class BackendQueue:
         if contexts is None:
             contexts = []
             self._operation_context.push_commits = contexts
+        if not contexts:
             self._operation_context.post_commit_push = False
         contexts.append(False)
+        post_commit_interruption = False
         try:
             self._begin_operation("push")
             try:
@@ -513,10 +517,16 @@ class BackendQueue:
             return result
         except BaseException:
             if contexts[-1]:
-                self._operation_context.post_commit_push = True
+                post_commit_interruption = True
+                if _preserve_post_commit_marker:
+                    self._operation_context.post_commit_push = True
             raise
         finally:
             contexts.pop()
+            if not contexts and not (
+                _preserve_post_commit_marker and post_commit_interruption
+            ):
+                self._operation_context.post_commit_push = False
 
 
     def _push(self, request: Request, priority: float) -> bool:
@@ -779,17 +789,19 @@ class BackendQueue:
                 processing_failure = exc
         finally:
             self._end_operation()
-        self._emit_pop_monitor()
-        if processing_failure is not None:
-            raise processing_failure
-        return result
+        return self._finish_pop_result(result, processing_failure)
 
 
     def _pop(self, timeout: float) -> Request | None:
         """Execute a pop operation without an operation gate."""
         data, ack_token = self._read_pop(timeout)
-        self._emit_pop_monitor()
-        return self._process_pop(data, ack_token)
+        processing_failure: BaseException | None = None
+        result: Request | None = None
+        try:
+            result = self._process_pop(data, ack_token)
+        except BaseException as exc:
+            processing_failure = exc
+        return self._finish_pop_result(result, processing_failure)
 
     def _read_pop(self, timeout: float) -> tuple[bytes | None, Any | None]:
         """Read one committed payload and validate its acknowledgement token."""
@@ -882,6 +894,23 @@ class BackendQueue:
             except BaseException:
                 pass
 
+
+    def _finish_pop_result(
+        self,
+        result: Request | None,
+        processing_failure: BaseException | None,
+    ) -> Request | None:
+        """Preserve a data-plane failure over post-commit monitor interruption."""
+        monitor_failure: BaseException | None = None
+        try:
+            self._emit_pop_monitor()
+        except BaseException as exc:
+            monitor_failure = exc
+        if processing_failure is not None:
+            raise processing_failure
+        if monitor_failure is not None:
+            raise monitor_failure
+        return result
     def _process_pop(self, data: bytes | None, ack_token: Any | None) -> Request | None:
         """Process a committed pop while its operation lease is held."""
         if data is None:

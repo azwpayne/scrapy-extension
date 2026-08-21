@@ -611,6 +611,55 @@ def test_pop_monitor_can_reenter_close_after_commit() -> None:
     assert not worker.is_alive()
     assert failures == []
     assert queue._close_complete is True
+
+
+def test_pop_monitor_control_does_not_mask_data_plane_error() -> None:
+    """A pop parser failure remains primary over post-commit telemetry."""
+    qb = MagicMock(name="QueueBackend")
+    qb.pop.return_value = b"not-json"
+    monitor = MagicMock()
+    signal = KeyboardInterrupt("monitor interrupted")
+    monitor.on_pop.side_effect = signal
+    queue = BackendQueue(
+        connection_manager=_cm(queue_backend=qb),
+        queue_name="q",
+        monitor=monitor,
+    )
+
+    with pytest.raises(SerializationError):
+        queue.pop()
+
+    assert monitor.on_pop.call_count == 1
+
+
+def test_private_pop_observes_after_request_processing(
+    mocker: MockerFixture,
+) -> None:
+    """Even the private pop path keeps observation after data-plane processing."""
+    qb = MagicMock(name="QueueBackend")
+    monitor = MagicMock()
+    queue = BackendQueue(
+        connection_manager=_cm(queue_backend=qb),
+        queue_name="q",
+        monitor=monitor,
+    )
+    request = Request("https://example.com/private-pop-order")
+    qb.pop.return_value = queue._serializer.serialize(queue._request_to_dict(request))
+    request_from_dict = mocker.patch.object(
+        queue,
+        "_request_from_dict",
+        wraps=queue._request_from_dict,
+    )
+
+    def assert_processed(_queue_name: str) -> None:
+        request_from_dict.assert_called_once()
+
+    monitor.on_pop.side_effect = assert_processed
+
+    restored = queue._pop(0.0)
+
+    assert restored is not None
+    assert restored.url == request.url
 @pytest.mark.parametrize(
     "diagnostic_error",
     [RuntimeError("logger boom"), KeyboardInterrupt(), SystemExit()],

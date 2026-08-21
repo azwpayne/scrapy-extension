@@ -1366,6 +1366,38 @@ class TestEnqueueDedupReservation:
         strategy.push.assert_called_once()
         dupefilter.forget.assert_not_called()
 
+    def test_direct_push_control_marker_cannot_skip_later_rollback(self) -> None:
+        """A direct queue.push interruption is scoped to that invocation."""
+        manager = MagicMock(name="ConnectionManager")
+        strategy = _durable_strategy_mock()
+        signal = _SchedulerStop()
+        queue = BackendQueue(
+            connection_manager=manager,
+            queue_name="stale-post-commit-marker",
+            queue_strategy=strategy,
+            monitor=_OneShotPushMonitor(signal),
+        )
+
+        with pytest.raises(_SchedulerStop) as raised:
+            queue.push(Request("https://example.com/direct-push"))
+        assert raised.value is signal
+
+        queue.set_monitor(Monitor())
+        pre_commit_signal = _SchedulerStop()
+        strategy._prepare_push.side_effect = pre_commit_signal
+        dupefilter = MagicMock(spec=["request_seen", "forget", "log"])
+        dupefilter.request_seen.return_value = False
+        scheduler = BackendScheduler(
+            connection_manager=manager,
+            dupefilter=dupefilter,
+        )
+        scheduler._queue = queue
+
+        with pytest.raises(_SchedulerStop) as raised:
+            scheduler.enqueue_request(Request("https://example.com/pre-commit"))
+        assert raised.value is pre_commit_signal
+        dupefilter.forget.assert_called_once()
+
     def test_push_process_control_rolls_back_without_masking_signal(self) -> None:
         manager = MagicMock(name="ConnectionManager")
         membership_filter = MemoryMembershipFilter(maxsize=None)
