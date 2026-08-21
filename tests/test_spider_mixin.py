@@ -15,7 +15,7 @@ from scrapy_extension.backends.connectors import (
     ConnectionManager,
     ConnectionManagerLease,
 )
-from scrapy_extension.exceptions import ConfigurationError
+from scrapy_extension.exceptions import BackendError, ConfigurationError
 from scrapy_extension.monitor import NullMonitor, ScrapyStatsMonitor
 from scrapy_extension.spider import spider_mixin as spider_mixin_module
 from scrapy_extension.spider.spider_mixin import BackendSpiderMixin
@@ -407,6 +407,54 @@ class TestSetupBackend:
             assert breaker is not None
             assert breaker.failure_threshold == 3
             assert breaker.reset_timeout == 7.5
+        finally:
+            spider.close_backend()
+
+    def test_repeated_setup_preserves_matching_env_breaker_state(
+        self, mocker, monkeypatch
+    ) -> None:
+        """Crawler setup must preserve an early env-fallback breaker."""
+        monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", "true")
+        monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "1")
+        monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_RESET_TIMEOUT", "7.5")
+
+        class EarlySetupSpider(BackendSpiderMixin, Spider):
+            name = "matching_env_breaker_spider"
+            backend_type = BackendType.REDIS
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self._early_manager = self.setup_backend()
+                self._early_breaker = self._early_manager._get_breaker()
+                assert self._early_breaker is not None
+
+                def fail_early() -> None:
+                    raise BackendError("early failure")
+
+                with pytest.raises(BackendError):
+                    self._early_breaker.call(fail_early)
+
+        crawler = mocker.MagicMock()
+        crawler.stats = mocker.MagicMock()
+        crawler.settings = ScrapySettings(
+            {
+                "SCRAPY_CIRCUIT_BREAKER_ENABLED": True,
+                "SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD": 1,
+                "SCRAPY_CIRCUIT_BREAKER_RESET_TIMEOUT": 7.5,
+            }
+        )
+
+        spider = EarlySetupSpider.from_crawler(crawler)
+        try:
+            manager = spider._connection_manager
+            assert manager is spider._early_manager
+            assert manager is not None
+            assert manager._get_breaker() is spider._early_breaker
+            assert spider._early_breaker.state.value == "open"
+
+            assert spider.setup_backend() is manager
+            assert manager._get_breaker() is spider._early_breaker
+            assert spider._early_breaker.state.value == "open"
         finally:
             spider.close_backend()
 
