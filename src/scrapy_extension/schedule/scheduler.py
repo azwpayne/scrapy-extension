@@ -3397,10 +3397,14 @@ class BackendScheduler:
             # owner intent bookkeeping; the queue item remains authoritative and
             # the original signal remains observable to the caller.
             post_commit_push = False
-            if phase == "push" and _static_declaration_rank(
-                queue,
-                "_consume_post_commit_push",
-            ) is not None:
+            if (
+                phase == "push"
+                and _static_declaration_rank(
+                    queue,
+                    "_consume_post_commit_push",
+                )
+                is not None
+            ):
                 consume_commit = getattr(queue, "_consume_post_commit_push")
                 if callable(consume_commit):
                     post_commit_push = bool(consume_commit())

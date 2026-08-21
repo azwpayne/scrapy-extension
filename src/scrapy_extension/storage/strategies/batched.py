@@ -193,7 +193,6 @@ class BatchedStorageStrategy(StorageStrategy):
                 return
             raise RuntimeError("batched storage strategy already has an owner")
 
-
     @property
     def pending(self) -> int:
         """Number of accepted-but-not-yet-persisted items (thread-safe)."""

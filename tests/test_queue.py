@@ -2610,6 +2610,7 @@ class TestBackendQueueDepthSampling:
         for _ in range(queue.depth_sample_every):
             queue.pop()
         assert queue._cached_depth == 0
+
     def test_successful_pop_decrements_cached_depth_before_monitor(
         self, mock_connection_manager, mocker
     ):
