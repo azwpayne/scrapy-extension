@@ -2844,9 +2844,7 @@ def test_apply_scrapy_breaker_policy_warns_on_dropped_differing_policy(
     "target_state",
     (BreakerState.CLOSED, BreakerState.OPEN, BreakerState.HALF_OPEN),
 )
-def test_apply_matching_scrapy_policy_preserves_env_breaker(
-    monkeypatch, target_state
-):
+def test_apply_matching_scrapy_policy_preserves_env_breaker(monkeypatch, target_state):
     """A matching explicit policy must not replace an env-fallback breaker."""
     monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", "true")
     monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "1")

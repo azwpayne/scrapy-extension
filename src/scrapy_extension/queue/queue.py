@@ -528,7 +528,6 @@ class BackendQueue:
             ):
                 self._operation_context.post_commit_push = False
 
-
     def _push(self, request: Request, priority: float) -> bool:
         """Execute an admitted push operation."""
         replacement_ack_token = request.meta.get(BACKEND_ACK_TOKEN_META_KEY)
@@ -795,7 +794,6 @@ class BackendQueue:
             self._end_operation()
         return self._finish_pop_result(result, processing_failure)
 
-
     def _pop(self, timeout: float) -> Request | None:
         """Execute a pop operation without an operation gate."""
         processing_failure: BaseException | None = None
@@ -902,7 +900,6 @@ class BackendQueue:
             except BaseException:
                 pass
 
-
     def _finish_pop_result(
         self,
         result: Request | None,
@@ -934,6 +931,7 @@ class BackendQueue:
         if monitor_failure is not None:
             raise monitor_failure
         return result
+
     def _process_pop(self, data: bytes | None, ack_token: Any | None) -> Request | None:
         """Process a committed pop while its operation lease is held."""
         if data is None:
@@ -1388,12 +1386,12 @@ class BackendQueue:
             self._active_operations -= 1
             if self._active_operations == 0:
                 self._operation_gate.notify_all()
+
     def _consume_post_commit_push(self) -> bool:
         """Consume the current thread's interrupted push commit marker."""
         committed = bool(getattr(self._operation_context, "post_commit_push", False))
         self._operation_context.post_commit_push = False
         return committed
-
 
     def ack(self, *, token: Any | None = None) -> None:
         """Acknowledge the popped request identified by ``token``.

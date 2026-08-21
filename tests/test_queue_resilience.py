@@ -528,6 +528,7 @@ def test_pop_survives_monitor_pop_rate_failure() -> None:
     # Must return None (empty), NOT raise the RuntimeError from on_pop_rate:
     assert bq.pop(timeout=0) is None
 
+
 def test_failed_pop_reports_attempt_and_error_without_decrementing_depth() -> None:
     """A failed backend pop is observable, but never counted as a success."""
     qb = MagicMock(name="QueueBackend")
@@ -595,8 +596,6 @@ def test_push_survives_monitor_failure_after_enqueue() -> None:
     bq.push(Request("https://example.com"))
 
     qb.push.assert_called_once()
-
-
 
 
 def test_push_monitor_can_reenter_close_after_commit() -> None:
@@ -712,6 +711,8 @@ def test_private_pop_observes_after_request_processing(
 
     assert restored is not None
     assert restored.url == request.url
+
+
 @pytest.mark.parametrize(
     "diagnostic_error",
     [RuntimeError("logger boom"), KeyboardInterrupt(), SystemExit()],
