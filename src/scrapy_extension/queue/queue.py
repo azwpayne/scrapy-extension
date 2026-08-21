@@ -311,6 +311,7 @@ class BackendQueue:
         # permanently stops admission on this instance; a scheduler reopen builds a
         # fresh BackendQueue around the reopened strategy.
         self._operation_gate = threading.Condition()
+        self._operation_context = threading.local()
         self._accepting_operations = True
         self._active_operations = 0
         self._close_complete = False
@@ -496,11 +497,27 @@ class BackendQueue:
         persistent dedup marker is safe after a strategy accepts into process-local
         state.
         """
-        self._begin_operation("push")
+        contexts = getattr(self._operation_context, "push_commits", None)
+        if contexts is None:
+            contexts = []
+            self._operation_context.push_commits = contexts
+            self._operation_context.post_commit_push = False
+        contexts.append(False)
         try:
-            return self._push(request, priority)
+            self._begin_operation("push")
+            try:
+                result = self._push(request, priority)
+            finally:
+                self._end_operation()
+            self._emit_push_monitor(priority)
+            return result
+        except BaseException:
+            if contexts[-1]:
+                self._operation_context.post_commit_push = True
+            raise
         finally:
-            self._end_operation()
+            contexts.pop()
+
 
     def _push(self, request: Request, priority: float) -> bool:
         """Execute an admitted push operation."""
@@ -652,6 +669,9 @@ class BackendQueue:
             data,
             require_durable=replacement_ack_token is not None,
         )
+        contexts = getattr(self._operation_context, "push_commits", None)
+        if contexts:
+            contexts[-1] = True
         if replacement_ack_token is not None and push_is_durable is not True:
             # Defense in depth for a malformed custom prepared route. The item may
             # have been published, so keep the source unresolved and permit replay;
@@ -698,19 +718,20 @@ class BackendQueue:
                         request.meta.pop(BACKEND_ACK_TOKEN_META_KEY, None)
                 if replacement_ack_failed:
                     self._record_replacement_ack_failure()
-        push_monitor_failed = False
+        return push_is_durable
+
+    def _emit_push_monitor(self, priority: float) -> None:
+        """Observe a committed push after releasing the operation gate."""
+        monitor_failed = False
         try:
             self._monitor.on_push(self.queue_name, priority)
         except Exception:  # noqa: BLE001 - enqueue has already committed
-            push_monitor_failed = True
-        if push_monitor_failed:
-            # Keep the monitor's ordinary failure swallowed even when its fallback
-            # diagnostic handler raises a control-flow exception.
+            monitor_failed = True
+        if monitor_failed:
             try:
                 logger.debug("monitor.on_push raised; ignored")
             except BaseException:
                 pass
-        return push_is_durable
 
     @serialization_error_boundary(
         _QUEUE_POP_SERIALIZATION_FAILURE,
@@ -740,6 +761,8 @@ class BackendQueue:
             SerializationError: If the request cannot be deserialized.
         """
         self._begin_operation("pop")
+        result: Request | None = None
+        processing_failure: BaseException | None = None
         try:
             try:
                 normalized_timeout = normalize_queue_timeout(timeout)
@@ -749,12 +772,27 @@ class BackendQueue:
                     queue_name=self.queue_name,
                     operation="pop",
                 ) from e
-            return self._pop(normalized_timeout)
+            data, ack_token = self._read_pop(normalized_timeout)
+            try:
+                result = self._process_pop(data, ack_token)
+            except BaseException as exc:
+                processing_failure = exc
         finally:
             self._end_operation()
+        self._emit_pop_monitor()
+        if processing_failure is not None:
+            raise processing_failure
+        return result
+
 
     def _pop(self, timeout: float) -> Request | None:
-        """Execute an admitted pop operation."""
+        """Execute a pop operation without an operation gate."""
+        data, ack_token = self._read_pop(timeout)
+        self._emit_pop_monitor()
+        return self._process_pop(data, ack_token)
+
+    def _read_pop(self, timeout: float) -> tuple[bytes | None, Any | None]:
+        """Read one committed payload and validate its acknowledgement token."""
         data, ack_token = self._pop_with_ack(timeout)
         if ack_token is not None and not isinstance(ack_token, _BoundQueueAckToken):
             # A custom strategy that consumes a deferred-ack backend but returns the
@@ -778,6 +816,10 @@ class BackendQueue:
                     queue_name=self.queue_name,
                     operation="pop",
                 )
+        return data, ack_token
+
+    def _emit_pop_monitor(self) -> None:
+        """Observe a committed pop after releasing the operation gate."""
         # Emit on every pop call — ``queue/pop_attempt_count`` (R14-D rename) is
         # the consumer-liveness signal (pop attempts per second), independent of
         # whether an item was returned. A worker popping an empty queue is itself
@@ -840,6 +882,8 @@ class BackendQueue:
             except BaseException:
                 pass
 
+    def _process_pop(self, data: bytes | None, ack_token: Any | None) -> Request | None:
+        """Process a committed pop while its operation lease is held."""
         if data is None:
             if ack_token is not None:
                 try:
@@ -1292,6 +1336,12 @@ class BackendQueue:
             self._active_operations -= 1
             if self._active_operations == 0:
                 self._operation_gate.notify_all()
+    def _consume_post_commit_push(self) -> bool:
+        """Consume the current thread's interrupted push commit marker."""
+        committed = bool(getattr(self._operation_context, "post_commit_push", False))
+        self._operation_context.post_commit_push = False
+        return committed
+
 
     def ack(self, *, token: Any | None = None) -> None:
         """Acknowledge the popped request identified by ``token``.

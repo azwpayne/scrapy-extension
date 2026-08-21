@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -544,6 +545,72 @@ def test_push_survives_monitor_failure_after_enqueue() -> None:
     qb.push.assert_called_once()
 
 
+
+
+def test_push_monitor_can_reenter_close_after_commit() -> None:
+    """A committed push must not hold the operation gate during on_push."""
+    queue: BackendQueue | None = None
+    monitor = MagicMock()
+
+    def close_queue(_queue_name: str, _priority: float) -> None:
+        assert queue is not None
+        queue.close(lossy=True)
+
+    monitor.on_push.side_effect = close_queue
+    queue = BackendQueue(
+        connection_manager=_cm(),
+        queue_name="q",
+        monitor=monitor,
+    )
+    failures: list[BaseException] = []
+
+    def run_push() -> None:
+        try:
+            queue.push(Request("https://example.com/reentrant-push-close"))
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            failures.append(exc)
+
+    worker = threading.Thread(target=run_push, daemon=True)
+    worker.start()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert failures == []
+    assert queue._close_complete is True
+
+
+def test_pop_monitor_can_reenter_close_after_commit() -> None:
+    """A committed pop must not hold the operation gate during on_pop."""
+    queue: BackendQueue | None = None
+    monitor = MagicMock()
+
+    def close_queue(_queue_name: str) -> None:
+        assert queue is not None
+        queue.close(lossy=True)
+
+    monitor.on_pop.side_effect = close_queue
+    queue = BackendQueue(
+        connection_manager=_cm(),
+        queue_name="q",
+        monitor=monitor,
+    )
+    queue.connection_manager.get_queue_backend().pop.return_value = None
+    failures: list[BaseException] = []
+
+    def run_pop() -> None:
+        try:
+            assert queue is not None
+            assert queue.pop() is None
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            failures.append(exc)
+
+    worker = threading.Thread(target=run_pop, daemon=True)
+    worker.start()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert failures == []
+    assert queue._close_complete is True
 @pytest.mark.parametrize(
     "diagnostic_error",
     [RuntimeError("logger boom"), KeyboardInterrupt(), SystemExit()],
