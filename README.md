@@ -711,11 +711,14 @@ and batched-storage crash loss remain separate contracts below.
 
 ### Queue telemetry freshness
 
-Queue-depth monitoring is sampled: `SCRAPY_QUEUE_DEPTH_SAMPLE_EVERY` controls
-real `queue_len()` probes and cached depth fills the gaps. A confirmed pop
-decrements a cached non-zero depth immediately; a failed pop leaves the cached
-depth unchanged. Every pop attempt, including empty polls and backend failures,
-updates `queue/last_pop_epoch` and increments `queue/pop_attempt_count`.
+Queue-depth monitoring is sampled only while a non-zero cached depth is in its
+sampling window: `SCRAPY_QUEUE_DEPTH_SAMPLE_EVERY` bounds real `queue_len()`
+probes in that active state. An unknown or zero cache is probed on every call so
+drain/idle detection stays fresh. A confirmed pop decrements a cached non-zero
+depth immediately. A failed pop never decrements local depth, although a
+scheduled depth sample on that attempt may refresh the cache from the backend.
+Every pop attempt, including empty polls and backend failures, updates
+`queue/last_pop_epoch` and increments `queue/pop_attempt_count`.
 `ScrapyStatsMonitor` emits the event-sampled rate at
 `queue/pop_rate_1m` for the default 60-second window and at
 `queue/pop_rate_{N}s` for an overridden window. The rate gauge may freeze when

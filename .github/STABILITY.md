@@ -124,15 +124,17 @@ know about:
   Pydantic field type/range/enum failures raise `ValidationError`. See the
   [settings-validation spec](https://github.com/azwpayne/scrapy-extension/blob/main/docs/insight/SPEC-round8-settings-validation.md).
 - **U4 — `queue_len` depth sampling.** `BackendQueue(depth_sample_every=100)`
-  probes real backend depth at most once per 100 pops, reclaiming pop-path RTT
-  budget at default config (`queue/queue.py`). Backpressure gates use the
-  sampled depth when the backend exposes one; set `depth_sample_every=1` to
-  restore per-pop behavior. A confirmed pop decrements a cached non-zero depth
-  immediately, while a failed pop leaves the cache unchanged. Pop attempts,
-  including backend failures, refresh `queue/last_pop_epoch`; the rolling rate
-  is event-sampled and may freeze after a stall. Pulsar and RocketMQ have no
-  configured depth API, so their scheduler degrades conservatively to continued
-  polling without depth-based backpressure.
+  bounds real backend depth probes while a non-zero cached depth is in its
+  sampling window, reclaiming pop-path RTT budget at default config
+  (`queue/queue.py`). An unknown or zero cache is probed on every call so
+  drain/idle detection stays fresh; set `depth_sample_every=1` to restore
+  per-call probing even for non-zero depth. A confirmed pop decrements a cached
+  non-zero depth immediately. A failed pop never decrements local depth, though
+  a scheduled depth sample on that attempt may refresh the cache from the
+  backend. Pop attempts, including backend failures, refresh
+  `queue/last_pop_epoch`; the rolling rate is event-sampled and may freeze after
+  a stall. Pulsar and RocketMQ have no configured depth API, so their scheduler
+  degrades conservatively to continued polling without depth-based backpressure.
 - **U5 — memory default cap.** `MemoryMembershipFilter(maxsize=1_000_000)`
   default + `DelayQueueStrategy(max_held=100_000)` soft-cap warn-once
   prevent silent OOM on long high-cardinality crawls. Explicit

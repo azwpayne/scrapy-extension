@@ -439,7 +439,7 @@ prefer a maintained storage backend when that dependency posture is unacceptable
 | RocketMQ queue pop | Single-outcome message token plus `SCRAPY_ROCKETMQ_INVISIBLE_DURATION` (default 300s). | The message can be delivered again if the pop-to-response interval exceeds the invisibility lease. | No automatic renewal. Token-aware pop never fills the legacy ack slot; ack/nack on one token serialize and a failure remains locally retryable. Explicit nack shortens the lease to RocketMQ's 10-second minimum. Pair set/storage through per-component backends. |
 | Backend/plugin declaring `supports_concurrent_ack=False` | Single ack slot only. | `CONCURRENT_REQUESTS > 1` raises at startup unless `SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS=True` is set. | Keep concurrency at 1, or pick a backend with a real in-flight ack set. |
 | Stateful queue strategies | In-process scheduling/fairness/rate state. | Hard crash can lose held strategy state; a token-bearing replacement is rejected before it enters volatile delay/time-wheel/round-robin/ring-buffer state. | Use a backend-durable push path when replacing an unacked broker delivery; zero effective delay remains a direct backend push. |
-| `batched` storage | Backend-bound in-process write buffer plus active flush snapshot. | Hard crash before flush loses buffered or in-flight items; an ordinary partial failure retries the failing item and tail against their original backends. | Keep caller-owned backends alive through drain and coordinate one shared strategy lifecycle; prefer `passthrough` when persistence must happen before item acknowledgement. |
+| `batched` storage | Backend-bound in-process write buffer plus active flush snapshot. | Hard crash before flush loses buffered or in-flight items; an ordinary partial failure retries the failing item and tail against their original backends. | One pipeline owns each `BatchedStorageStrategy`: same-owner attachment is idempotent, a distinct second owner is rejected; keep the owner and its backends alive through drain. Prefer `passthrough` when persistence must happen before item acknowledgement. |
 
 For TimeWheel specifically, a failed live-backend publication leaves the
 failing slot entry and its untouched tail in original order; entries whose push
@@ -710,14 +710,16 @@ different holder.
 
 ## The depth-sampling knob (round-9 U4)
 
-By default, `BackendQueue` probes real backend queue depth at most once per
-100 pops (`depth_sample_every=100`), keeping the depth signal fresh for
-backpressure gates while reclaiming ~25% of the pop-path RTT budget.
+By default, `BackendQueue` samples real backend queue depth at most once per
+`depth_sample_every=100` calls while a non-zero cached depth is in its sampling
+window. Unknown or zero cached depth is probed on every call so drain/idle
+detection stays fresh; the active non-zero path reclaims pop-path RTT budget.
 
 - **Tune:** set `SCRAPY_QUEUE_DEPTH_SAMPLE_EVERY=<N>` (default `100`).
   Lower for faster backpressure response (more depth RPCs); raise for lower
   pop-path overhead and a staler non-zero sample.
-  `SCRAPY_QUEUE_DEPTH_SAMPLE_EVERY=1` restores per-pop behavior.
+  `SCRAPY_QUEUE_DEPTH_SAMPLE_EVERY=1` restores per-call probing even for
+  non-zero depth.
   (Round-14 R14-C: this setting was deferred in round-9 — the constructor
   default was the only path; the setting now exists and is threaded by
   `BackendScheduler.from_settings` → `BackendQueue(depth_sample_every=…)`.)
@@ -731,9 +733,10 @@ backpressure gates while reclaiming ~25% of the pop-path RTT budget.
 
 After a confirmed pop, a cached non-zero depth is decremented immediately so a
 successful delivery cannot leave an impossible stale depth. A failed backend
-pop leaves the cache unchanged. `on_pop` and `queue/last_pop_epoch` still record
-every attempt, including backend failures; the rolling pop-rate gauge remains
-event-sampled.
+pop never decrements local depth, although a scheduled depth sample on that
+attempt may refresh the cache from the backend. `on_pop` and
+`queue/last_pop_epoch` still record every attempt, including backend failures;
+the rolling pop-rate gauge remains event-sampled.
 
 This knob cannot create a depth signal where the client has no backlog API.
 Pulsar and RocketMQ `queue_len()` raise `NotImplementedError`; the scheduler
