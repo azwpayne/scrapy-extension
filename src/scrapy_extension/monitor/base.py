@@ -238,8 +238,8 @@ class Monitor:
     def on_error(self, operation: str, error: BaseException) -> None:
         """Record an operation error.
 
-        Wired (R14-D) at the ``BackendQueue`` push-except and deserialize-fail
-        arms so serialization failures surface as ``errors/push`` /
+        Wired (R14-D) at the ``BackendQueue`` push-except, pop backend-failure,
+        and deserialize-fail arms so errors surface as ``errors/push`` /
         ``errors/pop`` instead of being dead observability (the hook previously
         had zero call sites).
 
