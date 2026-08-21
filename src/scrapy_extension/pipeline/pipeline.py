@@ -255,7 +255,29 @@ class BackendPipeline:
         self._opening_operation: Deferred[None] | None = None
         self._opening_failure: TwistedFailure | None = None
         if isinstance(self.storage_strategy, BatchedStorageStrategy):
-            self.storage_strategy.attach_owner(self)
+            try:
+                self.storage_strategy.attach_owner(self)
+            except BaseException:
+                if self._owns_connection_manager:
+                    try:
+                        from scrapy_extension.backends.connectors import (
+                            release_manager_acquire,
+                        )
+
+                        if self._connection_manager_lease is not None:
+                            release_manager_acquire(
+                                self._connection_manager_lease,
+                                exact=True,
+                            )
+                        else:
+                            release_manager_acquire(self.connection_manager)
+                    except BaseException:
+                        _emit_diagnostic(
+                            logger.error,
+                            "Failed to release pipeline manager after strategy "
+                            "attachment failure",
+                        )
+                raise
         set_monitor = getattr(self.storage_strategy, "set_monitor", None)
         if callable(set_monitor):
             set_monitor(self._monitor)

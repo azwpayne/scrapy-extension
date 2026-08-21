@@ -1351,6 +1351,33 @@ class TestBackendPipelineStorageStrategy:
         backend.store.assert_called_once()
         assert strategy.pending == 0
 
+    def test_attach_rejection_releases_direct_constructor_acquire(self, mocker):
+        """A rejected direct pipeline does not leak its manager acquire."""
+        from scrapy_extension.backends.connectors import ConnectionManager
+
+        settings = {"host": "batched-owner-rejection"}
+        manager = ConnectionManager.get_manager("redis", settings)
+        strategy = BatchedStorageStrategy()
+        pipeline = BackendPipeline(
+            connection_manager=manager,
+            storage_strategy=strategy,
+        )
+        assert manager._users == 1
+
+        ConnectionManager.get_manager("redis", settings)
+        with pytest.raises(
+            RuntimeError,
+            match="batched storage strategy already has an owner",
+        ):
+            BackendPipeline(
+                connection_manager=manager,
+                storage_strategy=strategy,
+            )
+
+        assert manager._users == 1
+        pipeline.close_spider(mocker.Mock(name="spider"))
+        assert manager._users == 0
+
     def test_batched_monitor_reports_only_durable_flushes(
         self, mock_connection_manager, mocker
     ):
