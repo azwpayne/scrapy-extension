@@ -528,6 +528,30 @@ def test_pop_survives_monitor_pop_rate_failure() -> None:
     # Must return None (empty), NOT raise the RuntimeError from on_pop_rate:
     assert bq.pop(timeout=0) is None
 
+def test_failed_pop_reports_attempt_and_error_without_decrementing_depth() -> None:
+    """A failed backend pop is observable, but never counted as a success."""
+    qb = MagicMock(name="QueueBackend")
+    qb.queue_len.return_value = 3
+    failure = QueueError("pop unavailable")
+    qb.pop.side_effect = failure
+    monitor = MagicMock()
+    bq = BackendQueue(
+        connection_manager=_cm(queue_backend=qb),
+        queue_name="q",
+        monitor=monitor,
+        depth_sample_every=100,
+    )
+
+    assert len(bq) == 3
+    with pytest.raises(QueueError) as raised:
+        bq.pop(timeout=0)
+
+    assert raised.value is failure
+    monitor.on_pop.assert_called_once_with("q")
+    monitor.on_last_pop_epoch.assert_called_once()
+    monitor.on_error.assert_called_once_with("pop", failure)
+    assert bq._cached_depth == 3
+
 
 def test_push_survives_monitor_failure_after_enqueue() -> None:
     """Telemetry failure cannot turn a committed enqueue into caller failure."""

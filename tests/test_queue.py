@@ -2610,6 +2610,33 @@ class TestBackendQueueDepthSampling:
         for _ in range(queue.depth_sample_every):
             queue.pop()
         assert queue._cached_depth == 0
+    def test_successful_pop_decrements_cached_depth_before_monitor(
+        self, mock_connection_manager, mocker
+    ):
+        """A confirmed pop must not leave an impossible cached depth."""
+        backend = mock_connection_manager.get_queue_backend()
+        backend.queue_len.return_value = 2
+        monitor = mocker.MagicMock()
+        queue = BackendQueue(
+            connection_manager=mock_connection_manager,
+            queue_name="test_queue",
+            monitor=monitor,
+            depth_sample_every=100,
+        )
+
+        assert len(queue) == 2
+        request = Request("https://example.com/depth-decrement")
+        backend.pop.return_value = queue._serializer.serialize(
+            queue._request_to_dict(request)
+        )
+
+        popped = queue.pop()
+
+        assert popped is not None
+        assert popped.url == request.url
+        assert queue._cached_depth == 1
+        monitor.on_queue_depth.assert_called_once_with("test_queue", 1)
+        assert backend.queue_len.call_count == 1
 
     def test_len_uses_sampled_depth(self, mock_connection_manager, mock_spider):
         """U4: __len__ also benefits from sampling — repeated len() probes cache.

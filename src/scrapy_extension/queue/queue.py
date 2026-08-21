@@ -777,16 +777,22 @@ class BackendQueue:
             try:
                 normalized_timeout = normalize_queue_timeout(timeout)
             except ValueError as e:
-                raise QueueError(
+                processing_failure = QueueError(
                     str(e),
                     queue_name=self.queue_name,
                     operation="pop",
-                ) from e
-            data, ack_token = self._read_pop(normalized_timeout)
-            try:
-                result = self._process_pop(data, ack_token)
-            except BaseException as exc:
-                processing_failure = exc
+                )
+                processing_failure.__cause__ = e
+            else:
+                try:
+                    data, ack_token = self._read_pop(normalized_timeout)
+                except BaseException as exc:
+                    processing_failure = exc
+                else:
+                    try:
+                        result = self._process_pop(data, ack_token)
+                    except BaseException as exc:
+                        processing_failure = exc
         finally:
             self._end_operation()
         return self._finish_pop_result(result, processing_failure)
@@ -794,13 +800,17 @@ class BackendQueue:
 
     def _pop(self, timeout: float) -> Request | None:
         """Execute a pop operation without an operation gate."""
-        data, ack_token = self._read_pop(timeout)
         processing_failure: BaseException | None = None
         result: Request | None = None
         try:
-            result = self._process_pop(data, ack_token)
+            data, ack_token = self._read_pop(timeout)
         except BaseException as exc:
             processing_failure = exc
+        else:
+            try:
+                result = self._process_pop(data, ack_token)
+            except BaseException as exc:
+                processing_failure = exc
         return self._finish_pop_result(result, processing_failure)
 
     def _read_pop(self, timeout: float) -> tuple[bytes | None, Any | None]:
@@ -831,7 +841,7 @@ class BackendQueue:
         return data, ack_token
 
     def _emit_pop_monitor(self) -> None:
-        """Observe a committed pop after releasing the operation gate."""
+        """Observe a pop attempt after releasing the operation gate."""
         # Emit on every pop call — ``queue/pop_attempt_count`` (R14-D rename) is
         # the consumer-liveness signal (pop attempts per second), independent of
         # whether an item was returned. A worker popping an empty queue is itself
@@ -900,12 +910,27 @@ class BackendQueue:
         result: Request | None,
         processing_failure: BaseException | None,
     ) -> Request | None:
-        """Preserve a data-plane failure over post-commit monitor interruption."""
+        """Preserve data-plane failures and account for confirmed pops."""
+        if processing_failure is None and result is not None:
+            cached_depth = self._cached_depth
+            if cached_depth is not None and cached_depth > 0:
+                self._cached_depth = cached_depth - 1
+
         monitor_failure: BaseException | None = None
+        if (
+            processing_failure is not None
+            and isinstance(processing_failure, Exception)
+            and not isinstance(processing_failure, SerializationError)
+        ):
+            try:
+                self._monitor.on_error("pop", processing_failure)
+            except BaseException as exc:
+                monitor_failure = exc
         try:
             self._emit_pop_monitor()
         except BaseException as exc:
-            monitor_failure = exc
+            if monitor_failure is None:
+                monitor_failure = exc
         if processing_failure is not None:
             raise processing_failure
         if monitor_failure is not None:

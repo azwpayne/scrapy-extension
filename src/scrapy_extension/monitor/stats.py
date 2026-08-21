@@ -79,15 +79,17 @@ class ScrapyStatsMonitor(Monitor):
     - ``queue/push_count`` (counter) — per successful push.
     - ``queue/pop_attempt_count`` (counter) — per pop ATTEMPT (R14-D rename of
       ``queue/pop_count``). ``BackendQueue.pop`` fires :meth:`on_pop` on every
-      call — including empty pops — because the consumer-liveness signal is
-      "is the worker popping at all?", independent of whether an item was
-      returned. The stat name now matches the per-attempt behavior.
+      call — including empty pops and backend failures — because the
+      consumer-liveness signal is "is the worker popping at all?", independent
+      of whether an item was returned. The stat name now matches the
+      per-attempt behavior.
     - ``dupefilter/hit_count`` (counter) — per duplicate request.
     - ``dupefilter/miss_count`` (counter) — per newly-seen request.
     - ``queue/depth`` (gauge) — last-sampled pending depth.
     - ``pipeline/store_count`` (counter) — per successful store.
     - ``errors/<operation>`` (counter) — per operation error. Wired (R14-D) at
-      the ``BackendQueue`` push-except and deserialize-fail arms.
+      the ``BackendQueue`` push-except, pop backend-failure, and deserialize-fail
+      arms.
     - ``queue/backpressure`` (gauge) — set to the sampled ``depth`` when it
       exceeds ``backpressure_threshold``; reset to ``0`` once depth drops back
       under. Set to an int on EVERY depth sample (``0`` under threshold) — it
@@ -157,10 +159,11 @@ class ScrapyStatsMonitor(Monitor):
     def on_pop(self, queue_name: str) -> None:
         """Increment ``queue/pop_attempt_count`` (R14-D rename — per attempt).
 
-        ``BackendQueue.pop`` fires this on every call — including empty pops —
-        because the consumer-liveness signal is "is the worker popping at all?",
-        independent of whether an item was returned. The stat key was renamed
-        from ``queue/pop_count`` so the name matches the per-attempt behavior.
+        ``BackendQueue.pop`` fires this on every call — including empty pops and
+        backend failures — because the consumer-liveness signal is "is the worker
+        popping at all?", independent of whether an item was returned. The stat
+        key was renamed from ``queue/pop_count`` so the name matches the
+        per-attempt behavior.
 
         Backward-compat: the legacy ``queue/pop_count`` key is ALSO incremented
         so existing dashboards and the out-of-scope test suite keep working
