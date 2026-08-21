@@ -2838,3 +2838,55 @@ def test_apply_scrapy_breaker_policy_warns_on_dropped_differing_policy(
         assert breaker.failure_threshold == 3  # first explicit policy wins
     finally:
         manager.close()
+
+
+@pytest.mark.parametrize(
+    "target_state",
+    (BreakerState.CLOSED, BreakerState.OPEN, BreakerState.HALF_OPEN),
+)
+def test_apply_matching_scrapy_policy_preserves_env_breaker(
+    monkeypatch, target_state
+):
+    """A matching explicit policy must not replace an env-fallback breaker."""
+    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_ENABLED", "true")
+    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "1")
+    monkeypatch.setenv("SCRAPY_CIRCUIT_BREAKER_RESET_TIMEOUT", "30")
+
+    from scrapy.settings import Settings as ScrapySettings
+
+    manager = ConnectionManager.get_manager(
+        BackendType.REDIS,
+        {"host": f"r137-matching-policy-{target_state.value}"},
+    )
+    try:
+        breaker = manager._get_breaker()
+        assert breaker is not None
+
+        if target_state is BreakerState.OPEN:
+            with pytest.raises(BackendError):
+                breaker.call(lambda: (_ for _ in ()).throw(BackendError("failure")))
+        elif target_state is BreakerState.HALF_OPEN:
+            with pytest.raises(BackendError):
+                breaker.call(lambda: (_ for _ in ()).throw(BackendError("failure")))
+            opened_at = breaker.last_failure_time
+            assert opened_at is not None
+            breaker._time_fn = lambda: opened_at + breaker.reset_timeout
+            with breaker._lock:
+                admission = breaker._allow_call()
+            assert admission.state is BreakerState.HALF_OPEN
+
+        assert breaker.state is target_state
+        manager.apply_scrapy_breaker_policy(
+            ScrapySettings(
+                {
+                    "SCRAPY_CIRCUIT_BREAKER_ENABLED": True,
+                    "SCRAPY_CIRCUIT_BREAKER_FAILURE_THRESHOLD": 1,
+                    "SCRAPY_CIRCUIT_BREAKER_RESET_TIMEOUT": 30.0,
+                }
+            )
+        )
+
+        assert manager._get_breaker() is breaker
+        assert breaker.state is target_state
+    finally:
+        manager.close()

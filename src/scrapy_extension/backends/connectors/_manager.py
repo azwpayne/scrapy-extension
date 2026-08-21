@@ -2609,9 +2609,16 @@ class ConnectionManager:
         policy_values = (enabled, failure_threshold, reset_timeout)
         warn_differing_policy = False
         with self._lock:
-            if self._breaker_configured and not (
-                self._breaker_resolved_from_env_fallback
-            ):
+            if self._breaker_configured and self._breaker_resolved_from_env_fallback:
+                if self._breaker_policy_values == policy_values:
+                    return
+                self._install_breaker_locked(
+                    enabled,
+                    failure_threshold,
+                    reset_timeout,
+                    from_env_fallback=False,
+                )
+            elif self._breaker_configured:
                 if (
                     self._breaker_policy_values != policy_values
                     and not self._dropped_breaker_policy_warned
