@@ -14,6 +14,14 @@ ports and the discovered Redis master accept TLS using the configured CA.
 verification is enabled by default. The backend never downgrades Sentinel
 discovery to plaintext when the Redis data-plane TLS flag is set.
 
+## Timeout ownership
+
+`SCRAPY_REACTOR_IO_TIMEOUT` bounds caller-visible waits and caps connection
+manager retry sleeps. It does not interrupt a synchronous Python thread or
+cancel an SDK call already in progress. The selected backend's native socket or
+RPC timeout must therefore bound each individual request; configure both
+policies when a tighter scheduler heartbeat is required.
+
 ## Operate Pulsar receive pumps
 
 Pulsar polling owns one background receive pump and a buffer of at most 100
@@ -198,7 +206,7 @@ required. Names are case-sensitive: use lowercase `passthrough` or `batched`.
 | Strategy | When to use | Durability boundary |
 |---|---|---|
 | `passthrough` (default) | Item loss is unacceptable; backend round trips are acceptable. | Each item is written directly to the selected `StorageBackend`. |
-| `batched` | Higher throughput is more important than immediate persistence. | Backend-bound items sit in a global FIFO until the threshold, configured age, or spider close triggers a flush. Each item drains through the exact backend supplied with it; hard crash before or during flush loses buffered or in-flight work, while an ordinary store exception re-enqueues the backend-bound failing item and unwritten tail. Accepted work is bounded across the buffer and in-flight flush snapshot. |
+| `batched` | Higher throughput is more important than immediate persistence. | Backend-bound items sit in a global FIFO until the threshold, configured age, or spider close triggers a flush. Each item drains through the exact backend supplied with it; hard crash before or during flush loses buffered or in-flight work, while an ordinary store exception re-enqueues the backend-bound failing item and unwritten tail. Accepted work is bounded across the buffer and in-flight flush snapshot. One strategy has one lifecycle owner; a distinct second pipeline attachment is rejected. |
 
 ```python
 # settings.py
@@ -232,6 +240,10 @@ and direct `BackendPipeline` construction. Set the setting or constructor
 argument explicitly to `None` only to opt into best-effort loss (swallow and
 count storage errors); an unset setting never selects that mode.
 
+Each `BatchedStorageStrategy` has one lifecycle owner. Attaching the same
+pipeline owner again is idempotent; attaching a distinct second pipeline raises
+before it can share the buffer, age flusher, or close boundary.
+
 Treat every failed batched close as an incomplete shutdown. The pipeline fences
 that lifecycle in a retry-only closing state: it rejects `process_item()` and
 `open_spider()`, retains manager ownership, and accepts only another
@@ -242,6 +254,15 @@ successful drain is different: release outcome is ambiguous and the pipeline is
 terminal, so do not call close again (which could double-decrement ownership).
 
 Use `passthrough` for the strongest persistence semantics. Use `batched` only with idempotent downstream consumers and an explicit crash-before-flush tolerance. When a blocked backend keeps the cap full, the next item is rejected immediately with `StorageBackpressureError`; treat that as an admission failure and let the crawler's retry/failure policy decide what to do, rather than assuming the item was persisted.
+
+## Download-level ACK boundary
+
+For deferred-ack queue backends, ACK/NACK remains tied to Scrapy's downloader
+signals: `response_received` or `spider_error`. It is not delayed until the
+spider callback or item pipeline completes, so queue ACK semantics do not
+promise item-pipeline at-least-once delivery. Use idempotent item processing and
+`passthrough` (or another durable storage topology) when persistence must
+precede downstream acknowledgement.
 
 ## Queue and dupefilter identity rollout
 
@@ -379,6 +400,10 @@ use idempotent values/keys. The ordinary pymemcache client has one protocol
 socket, so this backend serializes storage calls, health probes, and disconnect;
 expect one in-flight operation per connected backend generation.
 
+The supported `pymemcache>=4,<5` range currently resolves to the unmaintained
+4.0.0 release. Treat this as a supply-chain caveat when approving Memcached;
+prefer a maintained storage backend when that dependency posture is unacceptable.
+
 ## Safe clearing
 
 - Redis clear operations scan only `<namespace>:storage:*`; they never issue
@@ -409,7 +434,7 @@ expect one in-flight operation per connected backend generation.
 |---|---|---|---|
 | Redis / MongoDB queue pop | Atomic pop removes the item from the backend queue. Redis never automatically replays a transport-failed pop. | A worker crash after pop can lose the request unless the spider re-enqueues or the backend implementation provides its own recovery. A lost Redis response may hide one already-consumed item even though the SDK does not consume a second. | Use idempotent callbacks and durable item storage for critical crawls. Reconcile an ambiguous Redis failure before issuing another pop. |
 | ElasticSearch queue pop | Search plus optimistic-concurrency delete; explicit HTTP 409 races retry up to three searches. Every data mutation uses a no-replay client view. | A committed delete whose response is lost raises `QueueOutcomeIndeterminateError`; no SDK replay occurs, but the item may already be gone. This is not exactly-once delivery. | Reconcile the stable queue document/domain state before retrying. Treat malformed, timed-out, or partial search/delete responses as failures, never as an empty queue. |
-| Kafka / RabbitMQ / Pulsar queue pop | `pop_with_ack()` returns a per-message token; scheduler acks on Scrapy `response_received`. Kafka binds tokens to generation/assignment/attempt; Pulsar permits one successful terminal action and keeps client failures retryable. | Crash before ack redelivers. Kafka nacks/rebalances retire the old attempt so its late completion cannot commit the replacement. Crash after response but before callback/pipeline completion can lose downstream work. | Treat ack as downloader-level, not end-to-end completion. Retry the same Pulsar token after a reported client failure. RabbitMQ push waits for a publisher confirm and raises on unroutable/nacked delivery. |
+| Kafka / RabbitMQ / Pulsar queue pop | `pop_with_ack()` returns a per-message token; scheduler settles it on Scrapy `response_received` or `spider_error` (download-level). Kafka binds tokens to generation/assignment/attempt; Pulsar permits one successful terminal action and keeps client failures retryable. | Crash before ack redelivers. Kafka nacks/rebalances retire the old attempt so its late completion cannot commit the replacement. Crash after response but before callback/pipeline completion can lose downstream work. | Treat ACK as downloader-level, not pipeline-level; size broker leases above worst-case pop-to-response time. |
 | SQS queue pop | Receipt-handle token plus `SCRAPY_SQS_VISIBILITY_TIMEOUT` (default 300s). | The message can be delivered again if the pop-to-response interval exceeds the visibility lease. | No automatic renewal. Size the lease above worst-case download time. Explicit nack sets visibility to 0 for immediate redelivery. |
 | RocketMQ queue pop | Single-outcome message token plus `SCRAPY_ROCKETMQ_INVISIBLE_DURATION` (default 300s). | The message can be delivered again if the pop-to-response interval exceeds the invisibility lease. | No automatic renewal. Token-aware pop never fills the legacy ack slot; ack/nack on one token serialize and a failure remains locally retryable. Explicit nack shortens the lease to RocketMQ's 10-second minimum. Pair set/storage through per-component backends. |
 | Backend/plugin declaring `supports_concurrent_ack=False` | Single ack slot only. | `CONCURRENT_REQUESTS > 1` raises at startup unless `SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS=True` is set. | Keep concurrency at 1, or pick a backend with a real in-flight ack set. |
@@ -704,6 +729,12 @@ backpressure gates while reclaiming ~25% of the pop-path RTT budget.
   keeps the comparison within ~1% variance of the real depth at default
   config.
 
+After a confirmed pop, a cached non-zero depth is decremented immediately so a
+successful delivery cannot leave an impossible stale depth. A failed backend
+pop leaves the cache unchanged. `on_pop` and `queue/last_pop_epoch` still record
+every attempt, including backend failures; the rolling pop-rate gauge remains
+event-sampled.
+
 This knob cannot create a depth signal where the client has no backlog API.
 Pulsar and RocketMQ `queue_len()` raise `NotImplementedError`; the scheduler
 then skips depth-based backpressure for that poll, assumes pending work for idle
@@ -757,7 +788,7 @@ read-only depth gauge (R21-B made it live):
 | Setting | Default | Surface |
 |---|---|---|
 | `SCRAPY_MONITOR_BACKPRESSURE_THRESHOLD` | `1000` | Depth above which `queue/backpressure` flips on |
-| `SCRAPY_MONITOR_POP_RATE_WINDOW_S` | `60.0` | Trailing window (seconds) for the `queue/pop_rate_1m` gauge (window-tagged: `_1m` at the default 60s, `_{N}s` when overridden); capped at 86400 s (24 h) — R23-E: an unbounded window was a soft-OOM foot-gun (the pop-timestamp deque grows without eviction) |
+| `SCRAPY_MONITOR_POP_RATE_WINDOW_S` | `60.0` | Trailing window (seconds) for the pop-rate gauge: `queue/pop_rate_1m` at the default 60s, `queue/pop_rate_{N}s` when overridden; capped at 86400 s (24 h) — R23-E: an unbounded window was a soft-OOM foot-gun (the pop-timestamp deque grows without eviction) |
 | `queue/delay_depth` (read-only gauge) | — | Live depth of the in-process `DelayQueueStrategy` holding heap (R21-B; emits via `ScrapyStatsMonitor.on_delay_depth`); alert here to catch delay-heap growth before `SCRAPY_QUEUE_DELAY_MAX_HELD` fires |
 
 Both are threaded by `BackendScheduler.from_settings` → the resolved
@@ -766,18 +797,21 @@ Both are threaded by `BackendScheduler.from_settings` → the resolved
 
 ## Diagnose a stuck crawl (page on last-pop age)
 
-The rolling `queue/pop_rate_1m` gauge is event-sampled and can freeze at its
-last nonzero value when pops stop completely; it does not run a background
-heartbeat. Use `queue/last_pop_epoch` as the primary liveness signal and compute
-`current_epoch - last_pop_epoch` in the external monitoring system. The epoch is
-updated on every pop attempt, including empty polls, so its age continues to
-grow without any new queue event or component-owned timer. Pair it with
-`dupefilter/filter_saturation` and the supporting stats below:
+The rolling pop-rate gauge (`queue/pop_rate_1m` by default;
+`queue/pop_rate_{N}s` for an overridden window) is event-sampled and can freeze
+at its last nonzero value when pops stop completely; it does not run a
+background heartbeat. Use `queue/last_pop_epoch` as the primary liveness signal
+and compute `current_epoch - last_pop_epoch` in the external monitoring system.
+The epoch is updated on every pop attempt, including empty polls and backend
+failures, so its age continues to grow without any new queue event or
+component-owned timer. Pair it with `dupefilter/filter_saturation` and the
+supporting stats below:
 
 | Stat | What it tells you |
 |---|---|
 | `queue/last_pop_epoch` | Wall-clock Unix epoch of the latest pop attempt. Alert on externally computed age; unlike pop rate, this remains diagnostically useful when events stop. |
-| `queue/pop_rate_1m` | Event-sampled pop attempts/sec. Useful while events flow, but may freeze after a complete stall; do not use it alone for stall paging. |
+| `queue/pop_rate_1m` / `queue/pop_rate_{N}s` | Event-sampled pop attempts/sec over the configured trailing window. Useful while events flow, but may freeze after a complete stall; do not use it alone for stall paging. |
+| `errors/pop` | Backend pop failures and pop deserialization failures reported through `Monitor.on_error`; a non-zero value means the pop path is failing, not that a request was delivered. |
 | `queue/depth` (sampled, U4) | Depth of a backend that supports `queue_len`. `0` = empty only when a sample was available; Pulsar/RocketMQ do not emit a broker depth. |
 | `dupefilter/hit_count` | Per-duplicate request count (monitor/stats.py). High + rising = dedup actively filtering. |
 | `dupefilter/miss_count` | Per-newly-seen request count (monitor/stats.py). Complement to `hit_count` — rising = novel URLs still arriving. |

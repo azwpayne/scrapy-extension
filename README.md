@@ -433,9 +433,10 @@ usually unreachable from the host.
 </details>
 
 > **At-least-once delivery:** RocketMQ uses a deferred-ack model — `pop`
-> returns a message body **without** acking; the scheduler acks via
-> `ack(token=msg)` when Scrapy emits `response_received`. A crash before ack → the
-> broker's invisible-duration window redelivers (at-least-once, not exactly-once).
+> returns a message body **without** acking; the scheduler settles the token
+> when Scrapy emits `response_received` or `spider_error` (download-level). A
+> crash before settlement → the broker's invisible-duration window redelivers
+> (at-least-once, not exactly-once).
 > The lease is not auto-renewed: configure `INVISIBLE_DURATION` above the
 > maximum expected pop-to-downloader-response time. Explicit nack shortens the
 > lease to RocketMQ's 10-second minimum.
@@ -547,7 +548,10 @@ Memcached cannot enumerate or prefix-delete application keys. Consequently,
 default. Enabling `ALLOW_FLUSH_ALL` permits a server-wide destructive flush and
 is appropriate only for a dedicated Memcached instance. That permission is
 captured by the connected client generation; later settings mutation cannot
-enable a flush, and the server must return an explicit successful reply.
+enable a flush, and the server must return an explicit successful reply. The
+supported `pymemcache>=4,<5` range currently resolves to the unmaintained 4.0.0
+release; treat that as an explicit supply-chain caveat when approving this
+backend.
 
 ### DynamoDB (standalone=LocalStack, cloud=AWS, NoSQL KV)
 
@@ -694,14 +698,28 @@ What the library contractually promises — and just as importantly, what it doe
 | Dedup | `cuckoo` | Per-process | Pure-stdlib; successful inserts **never produce false negatives**; item-level deletion is fail-safe unsupported because fingerprints can collide; failed-push compensation uses one bounded retry allowance; raises `FilterFull` at capacity (degrades to passthrough + warn-once). |
 | Storage | all storage-capable backends | Yes | Via the `StorageBackend` KV+TTL contract. |
 
-**Defaults are distributed and crash-safe at-least-once.** `set` dedup +
-`passthrough` queue are safe for multi-worker crawls out of the box: a failed or
-crashed push cannot leave a persistent marker for work no queue accepted. This
-does not promise a cross-worker single winner for a brand-new fingerprint;
-concurrent misses may enqueue safe replay. `delay` / `throttle` /
+**Defaults provide distributed, crash-safe at-least-once scheduler admission.**
+`set` dedup + `passthrough` queue are safe for multi-worker crawls out of the
+box: a failed or crashed push cannot leave a persistent marker for work no queue
+accepted. This does not promise a cross-worker single winner for a brand-new
+fingerprint; concurrent misses may enqueue safe replay. `delay` / `throttle` /
 `round_robin` / `time_wheel` / `ring_buffer` / `memory` / `bloom` / `cuckoo`
 are **per-process opt-in**. `priority` and correctly configured
-`work_stealing` retain backend-side payload durability.
+`work_stealing` retain backend-side payload durability. This scheduler-admission
+guarantee is not an item-pipeline at-least-once guarantee; pipeline ACK timing
+and batched-storage crash loss remain separate contracts below.
+
+### Queue telemetry freshness
+
+Queue-depth monitoring is sampled: `SCRAPY_QUEUE_DEPTH_SAMPLE_EVERY` controls
+real `queue_len()` probes and cached depth fills the gaps. A confirmed pop
+decrements a cached non-zero depth immediately; a failed pop leaves the cached
+depth unchanged. Every pop attempt, including empty polls and backend failures,
+updates `queue/last_pop_epoch` and increments `queue/pop_attempt_count`.
+`ScrapyStatsMonitor` emits the event-sampled rate at
+`queue/pop_rate_1m` for the default 60-second window and at
+`queue/pop_rate_{N}s` for an overridden window. The rate gauge may freeze when
+pop events stop; use the last-pop epoch for freshness.
 
 ### Contractual promises
 
@@ -872,7 +890,7 @@ values (`passthrough` or `batched`). `BackendPipeline` delegates item writes to 
 | Strategy | Behavior | Durability note |
 |----------|----------|-----------------|
 | `passthrough` (default) | writes each serialized item directly to the selected `StorageBackend` | backend durability applies immediately after `store()` returns |
-| `batched` | buffers backend-bound records and flushes them in global insertion order at threshold / spider close | every record retains the exact backend passed to its `store()` call through age/manual/close drains and partial-failure retry; accepted work is capped across the retry buffer and in-flight snapshot (default: `2 × threshold`), and a full strategy raises `StorageBackpressureError` before accepting another item |
+| `batched` | buffers backend-bound records and flushes them in global insertion order at threshold / spider close | every record retains the exact backend passed to its `store()` call through age/manual/close drains and partial-failure retry; accepted work is capped across the retry buffer and in-flight snapshot (default: `2 × threshold`), and a full strategy raises `StorageBackpressureError` before accepting another item. One `BatchedStorageStrategy` has one lifecycle owner; a distinct second pipeline attachment is rejected. A hard crash before or during flush can lose buffered or in-flight work. |
 
 Use `passthrough` when item loss is unacceptable. Use `batched` only when throughput is worth the crash-before-flush trade-off and duplicate writes are acceptable after partial flush retry.
 
@@ -920,11 +938,11 @@ before releasing the manager.
 | Surface | Ack / state boundary | Crash behavior | Operational guidance |
 |---|---|---|---|
 | Redis / MongoDB / ElasticSearch queue pop | atomic backend pop; scheduler ack is inert; Redis does not replay an outcome-ambiguous transport failure | item is removed once popped; a later callback/pipeline crash can lose downstream item work. A lost Redis response may hide one already-consumed item, but the SDK will not consume a second item in the same call | pair with idempotent callbacks/pipelines when end-to-end exactly-once matters; reconcile an ambiguous Redis failure before another pop |
-| Kafka / RabbitMQ / Pulsar queue pop | per-message token stored in request meta and acked on Scrapy `response_received` | crash before ack redelivers; crash after downloader response but before callback/pipeline completion can drop downstream processing | safe under `CONCURRENT_REQUESTS > 1`; RabbitMQ push waits for publisher confirmation, but a durable receipt additionally requires `durable=True`, `auto_delete=False`, `exclusive=False`, and `delivery_mode=2` on the connected generation |
-| SQS / RocketMQ queue pop | per-message token plus a finite broker visibility/invisibility lease | an unacked message becomes deliverable again when the lease expires, including while a slow download is still running | no automatic lease renewal; set the lease above maximum pop-to-response time. SQS nack is immediate; RocketMQ nack uses its 10-second floor |
+| Kafka / RabbitMQ / Pulsar queue pop | per-message token stored in request meta and acked on Scrapy `response_received` or `spider_error` (download-level) | crash before ack redelivers; crash after downloader response but before callback/pipeline completion can drop downstream processing | safe under `CONCURRENT_REQUESTS > 1`; RabbitMQ push waits for publisher confirmation, but a durable receipt additionally requires `durable=True`, `auto_delete=False`, `exclusive=False`, and `delivery_mode=2` on the connected generation |
+| SQS / RocketMQ queue pop | per-message token plus a finite broker visibility/invisibility lease; settlement remains tied to Scrapy `response_received` or `spider_error` | an unacked message becomes deliverable again when the lease expires, including while a slow download is still running | no automatic lease renewal; set the lease above maximum pop-to-response time. SQS nack is immediate; RocketMQ nack uses its 10-second floor |
 | Backend/plugin declaring `supports_concurrent_ack=False` | single ack slot only | `CONCURRENT_REQUESTS > 1` raises at startup unless `SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS=True` | keep `CONCURRENT_REQUESTS=1` for such backends, or choose one with a real in-flight ack set |
 | Stateful queue strategies | in-process scheduling/fairness/rate/buffer state, with best-effort snapshot only where implemented | hard crash can lose held strategy state even if backend queue survives; a token-bearing replacement is rejected before entering volatile delay/time-wheel/round-robin/ring-buffer state | use a backend-durable push path (`passthrough`, `priority`, `work_stealing`, `throttle`, or zero effective delay) when replacing an unacked broker delivery |
-| `batched` storage | backend-bound in-process item buffer before backend `store()` | hard crash before flush loses buffered items; partial store exceptions retry the backend-bound unwritten tail in global FIFO order | keep every caller-provided backend alive until drain; prefer `passthrough` when persistence must happen before item acknowledgement |
+| `batched` storage | backend-bound in-process item buffer before backend `store()` | hard crash before flush loses buffered items and a crash during a detached in-flight flush can lose that work; partial store exceptions retry the backend-bound unwritten tail in global FIFO order; a second pipeline owner is rejected | keep every caller-provided backend alive until drain; prefer `passthrough` when persistence must happen before item acknowledgement |
 
 Within a live TimeWheel drain, each slot entry remains owned until its backend
 push returns. A failure keeps the failing item and untouched tail in their
@@ -932,7 +950,11 @@ original order, while a confirmed prefix is removed. If the backend accepts an
 item and a process-control signal arrives before local removal, retry may
 publish that one item again; consumers must retain at-least-once idempotence.
 
-Ack is tied to Scrapy downloader response delivery, not spider callback or item pipeline completion. If a crawl must tolerate process death after response download but before item persistence, make item processing idempotent and use a durable storage strategy/topology.
+Ack is tied to Scrapy downloader response delivery — `response_received` or
+`spider_error` — not spider callback or item pipeline completion. If a crawl must
+tolerate process death after response download but before item persistence, make
+item processing idempotent and use a durable storage strategy/topology; do not
+read the queue ACK as a pipeline-level at-least-once guarantee.
 
 Replacement publication and source acknowledgement are two broker operations,
 not one distributed transaction. The scheduler orders them as “replacement

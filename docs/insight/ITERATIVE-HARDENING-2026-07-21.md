@@ -134,11 +134,12 @@ speculative work.
 - [x] **PLUGIN-01 — descriptor boundary.** Validate entry-point name,
   `backend_type`, dotted class paths, and duplicates. Logging a broken plugin
   must not become an exception under warnings-as-errors.
-- [ ] **PLUGIN-CONFIG-01 — preserve selected plugin settings.** Resolve the
+- [x] **PLUGIN-CONFIG-01 — preserve selected plugin settings.** Resolve the
   selected third-party settings model before splitting manager and backend
-  configuration, so plugin fields named `retry_attempts` or `retry_delay` are
-  not silently stripped and reinterpreted as manager retry policy. Manager
-  aliases must remain explicit and built-in settings behavior unchanged.
+  configuration, so plugin fields named `retry_attempts` or `retry_delay` remain
+  plugin-owned and are not silently stripped or reinterpreted as manager retry
+  policy. Explicit manager retry aliases remain independent; built-in settings
+  behavior is unchanged. Landed in R80.
 - [x] **RUN-01 — circuit-breaker boundary.** Treat breaker-open queue reads and
   dedup checks as expected temporary backend failures rather than scheduler
   crashes.
@@ -253,10 +254,11 @@ speculative work.
   `requires_ack` backend to override pop-with-token, ack, and nack, and reject a
   delivered item with no token at runtime. Treat `(None, token)` as a real
   delivery that must be settled rather than scanning past and losing ownership.
-- [ ] **OBS-01 — truthful queue-stall telemetry.** Count failed pop attempts and
-  errors, expose attempt freshness, and stop promising that an event-driven
-  rate gauge decays without another event. Invalidate or decrement a cached
-  nonzero depth immediately after a successful pop.
+- [x] **OBS-01 — truthful queue-stall telemetry.** Count every pop attempt,
+  including backend failures, record pop errors and attempt freshness, and
+  document that the event-sampled rate gauge does not decay without another
+  event. A successful pop decrements a cached non-zero depth immediately; a
+  failed pop leaves that cache unchanged.
 - [ ] **DOC-DEDUP-01 — bounded no-false-negative promise.** Limit the Cuckoo
   guarantee to fingerprints successfully inserted before full degradation and
   document that overflow requests can pass repeatedly.
@@ -264,9 +266,10 @@ speculative work.
   entry's backend through threshold, age, close, and partial-failure flushes so
   sharing a batch strategy cannot write an earlier entry to the later caller's
   backend.
-- [ ] **STORAGE-02 — shared strategy lifecycle ownership.** Either coordinate
-  shared batched-strategy owners or reject a second attachment explicitly, so
-  closing one pipeline cannot terminate another live pipeline's storage path.
+- [x] **STORAGE-02 — shared strategy lifecycle ownership.** A
+  `BatchedStorageStrategy` has one lifecycle owner: attaching the same owner is
+  idempotent, while attaching a second owner is rejected explicitly so closing
+  one pipeline cannot terminate another pipeline's storage path.
 - [ ] **STORAGE-03 — retryable pipeline close.** Do not make a failed batched
   close permanently terminal or release its manager while a retry tail remains;
   a later close attempt must be able to drain before backend teardown.
@@ -2192,3 +2195,34 @@ advisory otherwise. Fresh fan-out registered independent next slices for
 RingBuffer interruption, backend-aware durability, SQS name ownership, MongoDB
 generations, Scrapy dupefilter lifecycle, deferred ACK ownership, lifecycle
 teardown, and observation isolation; none changes the bounded I48 contract.
+
+### Post-I48 maintenance — Tasks 1–4
+
+The following reviewed commits are landed maintenance corrections; they do not
+close the remaining backend-generation or open-frontier work in this register.
+
+- **Task 1 — queue telemetry re-entry and post-commit marker handling.**
+  Commits `c2b6b8a0` and `5d5624de` move queue push/pop telemetry outside the
+  operation gate, preserve the original pop failure, and fence the
+  post-commit marker so a monitor interruption after a physical push cannot be
+  treated as an uncommitted enqueue. The focused regression coverage is in
+  `tests/test_queue_resilience.py` and `tests/test_scheduler_backpressure.py`.
+- **Task 2 — matching breaker policy.** Commit `63dac849` preserves the existing
+  environment-fallback breaker instance and its CLOSED, OPEN, or HALF_OPEN state
+  when the later Scrapy policy has matching values; a differing explicit policy
+  still follows the first-policy rule. Focused coverage is in
+  `tests/test_connection_manager.py` and `tests/test_spider_mixin.py`.
+- **Task 3 — batched single-owner guard.** Commit `ca436f39` makes same-owner
+  attachment idempotent and rejects a distinct second pipeline owner before it
+  can share the buffer, flusher, or close boundary. Focused coverage is in
+  `tests/test_storage_strategies.py` and `tests/test_pipeline.py`.
+- **Task 4 — depth and pop telemetry freshness.** Commit `2550b8b5` reports
+  backend pop failures through `on_error("pop", ...)`, keeps pop-attempt and
+  `last_pop_epoch` signals fresh on failures, decrements a cached non-zero depth
+  after a confirmed pop, and retains sampled depth/rate behavior. The
+  corresponding monitor, queue, and resilience regressions are in
+  `tests/test_monitor.py`, `tests/test_queue.py`, and
+  `tests/test_queue_resilience.py`.
+
+These entries record local commit and focused-test evidence only; they do not
+claim a live broker integration run or a full-suite result.
