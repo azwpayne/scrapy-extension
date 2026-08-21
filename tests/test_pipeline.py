@@ -1318,43 +1318,37 @@ class TestBackendPipelineStorageStrategy:
         assert store.call_count == 2
         assert strat.pending == 0
 
-    def test_shared_batched_strategy_preserves_pipeline_backend_affinity(self, mocker):
-        """Each pipeline item drains through the backend accepted with that item."""
-        from scrapy_extension.storage.strategies.batched import (
-            BatchedStorageStrategy,
-        )
-
-        backend_a = mocker.Mock()
-        backend_b = mocker.Mock()
-        manager_a = mocker.Mock()
-        manager_b = mocker.Mock()
-        manager_a.get_storage_backend.return_value = backend_a
-        manager_b.get_storage_backend.return_value = backend_b
+    def test_shared_batched_strategy_rejects_second_pipeline(self, mocker):
+        """An independently owned second pipeline cannot close shared state."""
         strategy = BatchedStorageStrategy(threshold=2)
+        manager = mocker.Mock()
+        backend = mocker.Mock()
+        manager.get_storage_backend.return_value = backend
+        monitor_a = mocker.Mock()
+        monitor_b = mocker.Mock()
         pipeline_a = BackendPipeline(
-            connection_manager=manager_a,
-            ttl=11,
+            connection_manager=manager,
             storage_strategy=strategy,
+            monitor=monitor_a,
         )
-        pipeline_b = BackendPipeline(
-            connection_manager=manager_b,
-            ttl=22,
-            storage_strategy=strategy,
-        )
-        pipeline_a._storage_supported = True
-        pipeline_b._storage_supported = True
-        spider_a = mocker.Mock(name="spider_a")
-        spider_b = mocker.Mock(name="spider_b")
-        spider_a.name = "alpha"
-        spider_b.name = "beta"
 
-        pipeline_a.process_item(SampleItem(name="a", value=1), spider_a)
-        pipeline_b.process_item(SampleItem(name="b", value=2), spider_b)
+        with pytest.raises(
+            RuntimeError,
+            match="batched storage strategy already has an owner",
+        ):
+            BackendPipeline(
+                connection_manager=manager,
+                storage_strategy=strategy,
+                monitor=monitor_b,
+            )
+        assert strategy._monitor is monitor_a
 
-        backend_a.store.assert_called_once()
-        backend_b.store.assert_called_once()
-        assert backend_a.store.call_args.kwargs == {"ttl": 11}
-        assert backend_b.store.call_args.kwargs == {"ttl": 22}
+        spider = mocker.Mock(name="spider")
+        spider.name = "spider"
+        pipeline_a.process_item(SampleItem(name="a", value=1), spider)
+        pipeline_a.close_spider(spider)
+
+        backend.store.assert_called_once()
         assert strategy.pending == 0
 
     def test_batched_monitor_reports_only_durable_flushes(

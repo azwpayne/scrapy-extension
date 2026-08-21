@@ -167,6 +167,7 @@ class BatchedStorageStrategy(StorageStrategy):
         # has detached its batch and started writing outside _lock.
         self._flush_lock = threading.Lock()
         self._closed = False
+        self._owner: object | None = None
         self._monitor: Monitor = monitor if monitor is not None else NullMonitor()
         # Risk 2: oldest-buffered-item timestamp (monotonic) + flusher lifecycle.
         # ``_oldest_ts`` is None whenever the buffer is empty; set on first append
@@ -174,6 +175,24 @@ class BatchedStorageStrategy(StorageStrategy):
         self._oldest_ts: float | None = None
         self._flusher: threading.Thread | None = None
         self._stop = threading.Event()
+
+    def attach_owner(self, owner: object) -> None:
+        """Attach exactly one lifecycle owner to the strategy.
+
+        A batched strategy has one close boundary for its buffer and age flusher.
+        Reattaching the same owner is harmless, while a distinct pipeline is
+        rejected rather than silently sharing that close boundary.
+        """
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("batched storage strategy is closed")
+            if self._owner is None:
+                self._owner = owner
+                return
+            if self._owner is owner:
+                return
+            raise RuntimeError("batched storage strategy already has an owner")
+
 
     @property
     def pending(self) -> int:
@@ -417,6 +436,9 @@ class BatchedStorageStrategy(StorageStrategy):
                 key=None,
             )
 
+        if primary_error is None:
+            with self._lock:
+                self._owner = None
         if primary_error is not None:
             raise primary_error
 

@@ -128,6 +128,25 @@ class TestPassthroughStorageStrategy:
 class TestBatchedStorageStrategy:
     """Buffers items, flushes at threshold, drains on close."""
 
+    def test_owner_attachment_is_idempotent_for_same_owner(self) -> None:
+        strategy = BatchedStorageStrategy()
+        owner = object()
+
+        strategy.attach_owner(owner)
+        strategy.attach_owner(owner)
+
+        strategy.close()
+
+    def test_owner_attachment_rejects_distinct_owner(self) -> None:
+        strategy = BatchedStorageStrategy()
+        strategy.attach_owner(object())
+
+        with pytest.raises(
+            RuntimeError,
+            match="batched storage strategy already has an owner",
+        ):
+            strategy.attach_owner(object())
+
     def test_under_threshold_no_store(self, mocker) -> None:
         backend = mocker.Mock()
         strat = BatchedStorageStrategy(threshold=100)
