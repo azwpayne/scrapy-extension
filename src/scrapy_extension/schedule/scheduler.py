@@ -2761,12 +2761,26 @@ class BackendScheduler:
                 # compensation diagnostics have been prepared.
                 terminal_push_failure = True
         except BaseException:
-            # Process-control interruption after receipt handoff but before a
-            # confirmed push follows the package's at-least-once policy: compensate
-            # best-effort, preserve the original signal, and accept possible replay
-            # rather than leave a permanent ghost fingerprint.
+            # A queue monitor runs after the physical push commits, but its
+            # process-control interruption must not make the scheduler roll back
+            # a dedup reservation as if the push had failed. Discard only the
+            # owner intent bookkeeping; the queue item remains authoritative and
+            # the original signal remains observable to the caller.
+            post_commit_push = False
+            if phase == "push":
+                consume_commit = getattr(queue, "_consume_post_commit_push", None)
+                if callable(consume_commit):
+                    post_commit_push = bool(consume_commit())
             try:
-                if (
+                if post_commit_push:
+                    if (
+                        reservation_intent is not None
+                        and rollback_reservation_intent is not None
+                    ):
+                        rollback_reservation_intent(reservation_intent)
+                    reservation = None
+                    reservation_intent = None
+                elif (
                     reservation_intent is not None
                     and rollback_reservation_intent is not None
                 ):
@@ -2792,8 +2806,9 @@ class BackendScheduler:
                 # cleanup callee establishes its own try-region. Retry the silent
                 # owner fence once; it is idempotent and does not mutate membership.
                 if (
-                    reservation_intent is not None
+                    (post_commit_push or reservation_intent is not None)
                     and rollback_reservation_intent is not None
+                    and reservation_intent is not None
                 ):
                     try:
                         rollback_reservation_intent(reservation_intent)

@@ -262,6 +262,20 @@ class _SchedulerStop(BaseException):
     """Process-control sentinel used to verify scheduler receipt ownership."""
 
 
+class _OneShotPushMonitor(Monitor):
+    """Interrupt one committed queue push from its post-commit telemetry hook."""
+
+    def __init__(self, signal: BaseException) -> None:
+        self._signal = signal
+        self._raised = False
+
+    def on_push(self, queue_name: str, priority: float) -> None:
+        del queue_name, priority
+        if not self._raised:
+            self._raised = True
+            raise self._signal
+
+
 class _OneShotSchedulerStopMonitor(Monitor):
     def __init__(self, signal: BaseException) -> None:
         self._signal = signal
@@ -1295,6 +1309,62 @@ class TestEnqueueDedupReservation:
         assert scheduler.enqueue_request(request.replace()) is True
         assert queue.push.call_count == 2
         assert len(membership_filter) == 1
+
+    def test_post_commit_push_monitor_interruption_does_not_forget(self) -> None:
+        """A committed queue push must not roll back legacy dedup state."""
+        manager = MagicMock(name="ConnectionManager")
+        dupefilter = MagicMock(spec=["request_seen", "forget", "log"])
+        dupefilter.request_seen.return_value = False
+        signal = _SchedulerStop()
+        strategy = _durable_strategy_mock()
+        queue = BackendQueue(
+            connection_manager=manager,
+            queue_name="post-commit-monitor",
+            queue_strategy=strategy,
+            monitor=_OneShotPushMonitor(signal),
+        )
+        scheduler = BackendScheduler(
+            connection_manager=manager,
+            dupefilter=dupefilter,
+        )
+        scheduler._queue = queue
+        request = Request("https://example.com/post-commit-monitor")
+
+        with pytest.raises(_SchedulerStop) as raised:
+            scheduler.enqueue_request(request)
+        assert raised.value is signal
+        strategy.push.assert_called_once()
+        dupefilter.forget.assert_not_called()
+
+        assert scheduler.enqueue_request(request.replace()) is True
+        assert strategy.push.call_count == 2
+
+    def test_post_commit_push_monitor_failure_does_not_forget(self) -> None:
+        """An ordinary post-commit telemetry error cannot roll back dedup."""
+        manager = MagicMock(name="ConnectionManager")
+        dupefilter = MagicMock(spec=["request_seen", "forget", "log"])
+        dupefilter.request_seen.return_value = False
+        strategy = _durable_strategy_mock()
+        queue = BackendQueue(
+            connection_manager=manager,
+            queue_name="post-commit-monitor-error",
+            queue_strategy=strategy,
+            monitor=_OneShotPushMonitor(RuntimeError("monitor failed")),
+        )
+        scheduler = BackendScheduler(
+            connection_manager=manager,
+            dupefilter=dupefilter,
+        )
+        scheduler._queue = queue
+
+        assert (
+            scheduler.enqueue_request(
+                Request("https://example.com/post-commit-monitor-error")
+            )
+            is True
+        )
+        strategy.push.assert_called_once()
+        dupefilter.forget.assert_not_called()
 
     def test_push_process_control_rolls_back_without_masking_signal(self) -> None:
         manager = MagicMock(name="ConnectionManager")
