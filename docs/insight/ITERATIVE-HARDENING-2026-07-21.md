@@ -258,7 +258,9 @@ speculative work.
   including backend failures, record pop errors and attempt freshness, and
   document that the event-sampled rate gauge does not decay without another
   event. A successful pop decrements a cached non-zero depth immediately; a
-  failed pop leaves that cache unchanged.
+  failed pop never decrements local depth, while a scheduled depth sample on
+  that attempt may refresh the cache from the backend. Unknown or zero depth
+  caches are probed on every call to preserve drain/idle freshness.
 - [ ] **DOC-DEDUP-01 — bounded no-false-negative promise.** Limit the Cuckoo
   guarantee to fingerprints successfully inserted before full degradation and
   document that overflow requests can pass repeatedly.
@@ -2219,9 +2221,11 @@ close the remaining backend-generation or open-frontier work in this register.
 - **Task 4 — depth and pop telemetry freshness.** Commit `2550b8b5` reports
   backend pop failures through `on_error("pop", ...)`, keeps pop-attempt and
   `last_pop_epoch` signals fresh on failures, decrements a cached non-zero depth
-  after a confirmed pop, and retains sampled depth/rate behavior. The
-  corresponding monitor, queue, and resilience regressions are in
-  `tests/test_monitor.py`, `tests/test_queue.py`, and
+  after a confirmed pop, and retains sampled depth/rate behavior. Sampling
+  skips only active non-zero cached depth; unknown/zero depth probes every call,
+  and a due depth sample on a failed pop may refresh the cache without ever
+  decrementing local depth. The corresponding monitor, queue, and resilience
+  regressions are in `tests/test_monitor.py`, `tests/test_queue.py`, and
   `tests/test_queue_resilience.py`.
 
 These entries record local commit and focused-test evidence only; they do not
