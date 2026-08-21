@@ -777,22 +777,20 @@ class BackendQueue:
             try:
                 normalized_timeout = normalize_queue_timeout(timeout)
             except ValueError as e:
-                processing_failure = QueueError(
+                raise QueueError(
                     str(e),
                     queue_name=self.queue_name,
                     operation="pop",
-                )
-                processing_failure.__cause__ = e
+                ) from e
+            try:
+                data, ack_token = self._read_pop(normalized_timeout)
+            except BaseException as exc:
+                processing_failure = exc
             else:
                 try:
-                    data, ack_token = self._read_pop(normalized_timeout)
+                    result = self._process_pop(data, ack_token)
                 except BaseException as exc:
                     processing_failure = exc
-                else:
-                    try:
-                        result = self._process_pop(data, ack_token)
-                    except BaseException as exc:
-                        processing_failure = exc
         finally:
             self._end_operation()
         return self._finish_pop_result(result, processing_failure)
