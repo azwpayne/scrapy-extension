@@ -425,9 +425,11 @@ speculative work.
   request/response transactions and published-client teardown, fence private
   connection probes across disconnect, snapshot the destructive flush
   capability, and reject non-successful flush replies.
-- [ ] **BACKEND-11 — finite Memcached I/O deadlines.** Add strictly positive
-  connect and socket timeouts to the validated generation snapshot so a silent
-  peer cannot hold the single protocol lock and shutdown forever.
+- [x] **BACKEND-11 — finite Memcached I/O deadlines.** Validate strictly
+  positive, finite, bounded connect and socket timeouts in the generation
+  snapshot and pass them to the native client so a silent peer cannot hold the
+  protocol lock and shutdown forever. Landed in commit `03fb4d3`; focused
+  coverage is in `tests/test_memcached_backend.py`.
 - [x] **BACKEND-07A — confirmed Kafka publication.** Reject Kafka `acks=0`,
   apply advertised retention/min-ISR settings to new topics, and reject
   inconsistent replication, ISR, and partition-count policy.
