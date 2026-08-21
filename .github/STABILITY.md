@@ -34,7 +34,7 @@ comes from this document; being exported does not automatically make it Stable.
 | `Backend` / `QueueBackend` / `SetBackend` / `StorageBackend` ABCs | Stable | The abstract contract 3rd-party backends implement. `QueueBackend.push()` retains its stable signature/`None` return; the `_`-prefixed operation-bound durability receipt is Internal and existing plugins inherit a source-compatible volatile default. |
 | `ConnectionManager` (`backends/connectors.py`) | Stable | Lazy shared registry keyed by `backend_type:settings_digest`. Each `get_manager()` acquisition requires exactly one `close()` release. |
 | `scrapy_extension.backends.connectors.resolve_backend_config()` | Stable | Public fully qualified import used by all three component factories. |
-| `scrapy_extension.monitor.Monitor` / `NullMonitor` / `ScrapyStatsMonitor` | Stable | Public subpackage exports. The hook set is additive; fresh hooks are tiered below. |
+| `scrapy_extension.monitor.Monitor` / `NullMonitor` / `ScrapyStatsMonitor` | Stable | Public subpackage exports. The hook set is additive; `on_error("pop", ...)` includes backend pop failures as well as pop deserialization failures. `ScrapyStatsMonitor` emits the rolling pop-rate gauge under `queue/pop_rate_1m` for the default 60-second window and `queue/pop_rate_{N}s` for an overridden window; fresh hooks are tiered below. |
 | `BackendType`, `Serializer`, `JSONSerializer`, and `Settings` | Stable | Root-package exports and core extension contracts. |
 | Root-exported exception classes | Stable | `BackendError`, `BackendConnectionError`, `BackendOperationTimeout`, `QueueError`, `StorageError`, `SerializationError`, and `ConfigurationError`; documented context attributes are part of each concrete exception's contract. The additive Elasticsearch outcome subclasses (`QueueOutcomeIndeterminateError`, `SetOutcomeIndeterminateError`, and `StorageOutcomeIndeterminateError`) remain catch-compatible with the established queue/set/storage contracts and expose only static redacted diagnostics. As a security boundary, terminal queue/pipeline `SerializationError` instances intentionally expose `data=None` and fixed text only; `serializer` remains available. |
 | Root-exported concrete backend, mode, and backend-settings classes | Inherit backend tier | Stable except the Memcached classes, which are Experimental with that backend. |
@@ -60,7 +60,7 @@ comes from this document; being exported does not automatically make it Stable.
 | Queue `work_stealing` | Experimental | Backend-side worker queues; requires stable worker IDs and an explicit peer list; rejected with Kafka/RocketMQ. |
 | Queue `ring_buffer` | Experimental | Bounded fully in-process storage; bypasses an MQ broker; snapshot uses queue or configured storage; hard crashes lose state since the last clean checkpoint. |
 | Storage `passthrough` | Stable | Default; writes directly to `StorageBackend`. |
-| Storage `batched` | Experimental | In-process buffer; hard crashes can lose an unflushed batch. |
+| Storage `batched` | Experimental | In-process buffer; hard crashes can lose an unflushed or detached in-flight batch. One strategy has one lifecycle owner: a same-owner attachment is idempotent, but a distinct second pipeline attachment is rejected. |
 
 ### Fresh hooks / settings (may evolve in a minor bump)
 
@@ -124,12 +124,15 @@ know about:
   Pydantic field type/range/enum failures raise `ValidationError`. See the
   [settings-validation spec](https://github.com/azwpayne/scrapy-extension/blob/main/docs/insight/SPEC-round8-settings-validation.md).
 - **U4 — `queue_len` depth sampling.** `BackendQueue(depth_sample_every=100)`
-  probes real backend depth at most once per 100 pops, reclaiming ~25% of
-  the pop-path RTT budget at default config (`queue/queue.py`). Backpressure
-  gates use the sampled depth when the backend exposes one; set
-  `depth_sample_every=1` to restore per-pop behavior. Pulsar and RocketMQ have
-  no configured depth API, so their scheduler degrades conservatively to
-  continued polling without depth-based backpressure.
+  probes real backend depth at most once per 100 pops, reclaiming pop-path RTT
+  budget at default config (`queue/queue.py`). Backpressure gates use the
+  sampled depth when the backend exposes one; set `depth_sample_every=1` to
+  restore per-pop behavior. A confirmed pop decrements a cached non-zero depth
+  immediately, while a failed pop leaves the cache unchanged. Pop attempts,
+  including backend failures, refresh `queue/last_pop_epoch`; the rolling rate
+  is event-sampled and may freeze after a stall. Pulsar and RocketMQ have no
+  configured depth API, so their scheduler degrades conservatively to continued
+  polling without depth-based backpressure.
 - **U5 — memory default cap.** `MemoryMembershipFilter(maxsize=1_000_000)`
   default + `DelayQueueStrategy(max_held=100_000)` soft-cap warn-once
   prevent silent OOM on long high-cardinality crawls. Explicit
