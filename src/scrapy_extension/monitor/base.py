@@ -78,11 +78,11 @@ class Monitor:
 
     - ``on_push(queue_name, priority)`` — after a successful queue push.
     - ``on_pop(queue_name)`` — per pop ATTEMPT (R14-D semantics fix).
-      Emitted by ``BackendQueue.pop`` on every call — including empty pops —
-      because the consumer-liveness signal ("is the worker popping at all?")
-      is independent of whether an item was returned. The matching stat is
-      ``queue/pop_attempt_count`` (renamed from ``queue/pop_count`` in R14-D so
-      the key matches behavior).
+      Emitted by ``BackendQueue.pop`` on every call — including empty pops and
+      backend failures — because the consumer-liveness signal ("is the worker
+      popping at all?") is independent of whether an item was returned. The
+      matching stat is ``queue/pop_attempt_count`` (renamed from
+      ``queue/pop_count`` in R14-D so the key matches behavior).
     - ``on_dedup_hit(key)`` — request fingerprint was already seen.
     - ``on_dedup_miss(key)`` — a membership check admitted the request. On the
       bundled scheduler's two-phase path this is settled after queue success or
@@ -105,8 +105,8 @@ class Monitor:
       later insert-and-evict cycles. Lets operators see a filter APPROACHING full
       (e.g. >0.9) before the ``on_filter_full`` overflow signal fires.
     - ``on_error(operation, error)`` — an operation raised; record per-op.
-      Wired (R14-D) at the ``BackendQueue`` push-except and deserialize-fail
-      arms so serialization failures surface as ``errors/push`` /
+      Wired (R14-D) at the ``BackendQueue`` push-except, pop backend-failure,
+      and deserialize-fail arms so errors surface as ``errors/push`` /
       ``errors/pop`` instead of being dead observability.
     - ``on_connect(backend_type)`` — a backend connection was established.
       Wired (R14-D) from ``ConnectionManager.connect`` on the success path.
@@ -134,10 +134,10 @@ class Monitor:
 
         Emitted by :meth:`BackendQueue.pop
         <scrapy_extension.queue.queue.BackendQueue.pop>` on EVERY pop call —
-        including empty pops. The consumer-liveness signal ("is the worker
-        popping at all?") is independent of whether an item was returned, so the
-        matching stat is ``queue/pop_attempt_count`` (renamed from
-        ``queue/pop_count`` in R14-D so the key matches the per-attempt
+        including empty pops and backend failures. The consumer-liveness signal
+        ("is the worker popping at all?") is independent of whether an item was
+        returned, so the matching stat is ``queue/pop_attempt_count`` (renamed
+        from ``queue/pop_count`` in R14-D so the key matches the per-attempt
         behavior). For per-success push accounting see :meth:`on_push`.
 
         Args:

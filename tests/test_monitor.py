@@ -23,7 +23,11 @@ from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
 from scrapy_extension.dupefilter.filters.cuckoo_filter import (
     CuckooMembershipFilter,
 )
-from scrapy_extension.exceptions import BackendConnectionError, SerializationError
+from scrapy_extension.exceptions import (
+    BackendConnectionError,
+    QueueError,
+    SerializationError,
+)
 from scrapy_extension.monitor import (
     Monitor,
     NullMonitor,
@@ -807,6 +811,25 @@ class TestR14DObservability:
             queue.pop()
         assert monitor._stats.get_value("errors/pop") == 1  # type: ignore[attr-defined]
         assert monitor._stats.get_value("errors/push") is None  # type: ignore[attr-defined]
+
+    def test_on_error_emitted_on_backend_pop_failure(self, mock_connection_manager):
+        """A backend pop failure records an error and a real pop attempt."""
+        monitor = ScrapyStatsMonitor(_stats())
+        queue = BackendQueue(
+            connection_manager=mock_connection_manager,
+            queue_name="q",
+            monitor=monitor,
+        )
+        failure = QueueError("backend unavailable")
+        mock_connection_manager.get_queue_backend().pop.side_effect = failure
+
+        with pytest.raises(QueueError) as raised:
+            queue.pop()
+
+        assert raised.value is failure
+        assert monitor._stats.get_value("errors/pop") == 1  # type: ignore[attr-defined]
+        assert monitor._stats.get_value("queue/pop_attempt_count") == 1  # type: ignore[attr-defined]
+        assert monitor._stats.get_value("queue/last_pop_epoch") is not None  # type: ignore[attr-defined]
 
     def test_bloom_saturation_property_rises_with_load(self):
         """BloomMembershipFilter.saturation = len / capacity (R14-D mirror of cuckoo)."""
