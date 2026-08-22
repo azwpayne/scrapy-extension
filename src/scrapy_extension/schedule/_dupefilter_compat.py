@@ -7,6 +7,7 @@ logger name; if logging is ever needed here, reuse that historical name."""
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from inspect import getattr_static, signature
 from typing import TYPE_CHECKING, Any
 
@@ -19,6 +20,33 @@ if TYPE_CHECKING:
 _MISSING_STATIC_ATTRIBUTE = object()
 
 
+@dataclass(frozen=True, slots=True)
+class _BackendDupeFilterLifecycle:
+    """Resolved lifecycle capability for the bundled dupefilter family.
+
+    The predicate deliberately uses ``isinstance`` rather than an exact type
+    comparison.  A plugin subclass keeps the bundled ownership protocol unless
+    it explicitly overrides ``close``; an override is still a bundled
+    lifecycle component, but must be invoked through its public hook rather than
+    bypassed with the base class' exact release token.
+    """
+
+    uses_release_hook: bool
+
+
+def _backend_dupefilter_lifecycle(
+    dupefilter: object,
+) -> _BackendDupeFilterLifecycle | None:
+    """Return the one polymorphic lifecycle capability, or ``None``."""
+    from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
+
+    if not isinstance(dupefilter, BackendDupeFilter):
+        return None
+    declared_close = getattr_static(dupefilter, "close", _MISSING_STATIC_ATTRIBUTE)
+    base_close = getattr_static(BackendDupeFilter, "close", _MISSING_STATIC_ATTRIBUTE)
+    return _BackendDupeFilterLifecycle(uses_release_hook=declared_close is base_close)
+
+
 def _call_dupefilter_open(dupefilter: object, spider: Spider) -> Any:
     """Call a dupefilter's Scrapy-2.17 lifecycle hook compatibly.
 
@@ -29,10 +57,8 @@ def _call_dupefilter_open(dupefilter: object, spider: Spider) -> Any:
     its package-specific call.  Required-argument and variadic third-party test
     doubles remain supported for source compatibility.
     """
-    from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
-
     open_hook = getattr(dupefilter, "open")
-    if isinstance(dupefilter, BackendDupeFilter):
+    if _backend_dupefilter_lifecycle(dupefilter) is not None:
         return open_hook(spider)
     try:
         parameters = tuple(signature(open_hook).parameters.values())

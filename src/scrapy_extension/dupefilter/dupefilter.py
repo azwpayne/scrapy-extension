@@ -8,11 +8,15 @@ from __future__ import annotations
 import logging
 import sys
 from collections import OrderedDict, deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
-from threading import Lock, RLock, get_ident
+from threading import Condition, Lock, RLock, get_ident
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 from weakref import ReferenceType, WeakSet, ref
+
+from scrapy import Spider
+from twisted.internet.defer import Deferred
 
 from scrapy_extension.backends.base import _validate_key_name
 from scrapy_extension.backends.circuit_breaker import CircuitBreakerOpenError
@@ -22,7 +26,11 @@ from scrapy_extension.dupefilter.filters.memory_filter import (
     MemoryMembershipFilter,
 )
 from scrapy_extension.dupefilter.filters.set_filter import SetMembershipFilter
-from scrapy_extension.exceptions.base import BackendConnectionError, ConfigurationError
+from scrapy_extension.exceptions.base import (
+    BackendConnectionError,
+    ConfigurationError,
+    QueueError,
+)
 from scrapy_extension.monitor import NullMonitor, ScrapyStatsMonitor
 from scrapy_extension.monitor.base import Monitor
 from scrapy_extension.utils._config import (
@@ -38,7 +46,6 @@ from scrapy_extension.utils.identity import (
 from scrapy_extension.utils.request import request_fingerprint
 
 if TYPE_CHECKING:
-    from scrapy import Spider
     from scrapy.crawler import Crawler
     from scrapy.http import Request
     from scrapy.settings import Settings
@@ -122,6 +129,10 @@ _backend_error_warned: bool = False
 # Compensation has a distinct warning because its risk is a surviving remote
 # marker that suppresses a URL, rather than an admitted duplicate fetch.
 _forget_backend_error_warned: bool = False
+# These process-wide latches are advisory diagnostics, but their decision is
+# shared by concurrent filter calls. Serialize the test-and-set; never hold this
+# lock while logging or invoking a monitor.
+_diagnostic_state_lock = Lock()
 
 _DEDUP_BACKEND_FAILURE_MESSAGE = "Dedup backend is unavailable."
 _DEDUP_CIRCUIT_BREAKER_NAME = "dedup"
@@ -129,7 +140,8 @@ _DEDUP_CIRCUIT_BREAKER_NAME = "dedup"
 # Non-removable filters (notably Bloom and Cuckoo) cannot compensate a successful
 # add after the scheduler's later queue push fails. Keep a bounded, one-shot retry
 # allowance per fingerprint instead. 1,024 limits failure-path memory while
-# covering a useful transient queue-outage window; overflow evicts FIFO.
+# covering a useful transient queue-outage window. At capacity, new marker
+# admission is backpressured so an existing failed-work recovery is never evicted.
 _DEFAULT_RETRY_ALLOWANCE_LIMIT = 1_024
 
 # Volatile queue strategies need a process-local dedup shadow rather than a
@@ -156,7 +168,15 @@ _ContinuationDiagnostic = Literal[
     "filter_full",
     "backend_error",
     "forget_backend_error",
+    "retry_allowance_overflow",
 ]
+_LifecycleState = Literal["new", "opening", "open", "clearing", "closing", "closed"]
+_NEW: _LifecycleState = "new"
+_OPENING: _LifecycleState = "opening"
+_OPEN: _LifecycleState = "open"
+_CLEARING: _LifecycleState = "clearing"
+_CLOSING: _LifecycleState = "closing"
+_CLOSED: _LifecycleState = "closed"
 
 
 def _static_backend_error(exc: BaseException) -> BaseException:
@@ -164,6 +184,16 @@ def _static_backend_error(exc: BaseException) -> BaseException:
     if type(exc) is CircuitBreakerOpenError:
         return CircuitBreakerOpenError(_DEDUP_CIRCUIT_BREAKER_NAME)
     return BackendConnectionError(_DEDUP_BACKEND_FAILURE_MESSAGE)
+
+
+@dataclass(slots=True, eq=False, repr=False)
+class _StrongReference:
+    """Callable reference fallback for hostile/non-weak-referenceable objects."""
+
+    target: object
+
+    def __call__(self) -> object:
+        return self.target
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -186,7 +216,10 @@ class _MonitorFenceToken:
                     return True
             except Exception:  # noqa: BLE001 - stale telemetry cannot reject work
                 return False
-            frame = frame.f_back
+            try:
+                frame = frame.f_back
+            except Exception:  # noqa: BLE001 - hostile frame audit must fail open
+                return False
         return False
 
 
@@ -199,6 +232,45 @@ class _DedupReservation:
     owner: object
     request: object
     fingerprint_text: str
+
+
+@dataclass(slots=True, eq=False)
+class _LegacyReservation:
+    """One invocation-scoped receipt for Scrapy's boolean dupefilter protocol."""
+
+    fingerprint: bytes
+    epoch: int
+    owner: object
+    request_ref: Callable[[], Any]
+    fingerprint_text: str
+    consumed: bool = False
+    consumer_thread_id: int | None = None
+    settling: bool = False
+    allowance_slot_reserved: bool = False
+
+
+@dataclass(slots=True, eq=False)
+class _PendingLegacyAddIntent:
+    """One pre-publish intent for a legacy (boolean protocol) marker write.
+
+    Registered under the lifecycle lock before the ``filter.add`` attempt so a
+    BaseException anywhere in the add→receipt-publish window can be compensated
+    with ``forget`` semantics (one exact retry allowance) instead of stranding a
+    possibly-written marker with no recovery path — a permanent ghost
+    fingerprint that suppresses the URL for the rest of the process.
+    """
+
+    fingerprint: bytes
+    slot_reserved: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _OperationLease:
+    """One admitted filter operation, fenced to one lifecycle epoch."""
+
+    epoch: int
+    owner: object
+    thread_id: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +286,16 @@ class DedupDecision:
     seen: bool
     reservation: object | None = None
     observational: bool = False
+
+
+class DupeFilterLifecycleUnavailable(QueueError, RuntimeError):
+    """A request arrived while the dupefilter stopped admission."""
+
+    def __init__(self, operation: str, state: _LifecycleState) -> None:
+        super().__init__(
+            f"dupefilter {operation} unavailable while lifecycle is {state}",
+            operation=operation,
+        )
 
 
 class BackendDupeFilter:
@@ -304,6 +386,10 @@ class BackendDupeFilter:
         self._retry_allowance_lock = Lock()
         self._retry_allowance_limit = _DEFAULT_RETRY_ALLOWANCE_LIMIT
         self._retry_allowance_overflow_warned = False
+        # Slots are reserved before a non-transactional marker is added.  A full
+        # ledger therefore backpressures *new* marker admission instead of
+        # evicting an allowance whose probabilistic marker cannot be removed.
+        self._retry_allowance_slots_reserved = 0
         # A false request_seen result does not always mean a fingerprint was
         # reserved: filter-full and transient-outage degradation deliberately
         # admit without writing. Track only genuine new reservations (and
@@ -323,6 +409,17 @@ class BackendDupeFilter:
         # arbitrary release tokens interchangeable.
         self._release_owner_aliases: list[object] = []
         self._lifecycle_lock = RLock()
+        self._lifecycle_condition = Condition(self._lifecycle_lock)
+        # Membership-filter calls are serialized without holding the lifecycle
+        # lock. This preserves the thread-safety of in-process filters while
+        # allowing lifecycle transitions to observe and drain admitted calls.
+        self._filter_operation_lock = RLock()
+        self._lifecycle_state: _LifecycleState = _NEW
+        self._active_operations = 0
+        self._active_operations_by_epoch: dict[int, int] = {}
+        self._active_operation_threads: dict[int, int] = {}
+        self._lifecycle_transition_thread_id: int | None = None
+        self._close_requested = False
         # Operations enqueue complete telemetry batches under the lifecycle lock.
         # One elected caller drains this shared FIFO outside the lock; peers never
         # wait for that drainer. This preserves enqueue order and the monitor's
@@ -340,6 +437,23 @@ class BackendDupeFilter:
         # identity and fenced by the lifecycle epoch.
         self._active_reservations: dict[int, _DedupReservation] = {}
         self._reservations_by_owner: dict[int, _DedupReservation] = {}
+        # A Request can be submitted more than once, including concurrently.  Each
+        # table is consequently a FIFO of weak receipts, not a single value keyed
+        # by Request id.  Handoffs retain the consumed receipt only until the
+        # scheduler reports queue success or calls forget().
+        self._legacy_reservations: dict[int, deque[_LegacyReservation]] = {}
+        self._legacy_handoffs: dict[int, deque[_LegacyReservation]] = {}
+        # Legacy marker writes publish their invocation receipt only after
+        # ``filter.add`` returns.  A pre-publish intent registered under the
+        # lifecycle lock lets a BaseException in that window convert the
+        # invocation's reserved admission slot into one retry allowance
+        # (``forget`` semantics) instead of stranding a possibly-written ghost
+        # marker with no recovery path.
+        self._legacy_add_intents: dict[int, list[_PendingLegacyAddIntent]] = {}
+        # A transition retires all old receipts.  Keep only weak Request identity
+        # tombstones so a late forget cannot select a replacement-generation
+        # pending receipt for the same long-lived Request object.
+        self._legacy_retired_requests: WeakSet[Request] = WeakSet()
         self._reservation_epoch = 0
         # A process-local queue strategy cannot safely publish into a persistent
         # membership backend: a hard crash would lose the queued item but retain
@@ -355,8 +469,14 @@ class BackendDupeFilter:
         # is always independent work.
         self._active_monitor_requests: dict[
             int,
-            tuple[ReferenceType[object], set[_MonitorFenceToken]],
+            tuple[Callable[[], object | None], set[_MonitorFenceToken]],
         ] = {}
+        # A custom MembershipFilter may synchronously or cross-thread re-enter
+        # request_seen from its add/contains callback. The exact originating
+        # Request is observational during that callback, just as it is for a
+        # monitor hook; this avoids recursive filter calls and callback/join
+        # deadlocks without suppressing a different Request with the same key.
+        self._active_filter_requests: dict[int, object] = {}
         self._opened = False
         self._opened_spider: Spider | None = None
         self._opening = False
@@ -377,6 +497,332 @@ class BackendDupeFilter:
         """Prevent built-in filter callbacks from escaping the lifecycle lock."""
         if isinstance(self._filter, MemoryMembershipFilter):
             self._filter.set_monitor(NullMonitor())
+
+    @contextmanager
+    def _filter_operation_scope(self, request: object) -> Iterator[None]:
+        """Serialize one filter callback and fence exact-request re-entry."""
+        with self._filter_operation_lock:
+            request_id = id(request)
+            with self._lifecycle_condition:
+                previous = self._active_filter_requests.get(request_id)
+                self._active_filter_requests[request_id] = request
+            try:
+                yield
+            finally:
+                with self._lifecycle_condition:
+                    if previous is None:
+                        if self._active_filter_requests.get(request_id) is request:
+                            del self._active_filter_requests[request_id]
+                    else:
+                        self._active_filter_requests[request_id] = previous
+
+    def _set_lifecycle_state_locked(self, state: _LifecycleState) -> None:
+        """Publish one lifecycle state while retaining legacy boolean mirrors."""
+        self._lifecycle_state = state
+        self._opened = state == _OPEN
+        self._opening = state == _OPENING
+        self._closing = state == _CLOSING
+        self._closed = state == _CLOSED
+
+    def _operation_unavailable_error(self, operation: str) -> RuntimeError:
+        """Build a stable error for an operation rejected by admission."""
+        return DupeFilterLifecycleUnavailable(operation, self._lifecycle_state)
+
+    @contextmanager
+    def _admit_operation(
+        self,
+        operation: str,
+        *,
+        reservation: _DedupReservation | _LegacyReservation | None = None,
+    ) -> Iterator[_OperationLease | None]:
+        """Admit one filter call or settle one exact old-epoch reservation."""
+        with self._lifecycle_condition:
+            if reservation is None:
+                if self._lifecycle_state not in {_NEW, _OPEN}:
+                    raise self._operation_unavailable_error(operation)
+                epoch = self._reservation_epoch
+            elif not self._reservation_is_current_locked(reservation):
+                yield None
+                return
+            elif self._lifecycle_state not in {_NEW, _OPEN} and operation != "rollback":
+                # A commit/forget arriving after a transition has stopped
+                # admission must not call the old filter while clear/close/open
+                # owns the callback boundary. The queued item remains safe to
+                # replay; rollback is bookkeeping-only and may still settle.
+                self._discard_any_reservation_locked(reservation)
+                yield None
+                return
+            else:
+                epoch = reservation.epoch
+            owner = object()
+            thread_id = get_ident()
+            lease = _OperationLease(epoch, owner, thread_id)
+            self._active_operations += 1
+            self._active_operations_by_epoch[epoch] = (
+                self._active_operations_by_epoch.get(epoch, 0) + 1
+            )
+            self._active_operation_threads[thread_id] = (
+                self._active_operation_threads.get(thread_id, 0) + 1
+            )
+        try:
+            yield lease
+        finally:
+            with self._lifecycle_condition:
+                self._active_operations -= 1
+                epoch_count = self._active_operations_by_epoch.get(lease.epoch, 0)
+                if epoch_count <= 1:
+                    self._active_operations_by_epoch.pop(lease.epoch, None)
+                else:
+                    self._active_operations_by_epoch[lease.epoch] = epoch_count - 1
+                thread_count = self._active_operation_threads.get(lease.thread_id, 0)
+                if thread_count <= 1:
+                    self._active_operation_threads.pop(lease.thread_id, None)
+                else:
+                    self._active_operation_threads[lease.thread_id] = thread_count - 1
+                self._lifecycle_condition.notify_all()
+
+    def _reservation_is_current_locked(
+        self,
+        reservation: _DedupReservation | _LegacyReservation,
+    ) -> bool:
+        """Return whether a receipt is still owned by the current epoch."""
+        if reservation.epoch != self._reservation_epoch:
+            return False
+        if isinstance(reservation, _DedupReservation):
+            return self._active_reservations.get(id(reservation)) is reservation
+        request = reservation.request_ref()
+        if request is None:
+            return False
+        for table in (self._legacy_reservations, self._legacy_handoffs):
+            receipts = table.get(id(request), ())
+            if any(candidate is reservation for candidate in receipts):
+                return True
+        return False
+
+    def _wait_for_quiescence_locked(
+        self,
+        *,
+        include_reservations: bool,
+        include_legacy_reservations: bool = True,
+    ) -> None:
+        """Wait until admitted calls and selected receipts have settled."""
+        if self._active_operation_threads.get(get_ident(), 0):
+            raise RuntimeError(
+                "dupefilter lifecycle transition re-entered an active operation"
+            )
+        while self._active_operations or (
+            include_reservations
+            and (
+                self._active_reservations
+                or (include_legacy_reservations and self._legacy_reservations)
+            )
+        ):
+            self._lifecycle_condition.wait()
+
+    def _discard_any_reservation_locked(
+        self,
+        reservation: _DedupReservation | _LegacyReservation,
+    ) -> None:
+        """Discard either receipt kind at a lifecycle transition boundary."""
+        if isinstance(reservation, _DedupReservation):
+            self._discard_reservation(reservation)
+        else:
+            self._remove_legacy_reservation_locked(reservation)
+
+    @staticmethod
+    def _legacy_request_is(
+        reservation: _LegacyReservation,
+        request: object,
+    ) -> bool:
+        return reservation.request_ref() is request
+
+    @staticmethod
+    def _remove_receipt_from_table_locked(
+        table: dict[int, deque[_LegacyReservation]],
+        reservation: _LegacyReservation,
+    ) -> bool:
+        """Remove one identity-specific receipt from a weak receipt table."""
+        request = reservation.request_ref()
+        if request is None:
+            return False
+        request_id = id(request)
+        receipts = table.get(request_id)
+        if receipts is None:
+            return False
+        for index, candidate in enumerate(receipts):
+            if candidate is reservation:
+                del receipts[index]
+                if not receipts:
+                    table.pop(request_id, None)
+                return True
+        return False
+
+    def _remove_legacy_reservation_locked(
+        self,
+        reservation: _LegacyReservation,
+    ) -> None:
+        self._remove_receipt_from_table_locked(self._legacy_reservations, reservation)
+        self._remove_receipt_from_table_locked(self._legacy_handoffs, reservation)
+        request = reservation.request_ref()
+        if request is not None and id(request) not in self._legacy_reservations:
+            self._pending_reservations.discard(request)
+        if reservation.allowance_slot_reserved:
+            # This counter is protected by the lifecycle lock.  It is deliberately
+            # not released through _retry_allowance_lock here: all retry-state
+            # operations use lifecycle -> retry lock order, never the reverse.
+            reservation.allowance_slot_reserved = False
+            if self._retry_allowance_slots_reserved:
+                self._retry_allowance_slots_reserved -= 1
+        self._lifecycle_condition.notify_all()
+
+    def _legacy_request_collected(
+        self,
+        request_id: int,
+        request_ref: ReferenceType[Any],
+    ) -> None:
+        """Drop weak legacy receipt state when Scrapy releases its Request."""
+        with self._lifecycle_condition:
+            if request_ref() is not None:
+                retired = self._legacy_retired_requests
+                request = request_ref()
+                if request is not None and request_id == id(request):
+                    retired.discard(request)
+            for table in (self._legacy_reservations, self._legacy_handoffs):
+                receipts = table.get(request_id)
+                if receipts is None:
+                    continue
+                retained = deque(
+                    receipt
+                    for receipt in receipts
+                    if receipt.request_ref is not request_ref
+                )
+                removed = len(receipts) - len(retained)
+                if removed:
+                    for receipt in receipts:
+                        if (
+                            receipt.request_ref is request_ref
+                            and receipt.allowance_slot_reserved
+                        ):
+                            receipt.allowance_slot_reserved = False
+                            if self._retry_allowance_slots_reserved:
+                                self._retry_allowance_slots_reserved -= 1
+                if retained:
+                    table[request_id] = retained
+                else:
+                    table.pop(request_id, None)
+            self._lifecycle_condition.notify_all()
+
+    def _legacy_reservation_for_request_locked(
+        self,
+        request: object,
+        *,
+        thread_id: int | None = None,
+        handoff_only: bool = False,
+        pending_only: bool = False,
+    ) -> _LegacyReservation | None:
+        """Select one unsettled receipt without touching sibling invocations."""
+        request_id = id(request)
+        tables: tuple[dict[int, deque[_LegacyReservation]], ...]
+        if handoff_only:
+            tables = (self._legacy_handoffs,)
+        elif pending_only:
+            tables = (self._legacy_reservations,)
+        else:
+            # A consumed scheduler handoff belongs to its caller until it is
+            # settled. Prefer that exact thread, then permit a legacy caller that
+            # has no thread affinity to settle the oldest handoff.
+            tables = (self._legacy_handoffs, self._legacy_reservations)
+        for table in tables:
+            for receipt in table.get(request_id, ()):
+                if receipt.request_ref() is not request or receipt.settling:
+                    continue
+                if (
+                    thread_id is not None
+                    and table is self._legacy_handoffs
+                    and receipt.consumer_thread_id not in (None, thread_id)
+                ):
+                    continue
+                return receipt
+        if not handoff_only and not pending_only:
+            # If a different thread owns every handoff, do not accidentally settle
+            # one of those receipts; the pending table remains a safe fallback only
+            # for a not-yet-consumed direct request_seen receipt.
+            return None
+        return None
+
+    def _new_legacy_reservation_locked(
+        self,
+        request: Request,
+        fingerprint: bytes,
+        fingerprint_text: str,
+        *,
+        allowance_slot_reserved: bool,
+    ) -> _LegacyReservation:
+        """Register one weak legacy receipt without retaining the Request."""
+        request_id = id(request)
+
+        def collected(dead_ref: ReferenceType[Any]) -> None:
+            self._legacy_request_collected(request_id, dead_ref)
+
+        try:
+            request_ref: Callable[[], Any] = ref(request, collected)
+        except Exception:  # noqa: BLE001 - retain cleanup ownership fail-open
+            request_ref = _StrongReference(request)
+        reservation = _LegacyReservation(
+            fingerprint,
+            self._reservation_epoch,
+            object(),
+            request_ref,
+            fingerprint_text,
+            allowance_slot_reserved=allowance_slot_reserved,
+        )
+        self._legacy_reservations.setdefault(request_id, deque()).append(reservation)
+        self._pending_reservations.add(request)
+        return reservation
+
+    def _register_legacy_add_intent_locked(
+        self,
+        request: Request,
+        encoded_fingerprint: bytes,
+    ) -> _PendingLegacyAddIntent:
+        """Record one pre-publish legacy admission intent under the lifecycle lock.
+
+        The boolean protocol writes its marker before the invocation receipt is
+        published. This registration is the legacy counterpart of the
+        transactional owner intent: it gives the BaseException compensation the
+        request identity and fingerprint needed to decide whether a marker may
+        have been written without a receipt.
+        """
+        intent = _PendingLegacyAddIntent(encoded_fingerprint)
+        self._legacy_add_intents.setdefault(id(request), []).append(intent)
+        return intent
+
+    def _retire_legacy_add_intent_locked(
+        self,
+        request: Request,
+        intent: _PendingLegacyAddIntent | None,
+    ) -> None:
+        """Drop one published intent; its slot ownership has moved on.
+
+        Runs in the same lifecycle-lock section as the receipt publication, so
+        after this point a late interruption no longer compensates this
+        invocation: the published receipt (or, for admissions without a marker,
+        nothing) owns the recovery path.
+        """
+        if intent is None:
+            return
+        intent.slot_reserved = False
+        intents = self._legacy_add_intents.get(id(request))
+        if intents is None:
+            return
+        try:
+            intents.remove(intent)
+        except ValueError:
+            # A lifecycle boundary already cleared the intent table; the
+            # admission-slot ownership was retired with that generation.
+            return
+        if not intents:
+            del self._legacy_add_intents[id(request)]
 
     def _emit_monitor(self, event: _MonitorEvent) -> None:
         """Dispatch one recorded hook outside locks and isolate ordinary errors."""
@@ -448,12 +894,26 @@ class BackendDupeFilter:
                 # not turn an advisory monitor failure into a false request failure.
                 pass
 
-    def _monitor_origin_ref(self, origin_request: object) -> ReferenceType[object]:
-        """Create a weak origin reference that removes an abandoned fence entry."""
+    def _monitor_origin_ref(
+        self,
+        origin_request: object,
+    ) -> Callable[[], object | None]:
+        """Create a weak origin reference that removes an abandoned fence entry.
+
+        Requests are weak-referenceable in normal Scrapy operation.  A custom
+        request proxy or a hostile weakref/audit hook must not turn advisory
+        monitor bookkeeping into a failed dedup decision, though, so retain a
+        short-lived callable strong reference as a fail-open fallback.
+        """
         request_id = id(origin_request)
-        owner_ref = ref(self)
+        try:
+            owner_ref: ReferenceType[BackendDupeFilter] | None = ref(self)
+        except Exception:  # noqa: BLE001 - telemetry bookkeeping is fail-open
+            owner_ref = None
 
         def remove_stale_origin(dead_ref: ReferenceType[object]) -> None:
+            if owner_ref is None:
+                return
             owner = owner_ref()
             if owner is None:
                 return
@@ -463,9 +923,14 @@ class BackendDupeFilter:
                     if active is not None and active[0] is dead_ref:
                         del owner._active_monitor_requests[request_id]
             except BaseException:
-                _weakref_cleanup_failed = True
+                # A weakref callback runs during arbitrary interpreter teardown;
+                # losing this optional cleanup is safer than raising from GC.
+                pass
 
-        return ref(origin_request, remove_stale_origin)
+        try:
+            return ref(origin_request, remove_stale_origin)
+        except Exception:  # noqa: BLE001 - fail open for hostile object proxies
+            return _StrongReference(origin_request)
 
     def _queue_monitor_events_unlocked(
         self,
@@ -530,13 +995,18 @@ class BackendDupeFilter:
                         "warning fires once per process; subsequent transient backend errors "
                         "are counted via the errors/dedup stat only."
                     )
-                else:
+                elif diagnostic == "forget_backend_error":
                     logger.warning(
                         "Dedup backend transiently unavailable while compensating a failed "
                         "queue push; the remote marker may survive. A one-shot retry "
                         "allowance was granted so the fingerprint can be re-crawled once. "
                         "This warning fires once per process; subsequent failures during "
                         "forget are counted via the errors/dedup stat only."
+                    )
+                else:
+                    logger.warning(
+                        "Dedup retry allowance capacity is exhausted; backpressuring new "
+                        "marker admission instead of evicting failed-work recovery state."
                     )
             except BaseException:
                 # The graceful-miss outcome was already selected before reporting it.
@@ -849,43 +1319,67 @@ class BackendDupeFilter:
         raise factory_failure
 
     def open(self, spider: Spider | None = None) -> None:
-        """Reserve, execute, and publish one filter open outside the lifecycle lock."""
+        """Open one filter generation without admitting concurrent requests."""
         open_owner = _MonitorFenceToken(get_ident(), "open_owner")
-        with self._lifecycle_lock:
-            if self._closed or self._closing:
+        with self._lifecycle_condition:
+            if self._lifecycle_state in {_CLOSED, _CLOSING}:
                 raise RuntimeError("dupefilter is closing or closed")
-            if self._opening:
+            if self._lifecycle_state in {_OPENING, _CLEARING}:
                 current_owner = self._open_owner_token
                 if current_owner is not None and current_owner.active:
                     raise RuntimeError("dupefilter open is already in progress")
-                # An interrupted open may have crossed an opaque filter boundary.
-                # Do not replay it. Its only safe recovery is the close path, which
-                # can reclaim this inactive package-owned transition below.
-                raise RuntimeError("dupefilter interrupted open requires close")
-            if self._opened:
+                raise RuntimeError(
+                    "dupefilter lifecycle transition is already in progress"
+                )
+            if self._lifecycle_state == _OPEN:
                 if spider is self._opened_spider:
                     return
                 raise RuntimeError("dupefilter is already open for a different spider")
-            self._opening = True
+            self._set_lifecycle_state_locked(_OPENING)
             self._open_owner_token = open_owner
+            self._close_requested = False
+            try:
+                # Drain every call admitted before the opening boundary before
+                # retiring its local receipts.  Otherwise a request finishing
+                # between the reset and the wait could publish an old-generation
+                # reservation after the reset and let a late commit affect the new
+                # run.
+                self._wait_for_quiescence_locked(include_reservations=False)
+                self._clear_retry_allowances()
+            except BaseException:
+                self._open_owner_token = None
+                self._set_lifecycle_state_locked(_NEW)
+                raise
 
         open_failure: BaseException | None = None
         try:
             if spider is not None:
                 _validate_key_name(spider.name, field_name="spider.name")
                 self._resolve_spider_key(spider)
-            self._clear_retry_allowances()
-            self._filter.open()
-            if self.clear_on_open:
-                self._filter.clear()
+            with self._filter_operation_lock:
+                self._filter.open()
+                if self.clear_on_open:
+                    self._filter.clear()
         except BaseException as exc:
             open_failure = exc
+
+        if open_failure is None and self.clear_on_open:
+            with self._lifecycle_condition:
+                # clear-on-open is a successful clear boundary, so retire all
+                # pre-open receipts and local shadow state only after the filter
+                # callback has completed.  The opening boundary already advanced
+                # the epoch; avoid a second generation bump for the successful
+                # clear while still dropping any local state produced by setup.
+                self._clear_retry_allowances(
+                    advance_epoch=False,
+                    clear_reservations=True,
+                )
 
         if open_failure is not None:
             cleanup_failed = False
             reserved = False
             try:
-                with self._lifecycle_lock:
+                with self._lifecycle_condition:
                     reserved = self._reserve_release_locked(
                         self._direct_release_owner,
                         get_ident(),
@@ -902,13 +1396,126 @@ class BackendDupeFilter:
                     pass
             raise open_failure
 
-        with self._lifecycle_lock:
+        with self._lifecycle_condition:
             if self._open_owner_token is not open_owner:
                 raise RuntimeError("dupefilter open ownership changed")
-            self._opened = True
             self._opened_spider = spider
-            self._opening = False
             self._open_owner_token = None
+            self._set_lifecycle_state_locked(_OPEN)
+            self._lifecycle_condition.notify_all()
+
+    def _open_authoritative_async(
+        self,
+        spider: Spider | None = None,
+        *,
+        timeout: float,
+    ) -> tuple[Deferred[None], Deferred[None]]:
+        """Return authoritative and bounded views of synchronous ``open``."""
+        from scrapy_extension.utils.reactor import defer_to_thread_ordered
+
+        return defer_to_thread_ordered(
+            self.open,
+            spider,
+            timeout=timeout,
+            operation="dupefilter open",
+        )
+
+    def open_async(
+        self,
+        spider: Spider | None = None,
+        *,
+        timeout: float = 5.0,
+    ) -> Deferred[None]:
+        """Open off-reactor and return only the caller-bounded Deferred."""
+        operation, bounded = self._open_authoritative_async(
+            spider,
+            timeout=timeout,
+        )
+        try:
+            operation.addErrback(lambda _failure: None)
+        except BaseException:
+            # The operation remains authoritative even when a provider-specific
+            # Deferred rejects this best-effort observer registration.
+            pass
+        return bounded
+
+    def _clear_authoritative_async(
+        self, *, timeout: float
+    ) -> tuple[Deferred[None], Deferred[None]]:
+        """Return authoritative and bounded views of synchronous ``clear``."""
+        from scrapy_extension.utils.reactor import defer_to_thread_ordered
+
+        return defer_to_thread_ordered(
+            self.clear,
+            timeout=timeout,
+            operation="dupefilter clear",
+        )
+
+    def clear_async(self, *, timeout: float = 5.0) -> Deferred[None]:
+        """Clear off-reactor and return only the caller-bounded Deferred."""
+        operation, bounded = self._clear_authoritative_async(timeout=timeout)
+        try:
+            operation.addErrback(lambda _failure: None)
+        except BaseException:
+            # The operation remains authoritative even when a provider-specific
+            # Deferred rejects this best-effort observer registration.
+            pass
+        return bounded
+
+    def _release_authoritative_async(
+        self,
+        owner_token: object,
+        reason: str,
+        *,
+        timeout: float,
+    ) -> tuple[Deferred[None], Deferred[None]]:
+        """Return authoritative and bounded views of one exact release."""
+        from scrapy_extension.utils.reactor import defer_to_thread_ordered
+
+        return defer_to_thread_ordered(
+            self.release,
+            owner_token,
+            reason,
+            timeout=timeout,
+            operation="dupefilter close",
+        )
+
+    def release_async(
+        self,
+        owner_token: object,
+        reason: str,
+        *,
+        timeout: float = 5.0,
+    ) -> Deferred[None]:
+        """Release off-reactor and return only the caller-bounded Deferred."""
+        operation, bounded = self._release_authoritative_async(
+            owner_token,
+            reason,
+            timeout=timeout,
+        )
+        try:
+            operation.addErrback(lambda _failure: None)
+        except BaseException:
+            # The operation remains authoritative even when a provider-specific
+            # Deferred rejects this best-effort observer registration.
+            pass
+        return bounded
+
+    def _close_authoritative_async(
+        self,
+        reason: str,
+        *,
+        timeout: float,
+    ) -> tuple[Deferred[None], Deferred[None]]:
+        """Return authoritative and bounded views of direct ``close``."""
+        from scrapy_extension.utils.reactor import defer_to_thread_ordered
+
+        return defer_to_thread_ordered(
+            self.close,
+            reason,
+            timeout=timeout,
+            operation="dupefilter close",
+        )
 
     def _resolve_spider_key(self, spider: Spider) -> None:
         """Substitute identity placeholders in :attr:`key`, propagating
@@ -989,23 +1596,28 @@ class BackendDupeFilter:
         *,
         opening_owner: _MonitorFenceToken | None = None,
     ) -> bool:
-        """Atomically transfer lifecycle ownership into one close attempt."""
-        if self._closed:
+        """Atomically stop admission and reserve one close attempt."""
+        if self._lifecycle_state == _CLOSED:
             return False
-        if self._opening:
+        if self._lifecycle_state == _OPENING:
             open_owner = self._open_owner_token
             if opening_owner is not None and open_owner is opening_owner:
                 # A failed opener transfers its still-live transition directly to
                 # cleanup. No peer can observe an idle lifecycle between them.
-                self._opening = False
                 self._open_owner_token = None
             elif open_owner is not None and open_owner.active:
                 raise RuntimeError("dupefilter open is already in progress")
             else:
                 # The opening frame has unwound without terminal publication.
                 # Reclaim package state for close without replaying filter.open().
-                self._opening = False
                 self._open_owner_token = None
+        if (
+            self._lifecycle_transition_thread_id == thread_id
+            and self._clear_in_progress
+        ):
+            raise RuntimeError("dupefilter close re-entered an active clear")
+        if self._active_operation_threads.get(thread_id, 0):
+            raise RuntimeError("dupefilter close re-entered an active operation")
         if self._release_owner_token is None:
             self._release_owner_token = owner_token
         elif not self._release_owners_are_aliases(
@@ -1018,15 +1630,10 @@ class BackendDupeFilter:
             raise RuntimeError("dupefilter close is already in progress")
         self._release_in_progress = True
         self._release_thread_id = thread_id
-        self._closing = True
-        self._opening = False
-        self._open_owner_token = None
-        self._opened = False
+        self._close_requested = self._lifecycle_state == _CLEARING
         self._opened_spider = None
-        # Receipts before queue commit own no marker and need no backend call.
-        for reservation in tuple(self._active_reservations.values()):
-            self._discard_reservation(reservation)
-        self._clear_retry_allowances()
+        self._set_lifecycle_state_locked(_CLOSING)
+        self._lifecycle_condition.notify_all()
         return True
 
     def _run_reserved_release(self) -> None:
@@ -1034,12 +1641,23 @@ class BackendDupeFilter:
         try:
             self._close_locked()
         finally:
-            with self._lifecycle_lock:
+            with self._lifecycle_condition:
                 self._release_in_progress = False
                 self._release_thread_id = None
+                self._lifecycle_condition.notify_all()
 
     def _close_locked(self) -> None:
         """Run reserved filter/manager callbacks outside ``_lifecycle_lock``."""
+        with self._lifecycle_condition:
+            while self._clear_in_progress:
+                if self._lifecycle_transition_thread_id == get_ident():
+                    raise RuntimeError("dupefilter close re-entered an active clear")
+                self._lifecycle_condition.wait()
+            self._wait_for_quiescence_locked(include_reservations=False)
+            # Retire the old epoch only after every admitted filter call has
+            # returned. Late commits/forgets now become
+            # harmless no-ops instead of mutating the next generation.
+            self._clear_retry_allowances()
         primary_error: BaseException | None = None
         secondary_release_failed = False
         if not self._filter_released:
@@ -1085,8 +1703,8 @@ class BackendDupeFilter:
                 or self.connection_manager is None
                 or self._manager_released
             ):
-                self._closed = True
-                self._closing = False
+                self._close_requested = False
+                self._set_lifecycle_state_locked(_CLOSED)
                 # Terminal close has no future monitor dispatch. Drop retained
                 # Request references and invalidate any interrupted drainer.
                 self._monitor_events.clear()
@@ -1095,26 +1713,45 @@ class BackendDupeFilter:
             raise primary_error
 
     def clear(self) -> None:
-        """Clear fingerprints through a reservation/publication transition."""
-        with self._lifecycle_lock:
-            if self._closed or self._closing:
+        """Clear one generation after admission and receipt quiescence."""
+        with self._lifecycle_condition:
+            if self._lifecycle_state in {_CLOSED, _CLOSING}:
                 raise RuntimeError("dupefilter is closing or closed")
-            if self._opening or self._clear_in_progress:
+            if self._lifecycle_state in {_OPENING, _CLEARING}:
                 raise RuntimeError(
                     "dupefilter lifecycle transition is already in progress"
                 )
+            prior_state = self._lifecycle_state
+            self._set_lifecycle_state_locked(_CLEARING)
             self._clear_in_progress = True
-        succeeded = False
+            self._lifecycle_transition_thread_id = get_ident()
+            succeeded = False
+            try:
+                self._wait_for_quiescence_locked(include_reservations=False)
+            except BaseException:
+                self._clear_in_progress = False
+                self._lifecycle_transition_thread_id = None
+                self._set_lifecycle_state_locked(prior_state)
+                self._lifecycle_condition.notify_all()
+                raise
+
         try:
-            self._filter.clear()
+            with self._filter_operation_lock:
+                self._filter.clear()
             succeeded = True
         finally:
-            with self._lifecycle_lock:
+            with self._lifecycle_condition:
                 if succeeded:
-                    # Publish only after remote clear succeeds; existing receipts
-                    # remain compensatable across a failed callback.
+                    # Publish only after remote clear succeeds; every receipt from
+                    # the old epoch has already settled at this point.
                     self._clear_retry_allowances()
                 self._clear_in_progress = False
+                self._lifecycle_transition_thread_id = None
+                if self._close_requested:
+                    self._set_lifecycle_state_locked(_CLOSING)
+                else:
+                    self._set_lifecycle_state_locked(prior_state)
+                self._lifecycle_condition.notify_all()
 
     def log(self, request: Request, spider: Spider) -> None:
         """Log a filtered request.
@@ -1184,113 +1821,155 @@ class BackendDupeFilter:
         transactional: bool,
         owner: object | None = None,
     ) -> DedupDecision:
-        """Linearize one decision and dispatch its telemetry outside locks."""
+        """Admit one decision, call the filter unlocked, then publish telemetry."""
         pending_monitor_events: list[_PendingMonitorEvent] = []
         pending_diagnostics: list[_ContinuationDiagnostic] = []
         drain_token: _MonitorFenceToken | None = None
         should_warn_overflow = False
         reservation: _DedupReservation | None = None
         published_owner: object | None = None
-        compensated_under_lock = False
+        legacy_slot_reserved = False
+        legacy_add_intent: _PendingLegacyAddIntent | None = None
+        seen = False
         try:
-            with self._lifecycle_lock:
+            with self._admit_operation("request_seen") as operation:
+                assert operation is not None  # nosec B101
                 try:
-                    if self._closed or self._closing:
-                        raise RuntimeError("dupefilter is closing or closed")
-                    fingerprint = self.request_fingerprint(request)
-                    encoded_fingerprint = fingerprint.encode()
+                    with self._lifecycle_condition:
+                        fingerprint = self.request_fingerprint(request)
+                        encoded_fingerprint = fingerprint.encode()
 
-                    request_id = id(request)
-                    active_monitor = self._active_monitor_requests.get(request_id)
-                    if active_monitor is not None and active_monitor[0]() is request:
-                        active_tokens = active_monitor[1]
-                        for stale_token in tuple(active_tokens):
-                            if not stale_token.active:
-                                active_tokens.discard(stale_token)
-                        if active_tokens:
+                        request_id = id(request)
+                        active_monitor = self._active_monitor_requests.get(request_id)
+                        if (
+                            active_monitor is not None
+                            and active_monitor[0]() is request
+                        ):
+                            active_tokens = active_monitor[1]
+                            for stale_token in tuple(active_tokens):
+                                if not stale_token.active:
+                                    active_tokens.discard(stale_token)
+                            if active_tokens:
+                                return DedupDecision(seen=True, observational=True)
+                            del self._active_monitor_requests[request_id]
+                        elif active_monitor is not None:
+                            # Dead weak origin or recycled object id: stale telemetry state
+                            # must never suppress an unrelated Request.
+                            del self._active_monitor_requests[request_id]
+
+                        if self._active_filter_requests.get(request_id) is request:
                             return DedupDecision(seen=True, observational=True)
-                        del self._active_monitor_requests[request_id]
-                    elif active_monitor is not None:
-                        # Dead weak origin or recycled object id: stale telemetry state
-                        # must never suppress an unrelated Request.
-                        del self._active_monitor_requests[request_id]
 
-                    self._pending_reservations.discard(request)
-                    if transactional:
-                        # ``owner`` was normalized by the caller.
-                        assert owner is not None  # nosec B101
-                        existing = self._reservations_by_owner.get(id(owner))
-                        if existing is not None and existing.owner is owner:
-                            raise RuntimeError(
-                                "duplicate-filter owner intent is already active"
+                        if transactional:
+                            assert owner is not None  # nosec B101
+                            existing = self._reservations_by_owner.get(id(owner))
+                            if existing is not None and existing.owner is owner:
+                                raise RuntimeError(
+                                    "duplicate-filter owner intent is already active"
+                                )
+                            reservation = _DedupReservation(
+                                encoded_fingerprint,
+                                operation.epoch,
+                                owner,
+                                request,
+                                fingerprint,
                             )
-                        reservation = _DedupReservation(
-                            encoded_fingerprint,
-                            self._reservation_epoch,
-                            owner,
-                            request,
-                            fingerprint,
-                        )
-                        self._active_reservations[id(reservation)] = reservation
-                        self._reservations_by_owner[id(owner)] = reservation
-                        published_owner = owner
+                            self._active_reservations[id(reservation)] = reservation
+                            self._reservations_by_owner[id(owner)] = reservation
+                            published_owner = owner
+                        else:
+                            # Pre-publish intent for the legacy boolean protocol:
+                            # a BaseException between the marker write and the
+                            # receipt publication is compensated from this
+                            # registration (see
+                            # ``_compensate_interrupted_legacy_add_locked``),
+                            # mirroring the transactional owner-intent protocol.
+                            legacy_add_intent = self._register_legacy_add_intent_locked(
+                                request,
+                                encoded_fingerprint,
+                            )
 
-                    if transactional:
-                        seen = self._request_seen_for_scheduler_unlocked(
-                            fingerprint,
-                            encoded_fingerprint,
-                            pending_monitor_events,
-                            pending_diagnostics,
-                        )
-                        if seen:
-                            # A transactional reservation was published above.
+                    # The filter/backend callback is deliberately outside the lifecycle
+                    # lock. The separate operation lock keeps local filter strategies
+                    # thread-safe without preventing lifecycle admission from draining.
+                    with self._filter_operation_scope(request):
+                        if transactional:
+                            seen = self._request_seen_for_scheduler_unlocked(
+                                fingerprint,
+                                encoded_fingerprint,
+                                pending_monitor_events,
+                                pending_diagnostics,
+                            )
+                            reservation_state: Literal["added", "allowance"] | None = (
+                                None
+                            )
+                        else:
+                            assert legacy_add_intent is not None  # nosec B101
+                            seen, reservation_state, legacy_slot_reserved = (
+                                self._request_seen_unlocked(
+                                    request,
+                                    fingerprint,
+                                    encoded_fingerprint,
+                                    pending_monitor_events,
+                                    pending_diagnostics,
+                                    intent=legacy_add_intent,
+                                )
+                            )
+
+                    with self._lifecycle_condition:
+                        if transactional and seen:
                             assert reservation is not None  # nosec B101
                             self._discard_reservation(reservation)
                             reservation = None
-                    else:
-                        seen, reservation_state = self._request_seen_unlocked(
-                            request,
-                            fingerprint,
-                            encoded_fingerprint,
-                            pending_monitor_events,
-                            pending_diagnostics,
+                        elif not transactional:
+                            if reservation_state is not None:
+                                self._new_legacy_reservation_locked(
+                                    request,
+                                    encoded_fingerprint,
+                                    fingerprint,
+                                    allowance_slot_reserved=legacy_slot_reserved,
+                                )
+                                legacy_slot_reserved = False
+                            self._retire_legacy_add_intent_locked(
+                                request,
+                                legacy_add_intent,
+                            )
+                        drain_token, should_warn_overflow = (
+                            self._queue_monitor_events_unlocked(
+                                request,
+                                pending_monitor_events,
+                            )
                         )
-                        if reservation_state is not None:
-                            self._pending_reservations.add(request)
-
-                    drain_token, should_warn_overflow = (
-                        self._queue_monitor_events_unlocked(
-                            request,
-                            pending_monitor_events,
-                        )
-                    )
                 except BaseException:
-                    if transactional:
-                        self._compensate_interrupted_decision(
-                            reservation,
-                            published_owner,
-                        )
-                        compensated_under_lock = True
+                    with self._lifecycle_condition:
+                        if transactional:
+                            self._compensate_interrupted_decision(
+                                reservation,
+                                published_owner,
+                            )
+                        else:
+                            self._compensate_interrupted_legacy_add_locked(
+                                request,
+                                legacy_add_intent,
+                            )
                     raise
+
             self._emit_continuation_diagnostics(pending_diagnostics)
             self._dispatch_queued_monitor_events(
                 drain_token,
                 should_warn_overflow,
             )
-            return DedupDecision(
-                seen=seen,
-                reservation=reservation,
-            )
         except BaseException:
-            # The caller never received the opaque receipt. Compensate immediately;
-            # putting it back into the legacy WeakSet would be unusable because the
-            # next request_seen call clears that side channel before checking state.
-            if transactional and not compensated_under_lock:
-                self._compensate_interrupted_decision(
-                    reservation,
-                    published_owner,
-                )
+            # Preserve a published legacy receipt when process-control telemetry
+            # interrupts delivery.  Scrapy/custom callers may still consume and
+            # settle it after handling the signal; silently compensating here would
+            # make the public boolean protocol lose that retry handoff.
             raise
+
+        return DedupDecision(
+            seen=seen,
+            reservation=reservation,
+        )
 
     def _request_seen_unlocked(
         self,
@@ -1299,20 +1978,25 @@ class BackendDupeFilter:
         encoded_fingerprint: bytes,
         monitor_events: list[_PendingMonitorEvent],
         diagnostics: list[_ContinuationDiagnostic],
-    ) -> tuple[bool, Literal["added", "allowance"] | None]:
+        intent: _PendingLegacyAddIntent,
+    ) -> tuple[bool, Literal["added", "allowance"] | None, bool]:
         """Check if a request has been seen before.
 
         Args:
             request: The request to check.
+            intent: This invocation's pre-publish intent. ``slot_reserved`` is
+                maintained at every admission-slot ownership change so the
+                caller's BaseException compensation can decide exactly whether
+                a marker may have been written without a receipt.
 
         Returns:
-            ``(seen, reservation_state)`` for this invocation only.
+            ``(seen, reservation_state, slot_reserved)`` for this invocation only.
         """
         del request
 
         if encoded_fingerprint in self._volatile_fingerprints:
             monitor_events.append(("on_dedup_hit", (fingerprint,)))
-            return True, None
+            return True, None, False
 
         # Non-removable filters retain their original bit/fingerprint after a
         # failed queue push. ``forget`` grants exactly one retry miss; deletion
@@ -1320,12 +2004,46 @@ class BackendDupeFilter:
         # cannot consume the same allowance twice. The underlying retained marker
         # makes every other caller a duplicate before and after that one retry.
         if self._consume_retry_allowance(encoded_fingerprint):
+            intent.slot_reserved = True
             monitor_events.append(("on_dedup_miss", (fingerprint,)))
-            return False, "allowance"
+            return False, "allowance", True
+
+        # Never add a new non-transactional marker when every bounded recovery
+        # slot is already owned by a failed push.  Probe membership first so a
+        # previously durable marker remains a duplicate; an unseen item is
+        # admitted without a marker and can therefore never become an
+        # unreachable failed-work ghost.
+        if not self._reserve_retry_allowance_slot():
+            if self._note_retry_allowance_backpressure():
+                diagnostics.append("retry_allowance_overflow")
+            try:
+                already_seen = encoded_fingerprint in self._filter
+            except NotImplementedError as exc:
+                raise RuntimeError(
+                    "Configured backend does not support set/duplicate filtering; "
+                    "use a backend with SetBackend or disable BackendDupeFilter."
+                ) from exc
+            except (BackendConnectionError, CircuitBreakerOpenError) as exc:
+                self._handle_backend_error(
+                    fingerprint,
+                    exc,
+                    monitor_events,
+                    diagnostics,
+                )
+                return False, None, False
+            if already_seen:
+                monitor_events.append(("on_dedup_hit", (fingerprint,)))
+                return True, None, False
+            monitor_events.append(("on_dedup_miss", (fingerprint,)))
+            return False, None, False
+
+        intent.slot_reserved = True
 
         try:
             added = self._filter.add(encoded_fingerprint)
         except NotImplementedError as exc:
+            self._release_retry_allowance_slot()
+            intent.slot_reserved = False
             raise RuntimeError(
                 "Configured backend does not support set/duplicate filtering; "
                 "use a backend with SetBackend or disable BackendDupeFilter."
@@ -1349,8 +2067,10 @@ class BackendDupeFilter:
             # full). ``FilterFull`` is caught by TYPE (not by string-matching the
             # message), so the cuckoo layer is free to reword its message without
             # silently disabling this guard.
+            self._release_retry_allowance_slot()
+            intent.slot_reserved = False
             self._handle_filter_full(fingerprint, monitor_events, diagnostics)
-            return False, None
+            return False, None, False
         except (BackendConnectionError, CircuitBreakerOpenError) as exc:
             # Transient-backend-error graceful degradation (Risk 4).
             #
@@ -1367,8 +2087,18 @@ class BackendDupeFilter:
             # strictly better than crawl death. Distinct from the NotImplementedError
             # arm (unsupported backend, still raises RuntimeError) and the FilterFull
             # arm (filter at capacity).
+            self._release_retry_allowance_slot()
+            intent.slot_reserved = False
             self._handle_backend_error(fingerprint, exc, monitor_events, diagnostics)
-            return False, None
+            return False, None, False
+        except BaseException:
+            # A process-control interruption may land after the backend write
+            # took effect but before ``add`` returns. The invocation's reserved
+            # admission slot is intentionally retained on the intent so the
+            # caller's BaseException compensation converts it into one
+            # ``forget``-semantics retry allowance; releasing it here would
+            # strand a possibly-written marker as a permanent ghost.
+            raise
 
         # add() returns True when the item was newly added; a duplicate maps to False.
         seen = not added
@@ -1406,7 +2136,10 @@ class BackendDupeFilter:
         # case was queued above to preserve its insertion-only event order.
         if not is_memory_filter and saturation_event is not None:
             monitor_events.append(saturation_event)
-        return seen, "added" if added else None
+        if not added:
+            self._release_retry_allowance_slot()
+            intent.slot_reserved = False
+        return seen, "added" if added else None, added
 
     def _request_seen_for_scheduler_unlocked(
         self,
@@ -1465,63 +2198,62 @@ class BackendDupeFilter:
         pending_diagnostics: list[_ContinuationDiagnostic] = []
         drain_token: _MonitorFenceToken | None = None
         should_warn_overflow = False
-        with self._lifecycle_lock:
-            if (
-                reservation.epoch != self._reservation_epoch
-                or self._active_reservations.get(id(reservation)) is not reservation
-            ):
-                self._discard_reservation(reservation)
+        with self._admit_operation("commit", reservation=reservation) as operation:
+            if operation is None:
                 return
-            # The queue copy is already authoritative. Release bookkeeping before
-            # the backend write so an interruption at any later opcode can cause at
-            # most replay, never retain the Request/owner until close.
-            self._discard_reservation(reservation)
             try:
-                added = self._filter.add(reservation.fingerprint)
-            except FilterFull:
-                self._handle_filter_full(
-                    reservation.fingerprint_text,
-                    pending_monitor_events,
-                    pending_diagnostics,
-                )
-            except (BackendConnectionError, CircuitBreakerOpenError) as exc:
-                self._handle_backend_error(
-                    reservation.fingerprint_text,
-                    exc,
-                    pending_monitor_events,
-                    pending_diagnostics,
-                )
-            else:
-                saturation_event: _PendingMonitorEvent | None = None
-                is_memory_filter = isinstance(self._filter, MemoryMembershipFilter)
-                if not is_memory_filter or added:
-                    saturation = getattr(self._filter, "saturation", None)
-                    if saturation is not None:
-                        capacity = getattr(
+                with self._filter_operation_scope(reservation.request):
+                    try:
+                        added = self._filter.add(reservation.fingerprint)
+                    except FilterFull:
+                        self._handle_filter_full(
+                            reservation.fingerprint_text,
+                            pending_monitor_events,
+                            pending_diagnostics,
+                        )
+                    except (BackendConnectionError, CircuitBreakerOpenError) as exc:
+                        self._handle_backend_error(
+                            reservation.fingerprint_text,
+                            exc,
+                            pending_monitor_events,
+                            pending_diagnostics,
+                        )
+                    else:
+                        saturation_event: _PendingMonitorEvent | None = None
+                        is_memory_filter = isinstance(
                             self._filter,
-                            "configured_capacity",
-                            getattr(self._filter, "capacity", None),
+                            MemoryMembershipFilter,
                         )
-                        saturation_event = (
-                            "on_filter_saturation",
-                            (len(self._filter), capacity),
+                        if not is_memory_filter or added:
+                            saturation = getattr(self._filter, "saturation", None)
+                            if saturation is not None:
+                                capacity = getattr(
+                                    self._filter,
+                                    "configured_capacity",
+                                    getattr(self._filter, "capacity", None),
+                                )
+                                saturation_event = (
+                                    "on_filter_saturation",
+                                    (len(self._filter), capacity),
+                                )
+                        if is_memory_filter and saturation_event is not None:
+                            pending_monitor_events.append(saturation_event)
+                        pending_monitor_events.append(
+                            ("on_dedup_miss", (reservation.fingerprint_text,))
                         )
-                if is_memory_filter and saturation_event is not None:
-                    pending_monitor_events.append(saturation_event)
-                pending_monitor_events.append(
-                    ("on_dedup_miss", (reservation.fingerprint_text,))
-                )
-                if not is_memory_filter and saturation_event is not None:
-                    pending_monitor_events.append(saturation_event)
-            drain_token, should_warn_overflow = self._queue_monitor_events_unlocked(
-                reservation.request,
-                pending_monitor_events,
-            )
+                        if not is_memory_filter and saturation_event is not None:
+                            pending_monitor_events.append(saturation_event)
+            finally:
+                with self._lifecycle_condition:
+                    self._discard_reservation(reservation)
+                    drain_token, should_warn_overflow = (
+                        self._queue_monitor_events_unlocked(
+                            reservation.request,
+                            pending_monitor_events,
+                        )
+                    )
         self._emit_continuation_diagnostics(pending_diagnostics)
-        self._dispatch_queued_monitor_events(
-            drain_token,
-            should_warn_overflow,
-        )
+        self._dispatch_queued_monitor_events(drain_token, should_warn_overflow)
 
     def commit_volatile_reservation(self, reservation: object) -> None:
         """Publish a lifecycle-local marker for a process-local queue push."""
@@ -1530,35 +2262,29 @@ class BackendDupeFilter:
         drain_token: _MonitorFenceToken | None = None
         should_warn_overflow = False
         should_warn_marker_overflow = False
-        with self._lifecycle_lock:
-            if (
-                reservation.epoch != self._reservation_epoch
-                or self._active_reservations.get(id(reservation)) is not reservation
-            ):
-                self._discard_reservation(reservation)
+        with self._admit_operation("commit", reservation=reservation) as operation:
+            if operation is None:
                 return
-            # As for the durable commit path, release the receipt before any
-            # interruptible publication. Losing this process-local shadow can admit
-            # replay but cannot lose the item already held by the local strategy.
-            self._discard_reservation(reservation)
-            fingerprint = reservation.fingerprint
-            if fingerprint in self._volatile_fingerprints:
-                self._volatile_fingerprints.move_to_end(fingerprint)
-            else:
-                if len(self._volatile_fingerprints) >= self._volatile_fingerprint_limit:
-                    self._volatile_fingerprints.popitem(last=False)
-                    if not self._volatile_fingerprint_overflow_warned:
-                        self._volatile_fingerprint_overflow_warned = True
-                        should_warn_marker_overflow = True
-                self._volatile_fingerprints[fingerprint] = None
-            drain_token, should_warn_overflow = self._queue_monitor_events_unlocked(
-                reservation.request,
-                [("on_dedup_miss", (reservation.fingerprint_text,))],
-            )
-        self._dispatch_queued_monitor_events(
-            drain_token,
-            should_warn_overflow,
-        )
+            with self._lifecycle_condition:
+                fingerprint = reservation.fingerprint
+                if fingerprint in self._volatile_fingerprints:
+                    self._volatile_fingerprints.move_to_end(fingerprint)
+                else:
+                    if (
+                        len(self._volatile_fingerprints)
+                        >= self._volatile_fingerprint_limit
+                    ):
+                        self._volatile_fingerprints.popitem(last=False)
+                        if not self._volatile_fingerprint_overflow_warned:
+                            self._volatile_fingerprint_overflow_warned = True
+                            should_warn_marker_overflow = True
+                    self._volatile_fingerprints[fingerprint] = None
+                self._discard_reservation(reservation)
+                drain_token, should_warn_overflow = self._queue_monitor_events_unlocked(
+                    reservation.request,
+                    [("on_dedup_miss", (reservation.fingerprint_text,))],
+                )
+        self._dispatch_queued_monitor_events(drain_token, should_warn_overflow)
         if should_warn_marker_overflow:
             try:
                 logger.warning(
@@ -1567,8 +2293,6 @@ class BackendDupeFilter:
                     self._volatile_fingerprint_limit,
                 )
             except BaseException:
-                # The new marker was already published and the bounded eviction has
-                # already happened. Keep that committed outcome observable to callers.
                 pass
 
     def rollback_reservation(self, reservation: object) -> None:
@@ -1577,22 +2301,16 @@ class BackendDupeFilter:
             raise TypeError("invalid duplicate-filter reservation receipt")
         drain_token: _MonitorFenceToken | None = None
         should_warn_overflow = False
-        with self._lifecycle_lock:
-            if (
-                reservation.epoch != self._reservation_epoch
-                or self._active_reservations.get(id(reservation)) is not reservation
-            ):
-                self._discard_reservation(reservation)
+        with self._admit_operation("rollback", reservation=reservation) as operation:
+            if operation is None:
                 return
-            self._discard_reservation(reservation)
-            drain_token, should_warn_overflow = self._queue_monitor_events_unlocked(
-                reservation.request,
-                [("on_dedup_miss", (reservation.fingerprint_text,))],
-            )
-        self._dispatch_queued_monitor_events(
-            drain_token,
-            should_warn_overflow,
-        )
+            with self._lifecycle_condition:
+                self._discard_reservation(reservation)
+                drain_token, should_warn_overflow = self._queue_monitor_events_unlocked(
+                    reservation.request,
+                    [("on_dedup_miss", (reservation.fingerprint_text,))],
+                )
+        self._dispatch_queued_monitor_events(drain_token, should_warn_overflow)
 
     def rollback_reservation_intent(self, owner: object) -> None:
         """Discard a receipt whose return handoff was interrupted.
@@ -1601,7 +2319,7 @@ class BackendDupeFilter:
         monitor event. Keeping it side-effect-free also prevents monitor re-entry
         while an outer lifecycle-lock frame is still active.
         """
-        with self._lifecycle_lock:
+        with self._lifecycle_condition:
             reservation = self._reservations_by_owner.get(id(owner))
             if reservation is None or reservation.owner is not owner:
                 return
@@ -1631,6 +2349,54 @@ class BackendDupeFilter:
             # implementations through ``sys.exc_info()`` without improving recovery.
             return
 
+    def _compensate_interrupted_legacy_add_locked(
+        self,
+        request: Request,
+        intent: _PendingLegacyAddIntent | None,
+    ) -> None:
+        """Compensate one interrupted legacy admission with a retry path.
+
+        A process-control interruption anywhere between the marker write
+        (``filter.add``) and the receipt publication cannot tell whether the
+        backend write landed. When the invocation still owns its reserved
+        admission slot and no receipt was published, the slot is converted into
+        exactly one ``forget``-semantics retry allowance: the next matching
+        ``request_seen`` returns a miss (consuming the allowance) instead of
+        being permanently suppressed by a ghost marker, while every later
+        caller remains a duplicate against the retained marker. Requires the
+        lifecycle lock; mirrors ``_compensate_interrupted_decision`` for the
+        boolean protocol.
+        """
+        if intent is None:
+            return
+        intents = self._legacy_add_intents.get(id(request))
+        if intents is not None:
+            try:
+                intents.remove(intent)
+            except ValueError:
+                # A lifecycle boundary already cleared the intent table; the
+                # interrupted generation cannot own a live admission slot.
+                return
+            if not intents:
+                del self._legacy_add_intents[id(request)]
+        if not intent.slot_reserved:
+            # No marker could have been written by this invocation (volatile
+            # hit, backpressured probe, degradation, or duplicate admission).
+            return
+        receipt = self._legacy_reservation_for_request_locked(
+            request,
+            pending_only=True,
+        )
+        if (
+            receipt is not None
+            and receipt.fingerprint == intent.fingerprint
+            and receipt.allowance_slot_reserved
+        ):
+            # The receipt publication completed and already owns the slot; the
+            # scheduler's settle/forget path remains the recovery owner.
+            return
+        self._grant_retry_allowance(intent.fingerprint, reserved_slot=True)
+
     def _discard_reservation(self, reservation: _DedupReservation) -> None:
         """Forget one receipt without mutating membership state."""
         if self._active_reservations.get(id(reservation)) is reservation:
@@ -1638,24 +2404,57 @@ class BackendDupeFilter:
         owner_reservation = self._reservations_by_owner.get(id(reservation.owner))
         if owner_reservation is reservation:
             del self._reservations_by_owner[id(reservation.owner)]
+        self._lifecycle_condition.notify_all()
 
     def consume_reservation(self, request: Request) -> bool:
-        """Consume whether the latest check reserved state for ``request``.
+        """Consume exactly one pending legacy receipt for ``request``.
 
-        Scrapy's public dupefilter protocol returns only seen/not-seen. The
-        scheduler additionally needs to know whether a not-seen result actually
-        wrote a fingerprint before deciding if a failed queue push should call
-        :meth:`forget`. Filter-full and transient-outage misses return False but
-        create no reservation, so compensating those would delete unrelated state.
-
-        Returns:
-            True exactly once for a genuine reservation; False for degraded misses,
-            duplicates, unknown requests, and repeated consumption.
+        The boolean return is retained for Scrapy/custom-filter compatibility.  A
+        per-request FIFO and the caller thread's handoff identity ensure that a
+        repeated or concurrent call cannot consume a sibling invocation's receipt.
         """
-        with self._lifecycle_lock:
+        with self._lifecycle_condition:
             if request not in self._pending_reservations:
                 return False
-            self._pending_reservations.discard(request)
+            reservation = self._legacy_reservation_for_request_locked(
+                request,
+                pending_only=True,
+            )
+            if reservation is None or reservation.epoch != self._reservation_epoch:
+                if id(request) not in self._legacy_reservations:
+                    self._pending_reservations.discard(request)
+                return False
+            self._remove_receipt_from_table_locked(
+                self._legacy_reservations,
+                reservation,
+            )
+            # A current scheduler handoff supersedes any old-generation tombstone
+            # for this Request; subsequent forget() calls now select this exact
+            # handoff rather than being conservatively ignored.
+            self._legacy_retired_requests.discard(request)
+            reservation.consumed = True
+            reservation.consumer_thread_id = get_ident()
+            self._legacy_handoffs.setdefault(id(request), deque()).append(reservation)
+            if id(request) not in self._legacy_reservations:
+                self._pending_reservations.discard(request)
+            self._lifecycle_condition.notify_all()
+            return True
+
+    def settle_reservation(self, request: Request) -> bool:
+        """Remove one successful legacy scheduler handoff without filter I/O.
+
+        This is intentionally additive: generic third-party dupefilters that do
+        not expose it remain on the historical ``request_seen``/``forget`` path.
+        """
+        with self._lifecycle_condition:
+            reservation = self._legacy_reservation_for_request_locked(
+                request,
+                thread_id=get_ident(),
+                handoff_only=True,
+            )
+            if reservation is None or reservation.epoch != self._reservation_epoch:
+                return False
+            self._remove_legacy_reservation_locked(reservation)
             return True
 
     def forget(self, request: Request) -> None:
@@ -1672,88 +2471,218 @@ class BackendDupeFilter:
         failure calls ``forget`` again and re-arms one allowance.
 
         Allowances are unique per fingerprint and capped at 1,024 entries. At the
-        cap, the oldest allowance is evicted. Insertion and consumption share one
-        lock, giving concurrent callers a single linearization order and ensuring
-        no allowance can admit two queue pushes.
+        cap, new non-transactional marker admission is backpressured instead of
+        evicting an existing failed-work recovery. Insertion and consumption share
+        one lock, giving concurrent callers a single linearization order and
+        ensuring no allowance can admit two queue pushes.
 
         Args:
             request: The request whose newly-added fingerprint must be compensated.
         """
         pending_monitor_events: list[_PendingMonitorEvent] = []
         pending_diagnostics: list[_ContinuationDiagnostic] = []
-        with self._lifecycle_lock:
-            if self._closed or self._closing:
+        drain_token: _MonitorFenceToken | None = None
+        should_warn_overflow = False
+        with self._lifecycle_condition:
+            if self._lifecycle_state in {_CLOSED}:
                 raise RuntimeError("dupefilter is closing or closed")
-            self._pending_reservations.discard(request)
-            fingerprint = self.request_fingerprint(request).encode()
+            reservation = self._legacy_reservation_for_request_locked(
+                request,
+                thread_id=get_ident(),
+                handoff_only=True,
+            )
+            if reservation is None and request in self._legacy_retired_requests:
+                # This Request has an old-generation receipt that was cancelled by
+                # a transition.  Do not reinterpret the late forget as compensation
+                # for a replacement-generation pending marker.
+                return
+            if reservation is None:
+                reservation = self._legacy_reservation_for_request_locked(
+                    request,
+                    pending_only=True,
+                )
+            if reservation is None or reservation.epoch != self._reservation_epoch:
+                # A receipt from a retired epoch is intentionally a no-op. In
+                # particular, never remove a same-fingerprint marker from the new
+                # generation on behalf of a late scheduler compensation.
+                return
+            reservation.settling = True
+
+        with self._admit_operation("forget", reservation=reservation) as operation:
+            if operation is None:
+                return
             retry_allowance_needed = False
             try:
-                self._filter.remove(fingerprint)
-            except NotImplementedError:
-                retry_allowance_needed = True
-            except (BackendConnectionError, CircuitBreakerOpenError) as exc:
-                retry_allowance_needed = True
-                self._handle_forget_backend_error(
-                    exc,
-                    pending_monitor_events,
-                    pending_diagnostics,
-                )
-            if retry_allowance_needed:
-                # The handled exception has unwound before advisory overflow logging.
-                self._grant_retry_allowance(fingerprint)
-            drain_token, should_warn_overflow = self._queue_monitor_events_unlocked(
-                request,
-                pending_monitor_events,
-            )
+                with self._filter_operation_scope(request):
+                    try:
+                        self._filter.remove(reservation.fingerprint)
+                    except NotImplementedError:
+                        retry_allowance_needed = True
+                    except (BackendConnectionError, CircuitBreakerOpenError) as exc:
+                        retry_allowance_needed = True
+                        self._handle_forget_backend_error(
+                            exc,
+                            pending_monitor_events,
+                            pending_diagnostics,
+                        )
+                    except BaseException:
+                        # A control interruption may occur after a remote remove
+                        # took effect or before it did.  Keep one retry path and
+                        # re-raise the control signal after the receipt is settled.
+                        retry_allowance_needed = True
+                        raise
+            finally:
+                if retry_allowance_needed:
+                    # A receipt-owned slot makes this conversion exact and cannot
+                    # evict another failed-work allowance.
+                    self._grant_retry_allowance(
+                        reservation.fingerprint,
+                        reserved_slot=reservation.allowance_slot_reserved,
+                        reservation=reservation,
+                    )
+                with self._lifecycle_condition:
+                    self._remove_legacy_reservation_locked(reservation)
+                    drain_token, should_warn_overflow = (
+                        self._queue_monitor_events_unlocked(
+                            request,
+                            pending_monitor_events,
+                        )
+                    )
         self._emit_continuation_diagnostics(pending_diagnostics)
         self._dispatch_queued_monitor_events(drain_token, should_warn_overflow)
 
-    def _grant_retry_allowance(self, fingerprint: bytes) -> None:
-        """Insert or refresh one bounded retry allowance for ``fingerprint``."""
+    def _reserve_retry_allowance_slot(self) -> bool:
+        """Reserve bounded recovery capacity before adding a legacy marker."""
+        with self._lifecycle_condition:
+            with self._retry_allowance_lock:
+                if (
+                    len(self._retry_allowances) + self._retry_allowance_slots_reserved
+                    >= self._retry_allowance_limit
+                ):
+                    return False
+                self._retry_allowance_slots_reserved += 1
+                return True
+
+    def _note_retry_allowance_backpressure(self) -> bool:
+        """Elect one post-decision warning for a full recovery ledger."""
+        with self._lifecycle_condition:
+            with self._retry_allowance_lock:
+                if self._retry_allowance_overflow_warned:
+                    return False
+                self._retry_allowance_overflow_warned = True
+                return True
+
+    def _release_retry_allowance_slot_locked(self) -> None:
+        """Release a pre-admission slot while the lifecycle lock is held."""
+        if self._retry_allowance_slots_reserved:
+            self._retry_allowance_slots_reserved -= 1
+
+    def _release_retry_allowance_slot(self) -> None:
+        """Release a pre-admission slot outside filter callbacks."""
+        with self._lifecycle_condition:
+            self._release_retry_allowance_slot_locked()
+
+    def _grant_retry_allowance(
+        self,
+        fingerprint: bytes,
+        *,
+        reserved_slot: bool = False,
+        reservation: _LegacyReservation | None = None,
+    ) -> bool:
+        """Insert one exact recovery allowance without evicting another.
+
+        A reserved slot is normally carried by the legacy receipt.  The
+        ``reserved_slot=False`` path is retained for older/custom callers; when
+        the ledger is full it refuses admission and leaves the underlying marker
+        untouched rather than silently forgetting how to recover it.
+        """
         warn_overflow = False
-        with self._retry_allowance_lock:
-            if fingerprint in self._retry_allowances:
-                self._retry_allowances.move_to_end(fingerprint)
-                return
-            if len(self._retry_allowances) >= self._retry_allowance_limit:
-                self._retry_allowances.popitem(last=False)
-                if not self._retry_allowance_overflow_warned:
-                    self._retry_allowance_overflow_warned = True
-                    warn_overflow = True
-            self._retry_allowances[fingerprint] = None
+        inserted = False
+        with self._lifecycle_condition:
+            with self._retry_allowance_lock:
+                if fingerprint in self._retry_allowances:
+                    self._retry_allowances.move_to_end(fingerprint)
+                    if reserved_slot:
+                        # Clear the receipt flag while the same lifecycle lock still
+                        # owns the slot conversion.  Otherwise a concurrent request
+                        # can reserve the just-released counter and the later receipt
+                        # cleanup would decrement that unrelated reservation.
+                        if reservation is not None:
+                            reservation.allowance_slot_reserved = False
+                        self._release_retry_allowance_slot_locked()
+                    return True
+                if reserved_slot:
+                    # The receipt-owned slot is the admission guarantee; it is
+                    # converted atomically and cannot collide with another grant.
+                    if reservation is not None:
+                        reservation.allowance_slot_reserved = False
+                    self._release_retry_allowance_slot_locked()
+                    self._retry_allowances[fingerprint] = None
+                    inserted = True
+                elif (
+                    len(self._retry_allowances) + self._retry_allowance_slots_reserved
+                    >= self._retry_allowance_limit
+                ):
+                    if not self._retry_allowance_overflow_warned:
+                        self._retry_allowance_overflow_warned = True
+                        warn_overflow = True
+                else:
+                    self._retry_allowances[fingerprint] = None
+                    inserted = True
         if warn_overflow:
             try:
                 logger.warning(
-                    "Dedup retry allowances reached the configured bound; evicting the "
-                    "oldest failed-push allowance."
+                    "Dedup retry allowance capacity is exhausted; new marker admission "
+                    "is backpressured instead of evicting failed-work recovery state."
                 )
             except BaseException:
-                # Allowance insertion/eviction is the linearized recovery outcome;
-                # its warning must remain advisory.
                 pass
+        return inserted
 
     def _consume_retry_allowance(self, fingerprint: bytes) -> bool:
         """Atomically consume at most one allowance for ``fingerprint``."""
-        with self._retry_allowance_lock:
-            if fingerprint not in self._retry_allowances:
-                return False
-            del self._retry_allowances[fingerprint]
-            return True
+        with self._lifecycle_condition:
+            with self._retry_allowance_lock:
+                if fingerprint not in self._retry_allowances:
+                    return False
+                del self._retry_allowances[fingerprint]
+                # The matching request now owns the recovery slot until its queue
+                # handoff is settled or forget() re-arms the allowance.
+                self._retry_allowance_slots_reserved += 1
+                return True
 
-    def _clear_retry_allowances(self) -> None:
-        """Discard transient failed-push allowances at lifecycle boundaries."""
-        with self._retry_allowance_lock:
-            self._retry_allowances.clear()
-            # Reset the one-shot advisory latch alongside the LRU it guards so a
-            # close->open cycle in the same process can re-emit the overflow
-            # warning (mirrors ``_volatile_fingerprint_overflow_warned`` below).
-            self._retry_allowance_overflow_warned = False
-        self._pending_reservations.clear()
-        self._active_reservations.clear()
-        self._reservations_by_owner.clear()
-        self._volatile_fingerprints.clear()
-        self._volatile_fingerprint_overflow_warned = False
-        self._reservation_epoch += 1
+    def _clear_retry_allowances(
+        self,
+        *,
+        advance_epoch: bool = True,
+        clear_reservations: bool = True,
+    ) -> None:
+        """Reset retry state and optionally retire the current dedup epoch."""
+        with self._lifecycle_condition:
+            with self._retry_allowance_lock:
+                self._retry_allowances.clear()
+                # Reset the one-shot advisory latch alongside the bounded ledger so
+                # a close->open cycle can report backpressure again.
+                self._retry_allowance_overflow_warned = False
+            self._retry_allowance_slots_reserved = 0
+            if clear_reservations:
+                for table in (self._legacy_reservations, self._legacy_handoffs):
+                    for receipts in table.values():
+                        for receipt in receipts:
+                            request = receipt.request_ref()
+                            if request is not None:
+                                self._legacy_retired_requests.add(request)
+                self._pending_reservations.clear()
+                self._active_reservations.clear()
+                self._reservations_by_owner.clear()
+                self._legacy_reservations.clear()
+                self._legacy_handoffs.clear()
+                self._legacy_add_intents.clear()
+                self._volatile_fingerprints.clear()
+                self._volatile_fingerprint_overflow_warned = False
+            if advance_epoch:
+                self._reservation_epoch += 1
+            self._lifecycle_condition.notify_all()
 
     def _handle_filter_full(
         self,
@@ -1772,8 +2701,11 @@ class BackendDupeFilter:
             fingerprint: The request fingerprint that triggered the overflow.
         """
         global _filter_full_warned
-        if not _filter_full_warned:
-            _filter_full_warned = True
+        with _diagnostic_state_lock:
+            warn = not _filter_full_warned
+            if warn:
+                _filter_full_warned = True
+        if warn:
             diagnostics.append("filter_full")
         # Count the degradation via the monitor contract — ScrapyStatsMonitor
         # increments ``dupefilter/filter_full``; NullMonitor is a no-op. Replaces
@@ -1809,8 +2741,11 @@ class BackendDupeFilter:
             exc: The transient backend failure or circuit rejection.
         """
         global _backend_error_warned
-        if not _backend_error_warned:
-            _backend_error_warned = True
+        with _diagnostic_state_lock:
+            warn = not _backend_error_warned
+            if warn:
+                _backend_error_warned = True
+        if warn:
             diagnostics.append("backend_error")
         monitor_events.append(("on_error", ("dedup", _static_backend_error(exc))))
         if include_miss:
@@ -1824,8 +2759,11 @@ class BackendDupeFilter:
     ) -> None:
         """Record safe telemetry for failed-push compensation degradation."""
         global _forget_backend_error_warned
-        if not _forget_backend_error_warned:
-            _forget_backend_error_warned = True
+        with _diagnostic_state_lock:
+            warn = not _forget_backend_error_warned
+            if warn:
+                _forget_backend_error_warned = True
+        if warn:
             diagnostics.append("forget_backend_error")
         monitor_events.append(("on_error", ("dedup", _static_backend_error(exc))))
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 import sys
 import threading
@@ -14,6 +15,7 @@ import pytest
 from pytest_mock import MockerFixture
 from scrapy.http import Request
 
+import scrapy_extension.dupefilter.dupefilter as dupefilter_module
 from scrapy_extension.backends.circuit_breaker import CircuitBreakerOpenError
 from scrapy_extension.dupefilter.dupefilter import (
     BackendDupeFilter,
@@ -306,6 +308,23 @@ class _ThreadedSameRequestMonitor(Monitor):
         thread.join(timeout=2.0)
         if thread.is_alive():
             raise RuntimeError("threaded monitor re-entry deadlocked")
+
+
+class _SameThreadSameRequestMonitor(Monitor):
+    """Re-enter directly to verify the invocation-local frame fence."""
+
+    def __init__(self) -> None:
+        self.dupefilter: BackendDupeFilter | None = None
+        self.request: Request | None = None
+        self.observations: list[tuple[bool, bool]] = []
+
+    def on_dedup_miss(self, key: str) -> None:
+        del key
+        if self.dupefilter is None or self.request is None:
+            raise RuntimeError("same-thread monitor is not bound")
+        decision = self.dupefilter.request_seen_with_reservation(self.request)
+        self.observations.append((decision.seen, decision.observational))
+        assert decision.reservation is None
 
 
 class _NoSaturationCapacityPoisonFilter(MembershipFilter):
@@ -791,12 +810,13 @@ def test_retry_allowance_warning_handler_has_no_active_exception(
 
     assert dupefilter.request_seen(first) is False
     dupefilter.forget(first)
-    assert dupefilter.request_seen(second) is False
     with _capture_diagnostics(
         "scrapy_extension.dupefilter.dupefilter",
         level=logging.WARNING,
     ) as handler:
-        dupefilter.forget(second)
+        # The full recovery ledger backpressures this new marker; it does not
+        # admit work whose failed push could not be represented exactly.
+        assert dupefilter.request_seen(second) is False
 
     _assert_handler_records_are_redacted(handler, marker)
 
@@ -846,12 +866,12 @@ def test_volatile_marker_overflow_warning_preserves_published_marker(
         SystemExit(),
     ],
 )
-def test_retry_allowance_overflow_warning_preserves_new_allowance(
+def test_retry_allowance_overflow_warning_preserves_existing_allowance(
     mock_connection_manager: Any,
     mocker: MockerFixture,
     diagnostic_error: BaseException,
 ) -> None:
-    """Recovery allowance replacement is committed before its warning runs."""
+    """Backpressure preserves the existing failed-work allowance."""
     dupefilter = BackendDupeFilter(
         connection_manager=mock_connection_manager,
         membership_filter=BloomMembershipFilter(capacity=1_000, error_rate=0.01),
@@ -867,11 +887,12 @@ def test_retry_allowance_overflow_warning_preserves_new_allowance(
     )
     assert dupefilter.request_seen(second_request) is False
 
-    dupefilter.forget(second_request)
-
+    # The first allowance remains reachable; the second fingerprint was not
+    # inserted while the bounded ledger was full and therefore has no ghost.
     assert len(dupefilter._retry_allowances) == 1
     assert dupefilter.request_seen(second_request) is False
-    assert dupefilter.request_seen(second_request) is True
+    assert dupefilter.request_seen(first_request) is False
+    assert dupefilter.request_seen(first_request) is True
 
 
 @pytest.mark.parametrize(
@@ -1179,6 +1200,31 @@ def test_monitor_raw_thread_same_request_is_observational(
     dupefilter.commit_reservation(retry.reservation)
 
 
+def test_monitor_same_thread_reentry_is_observational_and_cleans_frame_token(
+    mock_connection_manager: Any,
+) -> None:
+    monitor = _SameThreadSameRequestMonitor()
+    membership = MemoryMembershipFilter(maxsize=None)
+    dupefilter = BackendDupeFilter(
+        connection_manager=mock_connection_manager,
+        membership_filter=membership,
+        monitor=monitor,
+    )
+    request = Request("https://example.test/same-thread-monitor")
+    monitor.dupefilter = dupefilter
+    monitor.request = request
+
+    decision = dupefilter.request_seen_with_reservation(request)
+    assert decision.reservation is not None
+    dupefilter.rollback_reservation(decision.reservation)
+
+    assert monitor.observations == [(True, True)]
+    assert dupefilter._monitor_drain_token is None
+    retry = dupefilter.request_seen_with_reservation(request.replace())
+    assert retry.reservation is not None
+    dupefilter.commit_reservation(retry.reservation)
+
+
 @pytest.mark.parametrize(
     "membership",
     [
@@ -1402,6 +1448,98 @@ def test_monitor_fence_liveness_audit_failure_admits_real_decision(
     assert decision.observational is False
     assert decision.reservation is not None
     dupefilter.rollback_reservation(decision.reservation)
+
+
+def test_monitor_fence_returns_false_when_frame_locals_are_unavailable(
+    mock_connection_manager: Any,
+    mocker: MockerFixture,
+) -> None:
+    class LocalsFailingFrame:
+        f_back = None
+
+        @property
+        def f_locals(self) -> dict[str, object]:
+            raise RuntimeError("frame audit denied")
+
+    mocker.patch.object(
+        sys,
+        "_current_frames",
+        return_value={threading.get_ident(): LocalsFailingFrame()},
+    )
+    token = _MonitorFenceToken(threading.get_ident(), "event_token")
+
+    assert token.active is False
+
+
+def test_monitor_fence_weakref_failure_fails_open(
+    mocker: MockerFixture,
+) -> None:
+    def hostile_ref(*_args: object, **_kwargs: object) -> object:
+        raise TypeError("weak references unavailable")
+
+    mocker.patch.object(dupefilter_module, "ref", hostile_ref)
+    dupefilter = BackendDupeFilter(
+        connection_manager=None,
+        membership_filter=MemoryMembershipFilter(maxsize=None),
+    )
+    request = Request("https://example.test/hostile-monitor-weakref")
+
+    decision = dupefilter.request_seen_with_reservation(request)
+    assert decision.reservation is not None
+    dupefilter.rollback_reservation(decision.reservation)
+    assert dupefilter._active_monitor_requests == {}
+
+
+def test_monitor_fence_returns_false_when_frame_chain_is_hostile(
+    mocker: MockerFixture,
+) -> None:
+    class FrameChainFailingFrame:
+        f_locals: dict[str, object] = {}
+
+        @property
+        def f_back(self) -> object:
+            raise RuntimeError("frame chain audit denied")
+
+    mocker.patch.object(
+        sys,
+        "_current_frames",
+        return_value={threading.get_ident(): FrameChainFailingFrame()},
+    )
+    token = _MonitorFenceToken(threading.get_ident(), "event_token")
+
+    assert token.active is False
+
+
+def test_monitor_origin_weakref_callback_removes_stale_entry() -> None:
+    dupefilter = BackendDupeFilter(
+        connection_manager=None,
+        membership_filter=MemoryMembershipFilter(maxsize=None),
+    )
+
+    def retain_origin() -> tuple[int, Any]:
+        request = Request("https://example.test/weak-monitor-origin")
+        origin = dupefilter._monitor_origin_ref(request)
+        request_id = id(request)
+        dupefilter._active_monitor_requests[request_id] = (origin, set())
+        return request_id, origin
+
+    request_id, origin = retain_origin()
+    gc.collect()
+    assert origin() is None
+    assert request_id not in dupefilter._active_monitor_requests
+
+
+def test_monitor_origin_weakref_cleanup_tolerates_owner_collection() -> None:
+    dupefilter = BackendDupeFilter(
+        connection_manager=None,
+        membership_filter=MemoryMembershipFilter(maxsize=None),
+    )
+    request = Request("https://example.test/weak-monitor-owner")
+    origin = dupefilter._monitor_origin_ref(request)
+    del dupefilter
+    del request
+    gc.collect()
+    assert origin() is None
 
 
 def test_reservation_repr_does_not_expose_request_or_owner_secrets(

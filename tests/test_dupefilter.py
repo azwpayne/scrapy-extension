@@ -761,7 +761,7 @@ class TestBackendDupeFilterForget:
         assert results.count(False) == 1
         assert results.count(True) == worker_count - 1
 
-    def test_retry_allowances_evict_oldest_at_fixed_bound(
+    def test_retry_allowances_backpressure_preserves_oldest_at_fixed_bound(
         self, mock_connection_manager
     ):
         membership_filter = BloomMembershipFilter(capacity=100, error_rate=1e-9)
@@ -776,9 +776,12 @@ class TestBackendDupeFilterForget:
             assert dupefilter.request_seen(request) is False
             dupefilter.forget(request)
 
+        # The bound is fail-safe: the third marker was never admitted, so no
+        # earlier failed-work allowance is evicted or made unreachable.
         assert len(dupefilter._retry_allowances) == 2
-        assert dupefilter.request_seen(requests[0]) is True
+        assert dupefilter.request_seen(requests[0]) is False
         assert dupefilter.request_seen(requests[1]) is False
+        assert dupefilter.request_seen(requests[2]) is False
         assert dupefilter.request_seen(requests[2]) is False
 
     def test_clear_retry_allowances_resets_overflow_warning_latch(
@@ -806,7 +809,8 @@ class TestBackendDupeFilterForget:
         logger_name = "scrapy_extension.dupefilter.dupefilter"
 
         def _grant_two() -> None:
-            # First grant fills the bound-1 LRU; second grant evicts -> overflow.
+            # First grant fills the bound-1 ledger; the second is refused with
+            # backpressure instead of evicting the first failed-work recovery.
             dupefilter._grant_retry_allowance(b"fp-a")
             dupefilter._grant_retry_allowance(b"fp-b")
 
@@ -817,7 +821,7 @@ class TestBackendDupeFilterForget:
         first_count = sum(
             1
             for record in caplog.records
-            if "retry allowances reached" in record.message
+            if "retry allowance capacity is exhausted" in record.message
         )
         assert first_count == 1
 
@@ -830,7 +834,7 @@ class TestBackendDupeFilterForget:
         total_count = sum(
             1
             for record in caplog.records
-            if "retry allowances reached" in record.message
+            if "retry allowance capacity is exhausted" in record.message
         )
         assert total_count == 2
 
