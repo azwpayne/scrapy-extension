@@ -86,7 +86,7 @@ all = [
 dev = [
     "packaging>=26.0,<27",
     "poethepoet",
-    "ruff",
+    "ruff>=0.16,<0.17",
 ]
 test = [
     "packaging>=26.0,<27",
@@ -147,6 +147,8 @@ source-exclude = [
     # uv-build's explicit source includes are broader than .gitignore. Keep
     # workstation state, local databases, and internal scratch plans out of a
     # release even when a maintainer builds from a dirty checkout.
+    "**/.claude/**",
+    "**/.claude-flow/**",
     "**/.omc/**",
     "**/.env*",
     "**/.secrets/**",

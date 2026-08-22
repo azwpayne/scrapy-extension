@@ -20,6 +20,8 @@ _REQUIRED_SOURCE_ENTRIES = {
     "uv.lock",
 }
 _REQUIRED_EXCLUDES = {
+    "**/.claude/**",
+    "**/.claude-flow/**",
     "**/.coverage.*",
     "./.cache/**",
     "**/.pytest_cache/**",

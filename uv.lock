@@ -2304,7 +2304,7 @@ provides-extras = ["redis", "mongodb", "kafka", "rabbitmq", "elasticsearch", "ro
 dev = [
     { name = "packaging", specifier = ">=26.0,<27" },
     { name = "poethepoet" },
-    { name = "ruff" },
+    { name = "ruff", specifier = ">=0.16,<0.17" },
 ]
 test = [
     { name = "bandit", extras = ["toml"] },
