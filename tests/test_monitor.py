@@ -913,7 +913,7 @@ class TestR14DObservability:
             manager, "_attempt_connection", side_effect=RuntimeError("boom")
         )
         mocker.patch(
-            "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+            "scrapy_extension.backends.connectors._manager._wait_for_retry_backoff",
             return_value=False,
         )  # skip backoff
         stats = _stats()
@@ -1005,7 +1005,7 @@ class TestR14DObservability:
             side_effect=[failed_backend, recovered_backend],
         )
         mocker.patch(
-            "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+            "scrapy_extension.backends.connectors._manager._wait_for_retry_backoff",
             return_value=False,
         )
         monitor = mocker.MagicMock(name="monitor")

@@ -577,12 +577,12 @@ class TestDescriptorBoundary:
 
     def test_plugin_loader_path_errors_are_configuration_errors(self, monkeypatch):
         descriptor = self._runtime_descriptor()
-        monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
+        monkeypatch.setattr(connectors._manager, "get_descriptor", lambda _: descriptor)
 
         def _missing_path(_: str) -> object:
             raise AttributeError("missing plugin symbol")
 
-        monkeypatch.setattr(connectors, "_load_object", _missing_path)
+        monkeypatch.setattr(connectors._plugin_contract, "_load_object", _missing_path)
 
         with pytest.raises(ConfigurationError, match="invalid plugin class path"):
             connectors.ConnectionManager("runtime_contract")._create_backend()
@@ -593,12 +593,12 @@ class TestDescriptorBoundary:
             marker,
             capabilities=frozenset({"queue"}),
         )
-        monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
+        monkeypatch.setattr(connectors._manager, "get_descriptor", lambda _: descriptor)
 
         def _missing_path(_: str) -> object:
             raise AttributeError(f"plugin loader detail: {marker}")
 
-        monkeypatch.setattr(connectors, "_load_object", _missing_path)
+        monkeypatch.setattr(connectors._plugin_contract, "_load_object", _missing_path)
 
         with pytest.raises(ConfigurationError) as exc_info:
             connectors.ConnectionManager(marker)._create_backend()
@@ -610,13 +610,13 @@ class TestDescriptorBoundary:
     ):
         descriptor = self._runtime_descriptor()
         loaded_paths: list[str] = []
-        monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
+        monkeypatch.setattr(connectors._manager, "get_descriptor", lambda _: descriptor)
 
         def _load(path: str) -> object:
             loaded_paths.append(path)
             return object()
 
-        monkeypatch.setattr(connectors, "_load_object", _load)
+        monkeypatch.setattr(connectors._plugin_contract, "_load_object", _load)
 
         with pytest.raises(ConfigurationError, match="acknowledgement contract"):
             connectors.ConnectionManager("runtime_contract")
@@ -624,7 +624,7 @@ class TestDescriptorBoundary:
 
     def test_plugin_constructor_type_error_is_not_retried(self, monkeypatch):
         descriptor = self._runtime_descriptor()
-        monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
+        monkeypatch.setattr(connectors._manager, "get_descriptor", lambda _: descriptor)
 
         class _BrokenBackend(_StubBackend):
             def __init__(self, settings: object) -> None:
@@ -636,7 +636,7 @@ class TestDescriptorBoundary:
                 _BrokenBackend if path == descriptor.backend_cls_path else _StubSettings
             )
 
-        monkeypatch.setattr(connectors, "_load_object", _load)
+        monkeypatch.setattr(connectors._plugin_contract, "_load_object", _load)
 
         with pytest.raises(ConfigurationError, match="could not be constructed"):
             connectors.ConnectionManager("runtime_contract")._create_backend()
@@ -644,7 +644,7 @@ class TestDescriptorBoundary:
     def test_plugin_constructor_diagnostics_are_not_retained(self, monkeypatch):
         descriptor = self._runtime_descriptor()
         marker = "plugin-constructor-secret-marker"
-        monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
+        monkeypatch.setattr(connectors._manager, "get_descriptor", lambda _: descriptor)
 
         class _BrokenBackend(_StubBackend):
             def __init__(self, settings: object) -> None:
@@ -656,7 +656,7 @@ class TestDescriptorBoundary:
                 _BrokenBackend if path == descriptor.backend_cls_path else _StubSettings
             )
 
-        monkeypatch.setattr(connectors, "_load_object", _load)
+        monkeypatch.setattr(connectors._plugin_contract, "_load_object", _load)
 
         with pytest.raises(ConfigurationError) as exc_info:
             connectors.ConnectionManager(
@@ -672,7 +672,7 @@ class TestDescriptorBoundary:
         marker = "plugin-settings-loader-secret-marker"
         load_calls: list[str] = []
         sleep_calls: list[float] = []
-        monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
+        monkeypatch.setattr(connectors._manager, "get_descriptor", lambda _: descriptor)
 
         def _load(path: str) -> object:
             load_calls.append(path)
@@ -682,9 +682,9 @@ class TestDescriptorBoundary:
                 raise ImportError(marker)
             raise AssertionError("unexpected descriptor path")
 
-        monkeypatch.setattr(connectors, "_load_object", _load)
+        monkeypatch.setattr(connectors._plugin_contract, "_load_object", _load)
         monkeypatch.setattr(
-            connectors,
+            connectors._manager,
             "_wait_for_retry_backoff",
             lambda _event, delay: sleep_calls.append(delay),
         )
@@ -703,9 +703,9 @@ class TestDescriptorBoundary:
     ):
         descriptor = self._runtime_descriptor()
         marker = "plugin-adaptation-loader-secret-marker"
-        monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
+        monkeypatch.setattr(connectors._config, "get_descriptor", lambda _: descriptor)
         monkeypatch.setattr(
-            connectors,
+            connectors._plugin_contract,
             "_load_object",
             lambda _: (_ for _ in ()).throw(ImportError(marker)),
         )
@@ -727,7 +727,7 @@ class TestDescriptorBoundary:
     def test_plugin_model_field_metadata_failure_is_not_public(self, monkeypatch):
         descriptor = self._runtime_descriptor()
         marker = "plugin-model-fields-secret-marker"
-        monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
+        monkeypatch.setattr(connectors._manager, "get_descriptor", lambda _: descriptor)
 
         class _ExplosiveMeta(type):
             @property
@@ -747,7 +747,7 @@ class TestDescriptorBoundary:
                 else _ExplosiveSettings
             )
 
-        monkeypatch.setattr(connectors, "_load_object", _load)
+        monkeypatch.setattr(connectors._plugin_contract, "_load_object", _load)
 
         with pytest.raises(ConfigurationError) as exc_info:
             connectors.ConnectionManager("runtime_contract")._create_backend()
@@ -761,7 +761,7 @@ class TestDescriptorBoundary:
         descriptor = self._runtime_descriptor()
         marker = "plugin-field-name-subclass-secret-marker"
         calls: list[str] = []
-        monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
+        monkeypatch.setattr(connectors._manager, "get_descriptor", lambda _: descriptor)
 
         class _ExplosiveFieldName(str):
             def __hash__(self) -> int:
@@ -783,7 +783,7 @@ class TestDescriptorBoundary:
                 _StubBackend if path == descriptor.backend_cls_path else _PluginSettings
             )
 
-        monkeypatch.setattr(connectors, "_load_object", _load)
+        monkeypatch.setattr(connectors._plugin_contract, "_load_object", _load)
         backend = connectors.ConnectionManager(
             "runtime_contract", {"password": marker}
         )._create_backend()
@@ -794,9 +794,9 @@ class TestDescriptorBoundary:
     def test_bundled_optional_dependency_import_error_is_preserved(self, monkeypatch):
         descriptor = get_descriptor("redis")
         marker = "bundled-optional-dependency-marker"
-        monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
+        monkeypatch.setattr(connectors._manager, "get_descriptor", lambda _: descriptor)
         monkeypatch.setattr(
-            connectors,
+            connectors._plugin_contract,
             "_load_object",
             lambda _: (_ for _ in ()).throw(ImportError(marker)),
         )
@@ -821,9 +821,9 @@ class TestDescriptorBoundary:
         descriptor = get_descriptor("redis")
         marker = f"bundled-{stage}-import-error-marker"
         sleeps: list[float] = []
-        monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
+        monkeypatch.setattr(connectors._manager, "get_descriptor", lambda _: descriptor)
         monkeypatch.setattr(
-            connectors,
+            connectors._manager,
             "_wait_for_retry_backoff",
             lambda _event, delay: sleeps.append(delay),
         )
@@ -847,7 +847,7 @@ class TestDescriptorBoundary:
                 return _ImportErrorSettings
             return _ImportErrorBackend
 
-        monkeypatch.setattr(connectors, "_load_object", _load)
+        monkeypatch.setattr(connectors._plugin_contract, "_load_object", _load)
         manager = connectors.ConnectionManager(
             "redis",
             {"retry_attempts": 3, "retry_delay": 0.01},
@@ -870,7 +870,7 @@ class TestDescriptorBoundary:
     ):
         descriptor = self._runtime_descriptor()
         factory_calls: list[object] = []
-        monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
+        monkeypatch.setattr(connectors._manager, "get_descriptor", lambda _: descriptor)
 
         def _factory(settings: object) -> object:
             factory_calls.append(settings)
@@ -879,7 +879,7 @@ class TestDescriptorBoundary:
         def _load(path: str) -> object:
             return _factory if path == descriptor.backend_cls_path else _StubSettings
 
-        monkeypatch.setattr(connectors, "_load_object", _load)
+        monkeypatch.setattr(connectors._plugin_contract, "_load_object", _load)
 
         with pytest.raises(ConfigurationError, match="acknowledgement contract"):
             connectors.ConnectionManager("runtime_contract")

@@ -148,7 +148,8 @@ def patch_sleep_random(monkeypatch):
         return (lo + hi) / 2  # midpoint — deterministic, strictly in-range
 
     monkeypatch.setattr(
-        "scrapy_extension.backends.connectors._wait_for_retry_backoff", fake_wait
+        "scrapy_extension.backends.connectors._manager._wait_for_retry_backoff",
+        fake_wait,
     )
     # Risk 6: random.uniform moved from connectors to the extracted _retry module.
     monkeypatch.setattr("scrapy_extension.backends._retry.random.uniform", fake_uniform)

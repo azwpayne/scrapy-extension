@@ -121,7 +121,7 @@ def test_resolve_boundary_rebuilds_bundled_import_error_without_loader_frames(
             return {} if default is None else default
 
     monkeypatch.setattr(
-        connectors,
+        connectors._plugin_contract,
         "_load_object",
         lambda _: (_ for _ in ()).throw(ImportError(marker)),
     )
@@ -324,7 +324,9 @@ def test_create_backend_rebuilds_bundled_loader_runtime_failures(
     def _raise_loader_error(_: str) -> object:
         raise RuntimeError(marker)
 
-    monkeypatch.setattr(connectors, "_load_object", _raise_loader_error)
+    monkeypatch.setattr(
+        connectors._plugin_contract, "_load_object", _raise_loader_error
+    )
     manager = ConnectionManager(BackendType.REDIS, {"password": marker})
 
     with pytest.raises(ConfigurationError) as exc_info:
@@ -349,7 +351,7 @@ def test_rebuild_connect_attempt_error_fails_closed_when_message_check_crashes(
         raise RuntimeError("message-check-secret-marker")
 
     monkeypatch.setattr(
-        connectors,
+        connectors._manager,
         "_is_safe_manager_configuration_message",
         _raise_from_message_check,
     )
@@ -591,7 +593,7 @@ class TestConnectionManagerSettingsKey:
     def test_settings_key_json_fallback_with_value_error(self, mocker):
         """Test JSON serialization falls back to str() sorting when json.dumps raises ValueError."""
         # Mock json.dumps to raise ValueError
-        mock_json = mocker.patch("scrapy_extension.backends.connectors.json")
+        mock_json = mocker.patch("scrapy_extension.backends.connectors._manager.json")
         mock_json.dumps.side_effect = ValueError("Object is not JSON serializable")
 
         settings = {"key": "value"}
@@ -604,7 +606,7 @@ class TestConnectionManagerSettingsKey:
     def test_settings_key_json_fallback_with_type_error(self, mocker):
         """Test JSON serialization falls back to str() sorting when json.dumps raises TypeError."""
         # Mock json.dumps to raise TypeError
-        mock_json = mocker.patch("scrapy_extension.backends.connectors.json")
+        mock_json = mocker.patch("scrapy_extension.backends.connectors._manager.json")
         mock_json.dumps.side_effect = TypeError(
             "Object of type is not JSON serializable"
         )
@@ -628,7 +630,7 @@ class TestConnectionManagerRetryLogic:
             side_effect=ConnectionError("Connection failed"),
         )
         mocker.patch(
-            "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+            "scrapy_extension.backends.connectors._manager._wait_for_retry_backoff",
             return_value=False,
         )
 
@@ -650,7 +652,7 @@ class TestConnectionManagerRetryLogic:
             side_effect=RuntimeError(f"driver dump included {marker}"),
         )
         mocker.patch(
-            "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+            "scrapy_extension.backends.connectors._manager._wait_for_retry_backoff",
             return_value=False,
         )
         manager = ConnectionManager(
@@ -691,7 +693,7 @@ class TestConnectionManagerRetryLogic:
         # First call raises, second succeeds
         mock_create_backend.side_effect = [ConnectionError("Failed"), mock_backend]
         mocker.patch(
-            "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+            "scrapy_extension.backends.connectors._manager._wait_for_retry_backoff",
             return_value=False,
         )
 
@@ -709,7 +711,7 @@ class TestConnectionManagerRetryLogic:
             ConnectionManager, "_create_backend", side_effect=KeyboardInterrupt
         )
         mocker.patch(
-            "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+            "scrapy_extension.backends.connectors._manager._wait_for_retry_backoff",
             return_value=False,
         )
 
@@ -724,7 +726,7 @@ class TestConnectionManagerRetryLogic:
             ConnectionManager, "_create_backend", side_effect=SystemExit
         )
         mocker.patch(
-            "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+            "scrapy_extension.backends.connectors._manager._wait_for_retry_backoff",
             return_value=False,
         )
 
@@ -1020,7 +1022,7 @@ class TestConnectionManagerMonitorReentrancy:
         recovered.is_connected.return_value = True
         mocker.patch.object(manager, "_create_backend", side_effect=[failed, recovered])
         mocker.patch(
-            "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+            "scrapy_extension.backends.connectors._manager._wait_for_retry_backoff",
             return_value=False,
         )
         lock_states: list[bool] = []

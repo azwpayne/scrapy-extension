@@ -65,7 +65,7 @@ def test_discovery_callback_recursion_fails_without_registry_lock(
             callback_errors.append(error)
         return original_get_descriptor(backend_type)
 
-    monkeypatch.setattr(connectors, "get_descriptor", callback)
+    monkeypatch.setattr(connectors._manager, "get_descriptor", callback)
 
     manager = ConnectionManager.get_manager(BackendType.REDIS, {"host": "outer"})
 

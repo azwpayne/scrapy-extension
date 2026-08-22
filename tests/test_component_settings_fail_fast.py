@@ -325,7 +325,7 @@ def test_ack_gate_settings_fail_fast_as_configuration_error(
     setting_value: object,
 ) -> None:
     mocker.patch(
-        "scrapy_extension.backends.connectors._load_object",
+        "scrapy_extension.backends.connectors._plugin_contract._load_object",
         return_value=_SingleSlotAckBackend,
     )
     values: dict[str, object] = {

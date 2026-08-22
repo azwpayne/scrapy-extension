@@ -227,7 +227,7 @@ def test_false_string_does_not_bypass_ack_concurrency_gate(
     raw_value: str,
 ) -> None:
     mocker.patch(
-        "scrapy_extension.backends.connectors._load_object",
+        "scrapy_extension.backends.connectors._plugin_contract._load_object",
         return_value=_SingleSlotAckBackend,
     )
     settings = ScrapySettings(
@@ -246,7 +246,7 @@ def test_true_string_bypasses_ack_concurrency_gate(
     mocker: MockerFixture, raw_value: str
 ) -> None:
     mocker.patch(
-        "scrapy_extension.backends.connectors._load_object",
+        "scrapy_extension.backends.connectors._plugin_contract._load_object",
         return_value=_SingleSlotAckBackend,
     )
     settings = ScrapySettings(
@@ -261,7 +261,7 @@ def test_true_string_bypasses_ack_concurrency_gate(
 
 def test_unset_ack_opt_out_defaults_to_false(mocker: MockerFixture) -> None:
     mocker.patch(
-        "scrapy_extension.backends.connectors._load_object",
+        "scrapy_extension.backends.connectors._plugin_contract._load_object",
         return_value=_SingleSlotAckBackend,
     )
     settings = ScrapySettings({"CONCURRENT_REQUESTS": 8})
@@ -312,7 +312,7 @@ def test_ack_bypass_descriptor_control_interruption_still_propagates(
 ) -> None:
     """Only the logger is advisory; descriptor resolution remains direct control."""
     mocker.patch(
-        "scrapy_extension.backends.connectors._load_object",
+        "scrapy_extension.backends.connectors._plugin_contract._load_object",
         side_effect=control_error("descriptor interrupted"),
     )
     warning = mocker.patch("scrapy_extension.schedule.scheduler.logger.warning")

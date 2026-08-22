@@ -79,7 +79,9 @@ def test_get_breaker_enabled_threads_settings_into_circuitbreaker():
 
     with (
         patch("scrapy_extension.settings.Settings", EnabledSettings),
-        patch("scrapy_extension.backends.connectors.CircuitBreaker") as mock_cb,
+        patch(
+            "scrapy_extension.backends.connectors._manager.CircuitBreaker"
+        ) as mock_cb,
     ):
         manager._get_breaker()
 

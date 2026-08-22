@@ -772,7 +772,7 @@ def test_connect_retry_backoff_outside_backend_lock(mocker):
         side_effect=ConnectionError("transient"),
     )
     wait = mocker.patch(
-        "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+        "scrapy_extension.backends.connectors._manager._wait_for_retry_backoff",
         return_value=False,
     )
 
@@ -936,7 +936,7 @@ def test_connect_retry_policy_sanitizes_custom_numeric_coercion(
     manager = ConnectionManager(BackendType.REDIS, {field: value})
     create_backend = mocker.patch.object(manager, "_create_backend")
     sleep = mocker.patch(
-        "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+        "scrapy_extension.backends.connectors._manager._wait_for_retry_backoff",
         return_value=False,
     )
 
@@ -1004,7 +1004,7 @@ def test_connect_does_not_retry_configuration_errors(mocker):
         ),
     )
     sleep = mocker.patch(
-        "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+        "scrapy_extension.backends.connectors._manager._wait_for_retry_backoff",
         return_value=False,
     )
 
@@ -1049,7 +1049,7 @@ def test_connect_sanitizes_plugin_validation_errors_without_retry(mocker):
         side_effect=validation_error,
     )
     sleep = mocker.patch(
-        "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+        "scrapy_extension.backends.connectors._manager._wait_for_retry_backoff",
         return_value=False,
     )
 
@@ -1250,7 +1250,7 @@ def test_retry_diagnostic_interrupt_does_not_block_retry(mocker):
         side_effect=[ConnectionError("first attempt failed"), None],
     )
     mocker.patch(
-        "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+        "scrapy_extension.backends.connectors._manager._wait_for_retry_backoff",
         return_value=False,
     )
     mocker.patch(
@@ -1295,7 +1295,7 @@ def test_direct_connect_dispatches_retry_monitor_outside_terminal_error(mocker):
         side_effect=RuntimeError(marker),
     )
     mocker.patch(
-        "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+        "scrapy_extension.backends.connectors._manager._wait_for_retry_backoff",
         return_value=False,
     )
 
@@ -1343,7 +1343,7 @@ def test_direct_connect_preserves_base_exception_retry_monitor_dispatch(mocker):
         side_effect=[RuntimeError("retryable failure"), interrupt],
     )
     mocker.patch(
-        "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+        "scrapy_extension.backends.connectors._manager._wait_for_retry_backoff",
         return_value=False,
     )
 
@@ -1383,7 +1383,7 @@ def test_direct_connect_base_exception_monitor_callback_keeps_precedence(mocker)
         side_effect=[RuntimeError("retryable failure"), backend_interrupt],
     )
     mocker.patch(
-        "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+        "scrapy_extension.backends.connectors._manager._wait_for_retry_backoff",
         return_value=False,
     )
 
@@ -1681,7 +1681,7 @@ def test_backend_property_concurrent_first_connect_single_connect(mocker):
     mock_backend = mocker.MagicMock()
     mocker.patch.object(ConnectionManager, "_create_backend", return_value=mock_backend)
     mocker.patch(
-        "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+        "scrapy_extension.backends.connectors._manager._wait_for_retry_backoff",
         return_value=False,
     )
 
@@ -1728,7 +1728,7 @@ def test_lazy_owner_failure_publishes_before_retry_monitor_reentry(mocker):
     failed.connect.side_effect = OSError("temporary failure")
     mocker.patch.object(manager, "_create_backend", return_value=failed)
     mocker.patch(
-        "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+        "scrapy_extension.backends.connectors._manager._wait_for_retry_backoff",
         return_value=False,
     )
     monitor_states: list[tuple[bool, bool]] = []
@@ -1802,7 +1802,7 @@ def test_lazy_owner_publishes_sanitized_mutated_config_error_to_peer(mocker):
 
     mocker.patch.object(manager, "_attempt_connection", side_effect=attempt_connection)
     mocker.patch(
-        "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+        "scrapy_extension.backends.connectors._manager._wait_for_retry_backoff",
         return_value=False,
     )
     outcomes: dict[str, BaseException] = {}
@@ -1911,7 +1911,7 @@ def test_lazy_owner_retry_success_publishes_before_monitor_reentry(mocker):
         side_effect=[failed, recovered],
     )
     mocker.patch(
-        "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+        "scrapy_extension.backends.connectors._manager._wait_for_retry_backoff",
         return_value=False,
     )
     monitor_states: list[tuple[str, bool, bool]] = []
@@ -2382,11 +2382,11 @@ def test_retirement_interrupts_retry_backoff_before_second_backend(mocker, teard
         return retirement_event.wait(delay)
 
     mocker.patch(
-        "scrapy_extension.backends.connectors.compute_full_jitter_backoff",
+        "scrapy_extension.backends.connectors._manager.compute_full_jitter_backoff",
         return_value=60,
     )
     mocker.patch(
-        "scrapy_extension.backends.connectors._wait_for_retry_backoff",
+        "scrapy_extension.backends.connectors._manager._wait_for_retry_backoff",
         side_effect=observed_wait,
     )
     outcomes: list[BaseException] = []

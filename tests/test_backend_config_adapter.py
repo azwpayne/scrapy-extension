@@ -163,7 +163,7 @@ def test_plugin_backend_skips_bundled_flat_setting_extraction(
         settings_cls_path="scrapy_extension.settings.RedisSettings",
         capabilities=frozenset({"queue"}),
     )
-    monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
+    monkeypatch.setattr(connectors._config, "get_descriptor", lambda _: descriptor)
     settings = ScrapySettings(
         {
             "SCRAPY_BACKEND_TYPE": "third_party",
@@ -187,7 +187,10 @@ def test_plugin_retry_fields_remain_backend_owned_and_manager_aliases_win(
         settings_cls_path="tests.test_backend_config_adapter._PluginRetrySettings",
         capabilities=frozenset({"queue"}),
     )
-    monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
+    # Dual-path test: patch both consumers of get_descriptor — the resolve
+    # path (_config) and the manager construction path (_manager).
+    monkeypatch.setattr(connectors._manager, "get_descriptor", lambda _: descriptor)
+    monkeypatch.setattr(connectors._config, "get_descriptor", lambda _: descriptor)
     settings = ScrapySettings(
         {
             "SCRAPY_BACKEND_TYPE": "plugin_retry",
@@ -373,7 +376,7 @@ def test_non_pydantic_settings_class_safely_skips_flat_extraction(
         settings_cls_path="builtins.dict",
         capabilities=frozenset({"queue", "set", "storage"}),
     )
-    monkeypatch.setattr(connectors, "get_descriptor", lambda _: descriptor)
+    monkeypatch.setattr(connectors._config, "get_descriptor", lambda _: descriptor)
     settings = ScrapySettings(
         {
             "SCRAPY_BACKEND_TYPE": "redis",

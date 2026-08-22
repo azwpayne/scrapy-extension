@@ -960,7 +960,7 @@ def test_non_value_tokens_are_owned_and_settled_by_identity(
         supports_concurrent_ack=True,
     )
     monkeypatch.setattr(
-        "scrapy_extension.backends.connectors._ack_token_key",
+        "scrapy_extension.backends.connectors._plugin_contract._ack_token_key",
         lambda token: ("identity", 1),
     )
     issued = _IdentityToken()

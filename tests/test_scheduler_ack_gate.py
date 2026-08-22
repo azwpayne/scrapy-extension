@@ -82,11 +82,11 @@ class TestAckCapabilityGate:
             supports_concurrent_ack = False
 
         sanitized_loader = mocker.patch(
-            "scrapy_extension.backends.connectors._load_descriptor_object",
+            "scrapy_extension.backends.connectors._plugin_contract._load_descriptor_object",
             return_value=_SingleSlotStub,
         )
         raw_loader = mocker.patch(
-            "scrapy_extension.backends.connectors._load_object",
+            "scrapy_extension.backends.connectors._plugin_contract._load_object",
             side_effect=AssertionError("scheduler bypassed descriptor sanitizer"),
         )
 
@@ -165,7 +165,7 @@ class TestAckCapabilityGate:
             supports_concurrent_ack = False
 
         mocker.patch(
-            "scrapy_extension.backends.connectors._load_object",
+            "scrapy_extension.backends.connectors._plugin_contract._load_object",
             return_value=_SingleSlotStub,
         )
         settings = _make_settings("sqs", concurrent=16)
@@ -187,7 +187,7 @@ class TestAckCapabilityGate:
             supports_concurrent_ack = False
 
         mocker.patch(
-            "scrapy_extension.backends.connectors._load_object",
+            "scrapy_extension.backends.connectors._plugin_contract._load_object",
             return_value=_SingleSlotStub,
         )
         settings = _make_settings("sqs", concurrent=16, opt_out=True)
@@ -289,7 +289,7 @@ class TestAckCapabilityGate:
             supports_concurrent_ack = False
 
         mocker.patch(
-            "scrapy_extension.backends.connectors._load_object",
+            "scrapy_extension.backends.connectors._plugin_contract._load_object",
             return_value=_SingleSlotStub,
         )
         settings = _make_settings("sqs", concurrent=1)
@@ -465,11 +465,11 @@ class TestStrategyMqAckBypassWarning:
             pass
 
         sanitized_loader = mocker.patch(
-            "scrapy_extension.backends.connectors._load_descriptor_object",
+            "scrapy_extension.backends.connectors._plugin_contract._load_descriptor_object",
             return_value=_DeferredStub,
         )
         raw_loader = mocker.patch(
-            "scrapy_extension.backends.connectors._load_object",
+            "scrapy_extension.backends.connectors._plugin_contract._load_object",
             side_effect=AssertionError("scheduler bypassed descriptor sanitizer"),
         )
 
