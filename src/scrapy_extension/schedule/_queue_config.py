@@ -19,6 +19,10 @@ from scrapy_extension.queue.snapshot import (
     MAX_SNAPSHOT_CHUNK_BYTES,
     MAX_SNAPSHOT_CHUNKS,
 )
+from scrapy_extension.queue.strategies._names import (
+    CURRENT_FANOUT_NAME_GENERATION,
+    LEGACY_FANOUT_NAME_GENERATION,
+)
 from scrapy_extension.utils._config import (
     get_bool_setting,
     parse_float_setting,
@@ -69,6 +73,7 @@ class _QueueComponentConfig:
     queue_snapshot_max_bytes: int | None = None
     queue_snapshot_chunk_bytes: int | None = None
     reactor_io_timeout: float | None = None
+    name_generation: str = CURRENT_FANOUT_NAME_GENERATION
 
     @classmethod
     def from_early_settings(
@@ -271,6 +276,24 @@ class _QueueComponentConfig:
         peer_ids = tuple(
             peer_id.strip() for peer_id in peer_id_values if peer_id.strip()
         )
+        # Fan-out strategies (priority/work_stealing) default to the versioned
+        # v2 physical names. legacy_v1 (old colon-delimited names) is a
+        # migration-only, quiescent drain mode and must be selected explicitly;
+        # there is no dual-read fallback. Keep the rejection message static so it
+        # can be matched without echoing operator input (ring-buffer precedent).
+        name_generation = settings.get(
+            "SCRAPY_QUEUE_NAME_GENERATION",
+            CURRENT_FANOUT_NAME_GENERATION,
+        )
+        if not isinstance(name_generation, str) or name_generation not in {
+            CURRENT_FANOUT_NAME_GENERATION,
+            LEGACY_FANOUT_NAME_GENERATION,
+        }:
+            raise ConfigurationError(
+                "SCRAPY_QUEUE_NAME_GENERATION must be one of 'v2' or 'legacy_v1'.",
+                setting_name="SCRAPY_QUEUE_NAME_GENERATION",
+                setting_value=name_generation,
+            )
         return replace(
             self,
             strategy_type=strategy_type,
@@ -284,6 +307,7 @@ class _QueueComponentConfig:
             capacity=capacity,
             worker_id=worker_id,
             peer_ids=peer_ids,
+            name_generation=name_generation,
         )
 
     def with_runtime_settings(self, settings: Settings) -> _QueueComponentConfig:

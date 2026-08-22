@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING
 
 from scrapy_extension.backends.base import _validate_key_name
 from scrapy_extension.queue.strategies._names import (
+    CURRENT_FANOUT_NAME_GENERATION,
     ensure_fanout_backend_supported,
     physical_strategy_queue_name,
 )
@@ -77,6 +78,7 @@ class WorkStealingQueueStrategy(QueueStrategy):
         worker_id: str | None = None,
         peer_ids: tuple[str, ...] = (),
         steal_timeout: float = DEFAULT_STEAL_TIMEOUT,
+        name_generation: str = CURRENT_FANOUT_NAME_GENERATION,
     ) -> None:
         """Initialize the work-stealing strategy.
 
@@ -91,7 +93,8 @@ class WorkStealingQueueStrategy(QueueStrategy):
 
         Raises:
             ValueError: If worker/peer IDs are invalid, the peer count is too high,
-                or ``steal_timeout`` is not finite and non-negative.
+                ``steal_timeout`` is not finite and non-negative, or
+                ``name_generation`` is not ``v2`` or ``legacy_v1``.
         """
         super().__init__(connection_manager)
         ensure_fanout_backend_supported(connection_manager, strategy="work_stealing")
@@ -107,6 +110,12 @@ class WorkStealingQueueStrategy(QueueStrategy):
             )
         if worker_id is not None:
             _validate_key_name(worker_id, "worker_id")
+        if not isinstance(name_generation, str) or name_generation not in {
+            "v2",
+            "legacy_v1",
+        }:
+            raise ValueError("name_generation must be 'v2' or 'legacy_v1'")
+        self._name_generation = name_generation
         self._worker_id = worker_id if worker_id is not None else uuid.uuid4().hex
         if worker_id is None:
             # #31: a restart without a stable SCRAPY_QUEUE_WORKER_ID generates a NEW
@@ -151,13 +160,21 @@ class WorkStealingQueueStrategy(QueueStrategy):
         return self._worker_queue(queue_name, self._worker_id)
 
     def _worker_queue(self, queue_name: str, worker_id: str) -> str:
-        """Return the stable, backlog-compatible name for one worker's queue."""
+        """Return the physical name for one worker's queue.
+
+        The default is the versioned ``v2`` digest; the old colon layout
+        ``{queue_name}:{worker_id}`` is produced only under the explicit
+        ``legacy_v1`` generation (``SCRAPY_QUEUE_NAME_GENERATION``) — a
+        quiescent drain mode that is never dual-read, not a
+        backlog-compatible default.
+        """
         return physical_strategy_queue_name(
             self._connection_manager,
             queue_name=queue_name,
             namespace="worker",
             discriminator=worker_id,
             legacy_name=f"{queue_name}:{worker_id}",
+            name_generation=self._name_generation,
         )
 
     @staticmethod

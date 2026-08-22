@@ -34,6 +34,7 @@ import math
 from typing import TYPE_CHECKING
 
 from scrapy_extension.queue.strategies._names import (
+    CURRENT_FANOUT_NAME_GENERATION,
     ensure_fanout_backend_supported,
     physical_strategy_queue_name,
 )
@@ -69,6 +70,7 @@ class PriorityQueueStrategy(QueueStrategy):
         connection_manager: ConnectionManager,
         *,
         levels: int = DEFAULT_PRIORITY_LEVELS,
+        name_generation: str = CURRENT_FANOUT_NAME_GENERATION,
     ) -> None:
         """Initialize the priority strategy.
 
@@ -78,7 +80,8 @@ class PriorityQueueStrategy(QueueStrategy):
                 default priority ``0``. Default 3 (positive / zero / negative).
 
         Raises:
-            ValueError: If ``levels`` is not an integer in the supported range.
+            ValueError: If ``levels`` is not an integer in the supported range or
+                ``name_generation`` is not ``v2`` or ``legacy_v1``.
         """
         super().__init__(connection_manager)
         ensure_fanout_backend_supported(connection_manager, strategy="priority")
@@ -90,7 +93,13 @@ class PriorityQueueStrategy(QueueStrategy):
             raise ValueError(
                 f"levels must be an integer in [1, {MAX_PRIORITY_LEVELS}], got {levels!r}"
             )
+        if not isinstance(name_generation, str) or name_generation not in {
+            "v2",
+            "legacy_v1",
+        }:
+            raise ValueError("name_generation must be 'v2' or 'legacy_v1'")
         self._levels = levels
+        self._name_generation = name_generation
 
     def _level_for(self, priority: float) -> int:
         """Map a caller priority to a level index in ``[0, levels-1]``.
@@ -130,13 +139,21 @@ class PriorityQueueStrategy(QueueStrategy):
         return min(self._levels - 1, max(0, level))
 
     def _bucket_queue(self, queue_name: str, level: int) -> str:
-        """Return the stable, backlog-compatible name for one priority level."""
+        """Return the physical name for one priority level.
+
+        The default is the versioned ``v2`` digest; the old colon layout
+        ``{queue_name}:p{level}`` is produced only under the explicit
+        ``legacy_v1`` generation (``SCRAPY_QUEUE_NAME_GENERATION``) — a
+        quiescent drain mode that is never dual-read, not a
+        backlog-compatible default.
+        """
         return physical_strategy_queue_name(
             self._connection_manager,
             queue_name=queue_name,
             namespace="priority",
             discriminator=str(level),
             legacy_name=f"{queue_name}:p{level}",
+            name_generation=self._name_generation,
         )
 
     def is_push_durable(self, *, delay: float, source: str) -> bool:

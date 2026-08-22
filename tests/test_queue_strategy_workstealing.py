@@ -22,6 +22,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from scrapy_extension.exceptions import ConfigurationError
+from scrapy_extension.queue.strategies._names import strategy_queue_name
 from scrapy_extension.queue.strategies.work_stealing import WorkStealingQueueStrategy
 from scrapy_extension.schedule.scheduler import BackendScheduler
 
@@ -135,6 +136,32 @@ def test_push_routes_to_own_queue():
     qb.push.assert_called_once_with(s._own_queue("q"), b"x", 0.5)
 
 
+@pytest.mark.parametrize("name_generation", [None, "v1", 7])
+def test_name_generation_must_be_explicitly_supported(name_generation):
+    cm = MagicMock(name="ConnectionManager")
+    cm.backend_type = "redis"
+
+    with pytest.raises(ValueError, match="name_generation"):
+        WorkStealingQueueStrategy(
+            cm,
+            worker_id="w1",
+            peer_ids=(),
+            name_generation=name_generation,
+        )
+
+
+def test_v2_worker_name_is_distinct_from_literal_passthrough_queue():
+    cm = MagicMock(name="ConnectionManager")
+    cm.backend_type = "redis"
+    cm.get_queue_backend.return_value = MagicMock()
+    strategy = WorkStealingQueueStrategy(cm, worker_id="w1", peer_ids=())
+
+    generated = strategy._own_queue("jobs")
+
+    assert generated.startswith("scrapyext-v2-worker-")
+    assert generated != "jobs:w1"
+
+
 def test_derived_worker_names_are_backend_portable_and_distinct():
     """Logical names and worker IDs cannot inject Kafka-invalid separators."""
     from scrapy_extension.backends.base import _validate_key_name
@@ -191,6 +218,20 @@ def test_zero_timeout_never_accumulates_blocking_peer_probes():
 
     assert s.pop("q", timeout=0.0) is None
     assert [call.args[1] for call in qb.pop.call_args_list] == [0.0, 0.0, 0.0]
+
+
+def test_pop_timeout_rescans_own_and_all_peers_before_returning_empty():
+    """After the own wait, every consumable queue gets one final scan."""
+    s, qb = _strategy(worker_id="w1", peer_ids=("w2", "w3"))
+    qb.pop.side_effect = [None] * 7
+
+    assert s.pop("q", timeout=2.5) is None
+    assert qb.pop.call_count == 7
+    timeouts = [call.args[1] for call in qb.pop.call_args_list]
+    assert timeouts[0] == 0.0
+    assert all(0.0 <= timeout <= s._steal_timeout for timeout in timeouts[1:3])
+    assert 2.3 <= timeouts[3] <= 2.5
+    assert timeouts[4:] == [0.0, 0.0, 0.0]
 
 
 def test_pop_rechecks_peers_after_blocking_own_timeout():
@@ -260,7 +301,9 @@ def test_compatible_backend_keeps_published_worker_queue_name():
     qb = MagicMock(name="QueueBackend")
     qb.pop.return_value = b"legacy"
     cm.get_queue_backend.return_value = qb
-    s = WorkStealingQueueStrategy(cm, worker_id="w1", peer_ids=("w2",))
+    s = WorkStealingQueueStrategy(
+        cm, worker_id="w1", peer_ids=("w2",), name_generation="legacy_v1"
+    )
 
     assert s._own_queue("q") == "q:w1"
     assert s.pop("q") == b"legacy"
@@ -276,7 +319,9 @@ def test_pop_with_ack_from_published_peer_queue_preserves_token():
         (b"legacy-peer", "legacy-token"),
     ]
     cm.get_queue_backend.return_value = qb
-    s = WorkStealingQueueStrategy(cm, worker_id="w1", peer_ids=("w2",))
+    s = WorkStealingQueueStrategy(
+        cm, worker_id="w1", peer_ids=("w2",), name_generation="legacy_v1"
+    )
 
     assert s.pop_with_ack("q") == (b"legacy-peer", "legacy-token")
     assert [call.args[0] for call in qb.pop_with_ack.call_args_list] == [
@@ -325,7 +370,9 @@ def test_pop_with_ack_binds_stolen_token_to_physical_peer_queue():
     manager = MagicMock(name="ConnectionManager")
     manager.backend_type = "redis"
     manager.get_queue_backend.return_value = backend
-    strategy = WorkStealingQueueStrategy(manager, worker_id="w1", peer_ids=("w2",))
+    strategy = WorkStealingQueueStrategy(
+        manager, worker_id="w1", peer_ids=("w2",), name_generation="legacy_v1"
+    )
 
     data, token = strategy.pop_with_ack("q")
 
@@ -379,7 +426,7 @@ def test_colon_bearing_worker_id_on_legacy_backend_uses_portable_name():
     physical = s._own_queue("jobs")
 
     assert physical != "jobs:a:b"
-    assert physical.startswith("scrapyext-worker-")
+    assert physical.startswith("scrapyext-v2-worker-")
 
 
 def test_colon_worker_identity_pair_resolves_to_distinct_physical_names():
@@ -394,15 +441,52 @@ def test_colon_worker_identity_pair_resolves_to_distinct_physical_names():
     assert colon_worker._own_queue("jobs") != colon_queue._own_queue("jobs:a")
 
 
-def test_colon_bearing_queue_name_with_colon_free_worker_keeps_legacy_name():
-    """Minimal behavior change: only the discriminator side hashes away, so a
-    colon-bearing queue name with a colon-free worker keeps its published name."""
+def test_legacy_v1_colon_bearing_worker_id_keeps_hash_name():
+    """V4-1: ``legacy_v1`` must not resurrect the R138-F1 colon alias.
+
+    A colon-bearing worker identity hashed away from the colon layout even
+    before the v2 flip, so the explicit drain knob still resolves it to the
+    digest name — no drainable backlog is lost by keeping the guard."""
+    cm = MagicMock(name="ConnectionManager")
+    cm.backend_type = "redis"
+    cm.get_queue_backend.return_value = MagicMock()
+    s = WorkStealingQueueStrategy(
+        cm, worker_id="a:b", peer_ids=(), name_generation="legacy_v1"
+    )
+
+    physical = s._own_queue("jobs")
+
+    assert physical == strategy_queue_name(
+        "jobs", namespace="worker", discriminator="a:b"
+    )
+    assert physical != "jobs:a:b"
+
+
+def test_legacy_v1_colon_worker_identity_pair_stays_distinct():
+    """The collision pair (queue=jobs, worker="a:b") vs (queue=jobs:a,
+    worker="b") must not share one physical queue under ``legacy_v1``."""
+    cm = MagicMock(name="ConnectionManager")
+    cm.backend_type = "redis"
+    cm.get_queue_backend.return_value = MagicMock()
+    colon_worker = WorkStealingQueueStrategy(
+        cm, worker_id="a:b", peer_ids=(), name_generation="legacy_v1"
+    )
+    colon_queue = WorkStealingQueueStrategy(
+        cm, worker_id="b", peer_ids=(), name_generation="legacy_v1"
+    )
+
+    assert colon_worker._own_queue("jobs") != colon_queue._own_queue("jobs:a")
+
+
+def test_colon_bearing_queue_name_with_colon_free_worker_uses_v2_digest():
+    """A colon-bearing queue name with a colon-free worker uses the v2 digest
+    under the flipped default (the colon layout is legacy_v1-only)."""
     cm = MagicMock(name="ConnectionManager")
     cm.backend_type = "redis"
     cm.get_queue_backend.return_value = MagicMock()
     s = WorkStealingQueueStrategy(cm, worker_id="b", peer_ids=())
 
-    assert s._own_queue("jobs:a") == "jobs:a:b"
+    assert s._own_queue("jobs:a").startswith("scrapyext-v2-worker-")
 
 
 def test_pop_skips_empty_peer_steals_from_next():
@@ -627,7 +711,9 @@ def test_queue_len_and_clear_use_one_published_name_per_worker():
     qb = MagicMock(name="QueueBackend")
     qb.queue_len.side_effect = [3, 7]
     cm.get_queue_backend.return_value = qb
-    s = WorkStealingQueueStrategy(cm, worker_id="w1", peer_ids=("w2",))
+    s = WorkStealingQueueStrategy(
+        cm, worker_id="w1", peer_ids=("w2",), name_generation="legacy_v1"
+    )
 
     assert s.queue_len("q") == 10
     assert [call.args[0] for call in qb.queue_len.call_args_list] == [

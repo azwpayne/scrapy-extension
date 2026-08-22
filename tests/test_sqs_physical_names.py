@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 
+import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
@@ -93,6 +94,18 @@ def test_v2_mapping_is_deterministic(prefix: str, logical_name: str) -> None:
     assert _physical_queue_name(prefix, logical_name, SqsQueueNameGeneration.V2) == (
         _physical_queue_name(prefix, logical_name, SqsQueueNameGeneration.V2)
     )
+
+
+@pytest.mark.parametrize("prefix, logical_name", [(None, "q"), ("p", None), (1, "q")])
+def test_physical_name_rejects_non_string_identity_parts(
+    prefix: object, logical_name: object
+) -> None:
+    with pytest.raises(ValueError, match="inputs must be strings"):
+        _physical_queue_name(
+            prefix,
+            logical_name,
+            SqsQueueNameGeneration.V2,  # type: ignore[arg-type]
+        )
 
 
 def test_settings_select_v2_by_default_and_explicit_legacy_drain_mode() -> None:
