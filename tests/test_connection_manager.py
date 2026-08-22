@@ -2868,7 +2868,11 @@ def test_apply_matching_scrapy_policy_preserves_env_breaker(monkeypatch, target_
                 breaker.call(lambda: (_ for _ in ()).throw(BackendError("failure")))
             opened_at = breaker.last_failure_time
             assert opened_at is not None
-            breaker._time_fn = lambda: opened_at + breaker.reset_timeout
+            # Pad past the cooldown boundary: evaluating ``opened_at +
+            # reset_timeout`` in floats can round the ``now - opened_at``
+            # difference just below ``reset_timeout`` (~4% of Linux monotonic
+            # timestamps), flaking the ``>=`` transition check in CI.
+            breaker._time_fn = lambda: opened_at + breaker.reset_timeout + 1.0
             with breaker._lock:
                 admission = breaker._allow_call()
             assert admission.state is BreakerState.HALF_OPEN
