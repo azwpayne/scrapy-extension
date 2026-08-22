@@ -156,7 +156,7 @@ jobs:
           sdists=(dist/*.tar.gz)
           test "${#wheels[@]}" -eq 1
           test "${#sdists[@]}" -eq 1
-          forbidden='(^|/)(\.coverage($|\.)|\.benchmarks/|\.cache/|\.env[^/]*|\.hypothesis/|\.mypy_cache/|\.packaging-canary|\.pytest_cache/|\.ruff_cache/|\.secrets/|__pycache__/|credentials/|generated-canary|htmlcov/|reports/|secrets/)|\.(db|log|sqlite|sqlite3)(-|$)|\.(pem|key|crt|cer|p12|pfx|jks|keystore)$|(^|/)local[_-]settings\.|(^|/)docs/(archive|audits|insight|superpowers)/'
+          forbidden='(^|/)(\.claude(-flow)?/|\.coverage($|\.)|\.benchmarks/|\.cache/|\.env[^/]*|\.hypothesis/|\.mypy_cache/|\.packaging-canary|\.pytest_cache/|\.ruff_cache/|\.secrets/|__pycache__/|credentials/|generated-canary|htmlcov/|reports/|secrets/)|\.(db|log|sqlite|sqlite3)(-|$)|\.(pem|key|crt|cer|p12|pfx|jks|keystore)$|(^|/)local[_-]settings\.|(^|/)docs/(archive|audits|insight|superpowers)/'
           for artifact in "${wheels[0]}" "${sdists[0]}"; do
             if [[ "$artifact" == *.whl ]]; then
               contents=$(unzip -Z1 "$artifact")
@@ -574,3 +574,9 @@ jobs:
           set -euo pipefail
           # Output the audit summary for artifact retention
           uv audit --locked > audit-report.txt 2>&1 || true
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-report
+          path: audit-report.txt

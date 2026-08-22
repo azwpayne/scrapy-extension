@@ -117,6 +117,30 @@ def test_ci_workflow_runs_for_pull_requests_before_merge() -> None:
     assert "push:" in workflow
 
 
+def test_ci_uploads_audit_report_even_when_the_scan_fails() -> None:
+    """R141: the audit report must outlive the ephemeral runner disk."""
+    repository_root = Path(__file__).resolve().parents[1]
+    workflow = yaml.safe_load(
+        (repository_root / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    upload_steps = [
+        step
+        for step in workflow["jobs"]["security-scan"]["steps"]
+        if step.get("uses", "").startswith("actions/upload-artifact")
+    ]
+    assert len(upload_steps) == 1
+
+    upload_step = upload_steps[0]
+    assert upload_step["if"] == "always()"
+    assert upload_step["with"] == {
+        "name": "audit-report",
+        "path": "audit-report.txt",
+    }
+
+
 def test_integration_ci_and_compose_share_locked_elasticsearch_contract() -> None:
     """R50: CI/Compose image versions derive from the exact locked client."""
     repository_root = Path(__file__).resolve().parents[1]
@@ -367,7 +391,10 @@ def test_connection_setting_merge_separates_colliding_backend_retry_delay() -> N
 
 def test_rabbitmq_host_and_node_validation_covers_boundary_syntax() -> None:
     assert _secret_text(SecretStr("secret")) == "secret"
-    assert normalize_rabbitmq_host(" [::1] ") == "::1"
+    with pytest.raises(ConfigurationError):
+        normalize_rabbitmq_host(" [::1] ")
+    assert normalize_rabbitmq_host("[::1]") == "::1"
+    assert normalize_rabbitmq_host("::1") == "::1"
 
     invalid_hosts: list[Any] = [None, "", "bad/host"]
     for host in invalid_hosts:
@@ -835,17 +862,19 @@ def test_dupefilter_scheduler_probe_translates_unsupported_set_backend() -> None
         )
 
 
-def test_dupefilter_retry_allowance_refreshes_and_evicts_oldest(caplog) -> None:
+def test_dupefilter_retry_allowance_refreshes_without_evicting_recovery(
+    caplog,
+) -> None:
     dupefilter = _new_dupefilter()
     dupefilter._retry_allowance_limit = 1
 
-    dupefilter._grant_retry_allowance(b"first")
-    dupefilter._grant_retry_allowance(b"first")
-    dupefilter._grant_retry_allowance(b"second")
+    assert dupefilter._grant_retry_allowance(b"first")
+    assert dupefilter._grant_retry_allowance(b"first")
+    assert not dupefilter._grant_retry_allowance(b"second")
 
-    assert not dupefilter._consume_retry_allowance(b"first")
-    assert dupefilter._consume_retry_allowance(b"second")
-    assert "Dedup retry allowances reached" in caplog.text
+    assert dupefilter._consume_retry_allowance(b"first")
+    assert not dupefilter._consume_retry_allowance(b"second")
+    assert "retry allowance capacity is exhausted" in caplog.text
 
 
 def test_dupefilter_monitor_fence_and_diagnostics_fail_open(monkeypatch) -> None:
