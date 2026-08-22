@@ -131,6 +131,14 @@ single consumer that cannot isolate a pop to the requested strategy topic.
 intentionally bypasses broker durability. Other bundled backend-delegating
 strategies preserve per-message ack tokens.
 
+Fan-out destinations use versioned `v2` names derived from the complete
+strategy namespace, logical queue, and bucket/worker identity. This prevents a
+priority or work-stealing destination from aliasing a literal `passthrough`
+queue such as `jobs:p0`. Old colon-delimited destinations are not dual-read.
+For a one-time migration, stop writers, drain with an explicit
+`name_generation="legacy_v1"` strategy (or the previous release), stop the
+legacy drainers, and then switch all workers to v2. Never mix generations.
+
 `ring_buffer` with `full_policy=drop_oldest` is intentionally lossy. The
 overwritten request remains suppressed by the lifecycle-local dedup shadow
 until the 65,536-entry shadow evicts it or the queue lifecycle ends. Choose
@@ -159,10 +167,13 @@ SCRAPY_QUEUE_SNAPSHOT_OWNER = "worker-a"
 ```
 
 An owner selects a length-prefixed v2 storage key and prevents workers from
-overwriting one another. Without an owner, the legacy spider+queue key remains
-for single-worker compatibility. A restored checkpoint remains stored until the
-next clean close replaces it with current state or deletes it after a clean
-drain. A crash after restore can therefore replay already-processed entries,
+overwriting one another. Without an owner, the v3 spider+queue key is still
+injective, while only the explicitly documented unscoped raw legacy key is
+considered for migration. A restored checkpoint remains stored until the next
+clean close replaces it with current state or deletes it after a clean drain.
+During a legacy-to-v7 empty migration, a separate tombstone is written
+before the empty manifest and retained until legacy cleanup completes, so a
+stale legacy value is never replayed. A crash after restore can therefore replay already-processed entries,
 but cannot lose the only copy of entries not yet processed. Hard crashes can
 still lose changes since the last clean checkpoint. If a current-format
 manifest or chunk cannot be read, persistence is fenced rather than replacing
@@ -174,20 +185,30 @@ uses the same retryable ownership rule: it retains a failed component, snapshot
 lease, or manager and raises the failure; call `close_backend()` again after the
 provider is healthy. The mixin itself does not add a lossy abort API.
 
-Snapshots use a v6 manifest-last repository. Each generation is written as
-immutable chunks (256 KiB by default) under fixed-length
-`queue:snapshot-chunk:v1:<sha256>` keys that hash the complete logical identity,
-generation, and index. The checksum/length/schema manifest is then stored at the
-logical snapshot key as the commit point. A chunk failure cannot replace the
-logical manifest. A manifest write confirmed not to have taken effect leaves the
-previous manifest authoritative; an effect-then-error response is verified by one
-exact readback when possible, but an unavailable readback remains ambiguous and a
-later successful retry establishes the authority callers should rely on. Its strict `state` discriminator
-separates an authoritative clean checkpoint (`none`) from a present bytes
-payload (`bytes`), including `b""`; only the clean checkpoint skips strategy
-restore. Existing v5/v4 manifests keep their old zero-length-is-clean meaning,
-and raw payloads at v3/v2 keys and the safely attributable pre-v3 raw key remain
-readable. The next successful close rewrites an old format as v6.
+Snapshots use a v7 manifest-last repository. Each generation is written as
+immutable chunks (256 KiB by default) under bounded
+`queue:snapshot-chunk:v2:<logical-sha256>:<generation>:<index>` keys. The
+checksum/length/schema manifest is then stored at the logical snapshot key as
+the commit point. A chunk failure cannot replace the logical manifest. A
+manifest write confirmed not to have taken effect leaves the previous manifest
+authoritative; an effect-then-error response is verified by one exact readback
+when possible, but an unavailable readback remains ambiguous and a later
+successful retry establishes the authority callers should rely on. Its strict
+`state` discriminator separates an authoritative clean checkpoint (`none`) from
+a present bytes payload (`bytes`), including `b""`; only the clean checkpoint
+skips strategy restore. Legacy v6 manifests retain that distinction, v5/v4
+keep their old zero-length-is-clean meaning, and raw payloads at v3/v2 keys and
+the safely attributable pre-v3 raw key remain readable. The next successful
+close rewrites an old format as v7.
+
+Orphan collection is deliberately offline and never automatic. Stop every
+writer that shares the storage namespace, verify the logical manifest, then use
+`SnapshotRepository.gc(..., quiescent=True)` only with a backend/plugin that
+implements bounded `list_storage_keys`. Unsupported backends surface a
+maintenance-unavailable error. The flag is an operator attestation, not a
+distributed lock: the repository's local lease cannot fence another process.
+Collection never falls back to broad clear/key guessing and never touches
+legacy v6/v5/v4 chunk namespaces.
 
 The logical cap is **128 MiB** by default and is enforced symmetrically before
 any write and before restore allocation. Configure
@@ -508,9 +529,9 @@ Common causes (round-9 SV1–SV5 close all of these):
 | "SASL username without password" / "TLS cert without key" | Cross-field auth incoherence (SV3) | `settings/{kafka,pulsar,redis,mongodb,elasticsearch,sqs,dynamodb}.py` |
 | "must start with a valid scheme" / "missing scheme" | Malformed host URL (SV4) | `settings/{mongodb,pulsar,rocketmq,elasticsearch,sqs,dynamodb}.py` |
 | "must be >= 0" / "must be a positive integer" | Unbounded-int / empty-string gap (SV5) | `settings/{memcached,redis,rabbitmq,base}.py` |
-| "Redis setting … contains an invalid address" | Redis URI/userinfo, malformed DNS/IP, unbracketed list IPv6, or invalid port | Use a bare scalar host or `host:port` / `[IPv6]:port` list entry; keep credentials separate |
+| "Redis setting 'host'/'port'/… contains an invalid address" (list entries append " at index N") | Redis URI/userinfo, malformed DNS/IP, unbracketed list IPv6, or invalid port | Use a bare scalar host or `host:port` / `[IPv6]:port` list entry; keep credentials separate |
 | "Redis setting 'masters' is unsupported" | Historical Cluster seed input was supplied | Replace it with `cluster_startup_nodes` and select Cluster mode |
-| "Redis setting … requires mode=…" | A non-default Sentinel/Cluster control belongs to another selected topology | Remove the unused setting or select the matching mode |
+| "Redis setting '…' requires mode='sentinel'/'cluster'" | A non-default Sentinel/Cluster control belongs to another selected topology | Remove the unused setting or select the matching mode |
 | "Redis Cluster supports only database 0" | Cluster was configured with a non-zero DB that older code silently dropped | Set DB0 and isolate with `SCRAPY_REDIS_NAMESPACE` or another Cluster |
 | "Redis replica routing is unsupported" | Deprecated master-slave replica-read input is non-empty/true | Remove the replica fields; use standalone or Sentinel |
 | "Redis TLS certificate settings require ssl_enabled=True" | Certificate intent would otherwise open plaintext | Enable Redis TLS explicitly or remove all TLS material |
@@ -518,7 +539,7 @@ Common causes (round-9 SV1–SV5 close all of these):
 | "credentials over cleartext http://" | ES cloud creds over http (SEC-3) | `settings/elasticsearch.py` |
 | "Authenticated Pulsar connections require … verification" | Token auth attempted with plaintext or a TLS verification escape hatch | `settings/pulsar.py`; fix the broker CA/hostname and keep both validation flags secure |
 | "Remote Memcached uses an unauthenticated plaintext protocol" | A non-loopback Memcached host lacks an explicit trusted-network decision | Prefer a TLS-capable storage backend, or set `SCRAPY_MEMCACHED_ALLOW_REMOTE_PLAINTEXT=True` only behind an isolated private firewall |
-| "MongoDB mutations require an acknowledged write concern" | `SCRAPY_MONGO_W` is zero, negative, boolean, or unsupported text | Use a positive integer or `majority`; prefer `majority` for replicated durability |
+| "MongoDB configuration is invalid." (at settings load the redaction boundary may instead show the generic "Settings contain an invalid configuration value."; either way the setting name points at `w` — check `SCRAPY_MONGO_W`) | `SCRAPY_MONGO_W` is zero, negative, boolean, or unsupported text; the write-concern detail is replaced by the static configuration-error boundary | Use a positive integer or `majority`; prefer `majority` for replicated durability |
 | "MongoDB ... capability domains must use distinct physical collection names" | Two of the queue, set, and storage collection settings resolve to the same MongoDB collection | Stop writers, split or migrate the mixed documents into three collections, then configure distinct names |
 | "endpoint_url must be http:// or https://" | LocalStack/AWS endpoint scheme (SEC-4) | `settings/{sqs,dynamodb}.py` |
 | "aws_access_key_id and aws_secret_access_key must both be set" | Half-configured AWS creds | `settings/{sqs,dynamodb}.py` (config-time), `backends/connectors.py` (connect-time SEC-7) |

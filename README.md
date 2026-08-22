@@ -334,6 +334,24 @@ counts existing backlog, `"latest"` begins at the end, and `"none"` fails
 instead of returning a false zero. Consumer metadata calls are serialized with
 poll and settlement because KafkaConsumer is not thread-safe.
 
+**Logical queues and physical topics.** The queue name is the stable logical
+identity; Kafka receives a resolved physical topic. `SCRAPY_KAFKA_TOPIC_NAME_GENERATION`
+defaults to `auto`: safe historical names continue to use
+`scrapy-<queue>`, while names containing `:`, Unicode, or exceeding Kafka's
+limit use one deterministic `scrapyext-v2-<digest>` topic. `v2` selects the
+hashed mapping for every queue and `legacy` is a migration-only mode that
+rejects identities the old direct mapping could not represent. The resolver is
+used consistently by create, send, pop, depth, and maintenance paths; it never
+dual-reads or silently migrates a backlog. Drain the old topic before switching
+an existing queue to `v2`.
+
+A Kafka operation leases its producer/admin/consumer generation until the SDK
+call returns. `disconnect()` waits for admitted work before closing opaque
+handles, and reconnects fence old delivery tokens. A send timeout or transport
+loss after `send()` is a `QueueOutcomeIndeterminateError`: no success receipt is
+issued, retry is at-least-once and may duplicate, and callers should reconcile
+by their own idempotency key.
+
 ### RabbitMQ (standalone, cluster, mirrored_queues)
 
 ```python
@@ -450,7 +468,11 @@ usually unreachable from the host.
 > stop its waiters, call `disconnect()`, call `connect()`, and make the first pop
 > on the replacement queue; tokens from the retired generation must not be
 > reused. A receive-pump failure is likewise terminal and visible to every waiter
-> until this disconnect/reconnect migration creates a fresh generation.
+> until this disconnect/reconnect migration creates a fresh generation. Producer
+> sends and token settlements lease their exact RocketMQ generation until the SDK
+> call returns; a caller timeout does not release that lease. The bundled client
+> still cannot prove whether a lost send response committed, so reconcile and
+> retry conservatively.
 
 ### Pulsar (standalone, cluster)
 
@@ -473,6 +495,14 @@ Authenticated connections reject blank tokens, URL userinfo,
 `SCRAPY_PULSAR_TLS_VALIDATE_HOSTNAME=False`.
 Clusters use one scheme followed by comma-separated `host[:port]` members;
 ports must be numeric and in range, and IPv6 members must be bracketed.
+
+Pulsar producer sends and per-message token settlements retain the client
+connection generation until the synchronous SDK call returns. Receive pumps
+have a separate stop/close fence so disconnect can interrupt a blocked receive;
+late deliveries from a retired pump are discarded rather than published into a
+replacement generation. The sync client does not provide a durable send receipt
+contract for response-loss reconciliation, so real-broker deployments must use
+idempotent payloads.
 
 ### Amazon SQS (standalone=LocalStack, cloud=AWS)
 
@@ -734,6 +764,7 @@ pop events stop; use the last-pop epoch for freshness.
 | **Input names are validated.** Queue / set / index / topic names match the documented safe subsets; injection-shaped inputs are rejected before use. | `backends.base._validate_key_name` and backend topic validators |
 | **Ack correctness under `CONCURRENT_REQUESTS > 1`.** Deferred-ack backends (Kafka, RabbitMQ, RocketMQ, Pulsar, SQS) carry a per-message ack token so the *specific* popped message is acked. Kafka additionally fences tokens by consumer generation, assignment epoch, and unique delivery attempt, preventing a late completion from committing a same-offset redelivery after nack/rebalance. Retry/redirect replacements transfer the token through their queue commit; user errbacks returning one or many requests use child tokens and settle the source only after every replacement is accepted. The scheduler's `from_settings` gate refuses a backend/plugin that declares single-slot ack unless `SCRAPY_ACK_UNSAFE_CONCURRENT_REQUESTS` is set. | `backends/base.py` (`QueueBackend` ack contract), `backends/kafka.py`, `schedule/scheduler.py` |
 | **Queue-before-marker publication.** On the bundled atomic scheduler/dupefilter path, a persistent dedup marker is published only after a crash-durable queue push. Failed pushes discard local intent without deleting a competing worker's marker. Volatile queue strategies use a bounded lifecycle-local shadow; broker-token replacements are rejected before volatile acceptance. | `schedule/scheduler.py`, `dupefilter/dupefilter.py`, `queue/queue.py` |
+| **DupeFilter lifecycle admission.** `BackendDupeFilter` transitions `NEW → OPENING → OPEN ⇄ CLEARING → CLOSING → CLOSED`; only `NEW`/`OPEN` admit requests. Clear and close stop admission before waiting for admitted filter calls, and old-epoch commit/forget receipts cannot mutate a replacement generation. Filter and monitor callbacks run outside the lifecycle lock. A temporary lifecycle-unavailable decision is a `QueueError`/`RuntimeError` and the scheduler preserves the request through its enqueue fallback. | `dupefilter/dupefilter.py`, `schedule/scheduler.py` |
 | **Lazy optional deps.** The core distribution installs with **zero** backend deps. Each backend's optional dep loads on first access via PEP 562, with `ImportError` install hints. | package and backends `__getattr__` implementations |
 | **Probabilistic dedup never false-negatives.** Bloom and Cuckoo may produce false positives (a fresh URL reported as "seen"); they will never let a seen URL through as fresh. | `dupefilter/filters/bloom_filter.py`, `dupefilter/filters/cuckoo_filter.py` |
 | **Backend capability honesty.** A backend never silently no-ops on an unsupported interface: queue-only backends omit `SetBackend`/`StorageBackend` entirely; RocketMQ set/storage are rejected at config time (`ConfigurationError` guard). The matrix above is the contract. | `backends/base.py` ABCs; `backends/connectors.py` capability gates |
@@ -855,9 +886,20 @@ dedup shadow, while source-token transfers fail closed before local mutation or
 remain unacked after a backend policy rejection.
 
 `priority` and `work_stealing` fan out one logical queue into multiple physical
-queues. They fail fast with Kafka and RocketMQ because those backends cannot
-isolate a pop to one strategy-selected topic. Backend-delegating strategies
-(`passthrough`, `delay`, `throttle`, `priority`, `time_wheel`, and
+queues. Their default `v2` names are versioned, length-delimited digests of the
+complete strategy namespace, logical queue, and bucket/worker identity. This
+keeps generated queues distinct from one another and from a literal
+`passthrough` queue such as `jobs:p0`; Kafka-invalid separators and backend name
+limits are avoided as well. They fail fast with Kafka and RocketMQ because those
+backends cannot isolate a pop to one strategy-selected topic.
+
+There is no automatic dual-read of old colon-delimited fan-out queues. For a
+one-time migration, stop all writers, drain the old backlog with
+`SCRAPY_QUEUE_NAME_GENERATION="legacy_v1"` — the validated settings knob that
+selects the legacy colon layout (default `v2`; invalid values fail fast) —
+stop those drainers, then switch the whole worker group back to the default
+`v2` generation. Never run both generations concurrently. Backend-delegating
+strategies (`passthrough`, `delay`, `throttle`, `priority`, `time_wheel`, and
 `work_stealing`) preserve MQ ack tokens where supported. `round_robin` and
 `ring_buffer` are fully local and intentionally bypass broker durability.
 With `ring_buffer`'s explicitly lossy `drop_oldest` policy, an overwritten
@@ -882,7 +924,10 @@ entries, but cannot lose the only copy of entries not yet processed. If a
 current-format manifest or chunk cannot be read, persistence is fenced rather
 than replacing that checkpoint with a clean-start snapshot; after verifying the
 intended in-memory state, call `BackendQueue.reset_snapshot()` (or use the
-explicit lossy abort) before teardown.
+explicit lossy abort) before teardown. v7 orphan chunks are never reclaimed
+automatically: use the explicit, quiescent `SnapshotRepository.gc()` operation
+only with a backend that advertises bounded key listing; unsupported storage
+surfaces a maintenance-unavailable error.
 
 ### Storage strategy — `SCRAPY_STORAGE_STRATEGY`
 
@@ -1049,10 +1094,12 @@ class MySpider(BackendSpiderMixin, scrapy.Spider):
 
 For spiders created by Scrapy, `BackendSpiderMixin.from_crawler()` performs
 backend setup automatically after the crawler is attached and binds lifecycle
-signals exactly once. Do not add a second `from_crawler()` or call
-`setup_backend()` from `__init__`. Only code that constructs `MySpider()`
-directly, outside Scrapy's factory, must call `setup_backend()` before using the
-low-level backend properties and must later call `close_backend()`.
+signals exactly once. Do not add a second `from_crawler()`; calling
+`setup_backend()` from `__init__` is tolerated—setup is idempotent and
+`from_crawler()` re-finalizes it once the crawler is attached—but it is not
+required. Only code that constructs `MySpider()` directly, outside Scrapy's
+factory, must call `setup_backend()` before using the low-level backend
+properties and must later call `close_backend()`.
 
 The class attributes configure the mixin's direct manager. `get_queue()` and
 `get_scheduler()` reuse the standard scheduler/dupefilter factories with that
@@ -1115,6 +1162,19 @@ Uses a `MembershipFilter` for duplicate detection (default:
 strategy fails fast when the selected set backend lacks that capability; bind a
 separate set backend for distributed dedup or deliberately choose a local
 filter.
+
+Lifecycle admission is explicit: `NEW` and `OPEN` accept `request_seen()`;
+`OPENING`, `CLEARING`, `CLOSING`, and `CLOSED` reject new admission. `clear()`
+and `close()` wait for filter calls already admitted before invoking opaque
+filter/manager callbacks, and receipt epochs fence late `commit_reservation()`,
+`rollback_reservation()`, and `forget()` calls. The scheduler treats a temporary
+lifecycle rejection as a queue error and preserves the request rather than
+silently dropping it. Direct pre-open `request_seen()` remains supported.
+When used from a running reactor, scheduler-owned `open()`/`clear()`/`release()`
+and mixin-owned direct dupefilter close run through authoritative worker
+Deferreds;
+`BackendSpiderMixin.get_queue_async()` is the off-reactor companion for queue
+construction. Synchronous direct callers retain the existing APIs.
 
 ### Pipeline
 

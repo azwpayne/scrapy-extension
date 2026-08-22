@@ -460,6 +460,39 @@ S Sentinel endpoints create S control pools plus one discovered-master data
 pool. No Redis key or wire-data migration is required solely for these mode,
 endpoint, error, or binary-decoding changes.
 
+The generation lease and naming regressions are deterministic unit contracts;
+this repository does not claim that a mocked SDK proves broker-specific
+redelivery, response-loss, or topic-creation behavior. Validate Kafka, Pulsar,
+and RocketMQ reconnect/redelivery and physical-name acceptance against the
+versions and proxy/broker topology used in production before rollout.
+
+## DupeFilter Lifecycle Admission
+
+`BackendDupeFilter` now publishes an explicit lifecycle state:
+
+```text
+NEW → OPENING → OPEN ⇄ CLEARING → CLOSING → CLOSED
+```
+
+Only `NEW` and `OPEN` admit new duplicate checks. `open()`, `clear()`, and
+`close()` never hold the lifecycle lock while calling a membership filter,
+manager, or monitor callback. `clear()` and `close()` first stop admission and
+wait for already-admitted filter calls; a clear/close request cannot overtake a
+blocked `add()`, `remove()`, or `clear()` call. The scheduler preserves a request
+when admission is temporarily unavailable instead of treating that lifecycle
+race as a duplicate or a dropped request.
+
+Transactional reservations and the legacy `request_seen()` compensation path
+carry an epoch fence. A receipt from a retired epoch is a no-op, so a late
+`commit_reservation()` or `forget()` cannot add or remove a marker belonging to
+a replacement generation. Direct pre-open `request_seen()` remains compatible;
+call `consume_reservation()` after handing a successful decision to the queue,
+or call `forget()` after a failed push. A failed `clear()` does not advance the
+epoch and remains retryable. In a running reactor, scheduler-owned dupefilter
+open/release and direct mixin dupefilter close use authoritative worker Deferreds;
+use `BackendSpiderMixin.get_queue_async()` rather than constructing a queue on
+the reactor thread. Non-reactor direct callers retain synchronous compatibility.
+
 ## Queued-Request Wire Format
 
 Current request dictionaries mark bodies with
@@ -532,6 +565,42 @@ bodies, metadata, callback arguments, cookies, tokens, or personal data. Use
 authenticated TLS, least-privilege topic/key/index ACLs, and encryption at rest
 or application-layer encryption before copying a backlog or snapshot.
 
+## Queue Strategy Fan-out Names
+
+`priority` and `work_stealing` now default to versioned `v2` physical names:
+`<scrapyext-v2-strategy-digest>`. The digest is derived from the complete
+strategy namespace, logical queue name, and bucket or worker discriminator, so a
+fan-out destination cannot alias another fan-out strategy or a literal
+`passthrough` queue using a name such as `jobs:p0`. The old colon-delimited
+names are migration-only and are not dual-read.
+
+To migrate an existing priority/work-stealing backlog, stop every producer and
+consumer that can touch it. Set `SCRAPY_QUEUE_NAME_GENERATION="legacy_v1"` in
+the drain crawlers' settings — this validated knob selects the old colon
+layout for fan-out physical names; the default is `v2`, and any other value
+fails fast with a `ConfigurationError` — and run a bounded drain until the old
+physical queues reach the agreed empty state. Stop the drainers, remove the
+setting (or set it back to `"v2"`), and then start the full worker group with
+the default `v2` generation. Do not mix generations: a mixed fleet splits one
+logical backlog across two physical namespaces. A colon-bearing worker ID also
+changes destination under v2 — and `legacy_v1` does not restore the colon
+layout for it — so keep worker IDs stable after the migration.
+
+The drain knob deliberately does not reach every pre-upgrade name; two
+surfaces are excluded and need explicit operator action:
+
+- Strict topic/queue-name backends such as SQS are not in the legacy-colon
+  set (redis, mongodb, elasticsearch, pulsar, rabbitmq), so `legacy_v1` is a
+  no-op on them: the strategy keeps reading and writing the new `v2` names,
+  and the package logs a one-time warning when `legacy_v1` is requested on
+  such a backend.
+- Pre-flip hash names — the `scrapyext-<ns>-<blake2s16>` format, including
+  the `scrapyext-worker-<digest>` names that colon-bearing discriminator
+  identities already hashed to before the flip — are unreachable under both
+  knob values (`v2` publishes `scrapyext-v2-<ns>-<digest>`, and `legacy_v1`
+  still routes colon-bearing discriminators to the v2 digest). Locate and
+  drain those queues manually by the old name format.
+
 ## Strategy Snapshots
 
 Only strategies with in-process state produce snapshots. Redis, MongoDB, and
@@ -558,28 +627,32 @@ v2 identity:
 queue:snapshot:v2:<owner-length>:<owner>:<spider-length>:<spider>:<queue>
 ```
 
-The v3/v2 strings above remain the logical keys. New writes place a v6
-manifest at that key and immutable generation chunks in the fixed-length
-`queue:snapshot-chunk:v1:<sha256>` namespace. Each chunk key hashes the complete
-logical key, generation, and index, so v2/v3 identities cannot alias chunks and
-backend key limits do not depend on identity length. The manifest is written
-last and includes schema version, logical length, chunk geometry, SHA-256, and a
-strict `state` discriminator. `state="none"` is an authoritative clean
-checkpoint, while `state="bytes"` means a bytes payload is present and may have
-zero length. Existing v5 and v4 manifests retain their historical zero-length
+The v3/v2 strings above remain the logical keys. New writes place a v7
+manifest at that key and immutable generation chunks under the bounded
+`queue:snapshot-chunk:v2:<logical-sha256>:<generation>:<index>` namespace. The
+logical-key digest prevents v2/v3 identities from aliasing; explicit generation
+and index fields make offline orphan inspection possible without exposing the
+logical identity. The manifest is written last and includes schema version,
+logical length, chunk geometry, SHA-256, and a strict `state` discriminator.
+`state="none"` is an authoritative clean checkpoint, while `state="bytes"`
+means a bytes payload is present and may have zero length. Legacy v6 manifests
+retain that discriminator; v5 and v4 retain their historical zero-length
 meaning (`None`), and raw payloads already stored at either logical key remain
 readable. No offline rewrite is required: the next successful clean close
-rewrites any recovered old format as v6. Stop old writers before upgrading so a
-v5 writer cannot erase the distinction after a v6 writer has committed empty
+rewrites any recovered old format as v7. Stop old writers before upgrading so a
+v5 writer cannot erase the distinction after a v7 writer has committed empty
 bytes.
 
 The package automatically checks the old `queue:snapshot:<queue>` raw form only
-when there is no named spider and the queue name contains no `:`. A successful
-manifest commit becomes authoritative before that old key and the historical
-empty-marker key are retired. Any failure before manifest publication leaves the
-old manifest/raw value authoritative; any legacy cleanup failure leaves the new
-manifest authoritative and cleanup is retried after a later close. Configure the
-symmetric logical and chunk limits with `SCRAPY_QUEUE_SNAPSHOT_MAX_BYTES`
+when there is no named spider and the queue name contains no `:`. After a legacy
+checkpoint is intentionally drained to empty, the separate tombstone is stored
+before the v7 empty manifest; it remains a fence until the old value and marker
+are retired. A successful manifest commit becomes authoritative before that old
+key and the tombstone are deleted. Any failure before manifest publication leaves
+the old manifest/raw value authoritative while the tombstone prevents stale
+legacy replay; any legacy cleanup failure leaves the new v7 manifest authoritative
+and cleanup is retried after a later close. Configure the symmetric logical and
+chunk limits with `SCRAPY_QUEUE_SNAPSHOT_MAX_BYTES`
 (default 128 MiB) and `SCRAPY_QUEUE_SNAPSHOT_CHUNK_BYTES` (default 256 KiB).
 The configured chunk size cannot exceed the universal backend-safe 256 KiB cap.
 
@@ -606,9 +679,16 @@ a failure for that attempt. If a current-format manifest or chunk read fails,
 persistence is fenced and normal close cannot overwrite the authoritative
 checkpoint. Repair storage and invoke close again; to explicitly replace the
 unreadable checkpoint, call `BackendQueue.reset_snapshot()` first. Use lossy abort
-only when discarding held state is acceptable. Old unreferenced generation chunks can be removed only
-while the owning worker is stopped and after verifying they are not named by the
-logical manifest; never delete the manifest first.
+only when discarding held state is acceptable. Old unreferenced v7 generation chunks are not collected automatically. They
+may be collected only after **all** writers for the storage namespace are
+stopped. `SnapshotRepository.gc(..., quiescent=True)` requires that explicit
+operator attestation and a storage backend/plugin that implements bounded
+`list_storage_keys`; unsupported backends surface a maintenance-unavailable
+error. It never falls back to broad clear or key guessing, never touches legacy
+v6/v5/v4 chunk namespaces, and leaves malformed listing entries alone.
+The in-process lease cannot fence another repository instance or worker, so
+`quiescent=True` is not a lock. Verify the currently referenced generation and
+never delete the logical manifest first.
 
 `BackendSpiderMixin.close_backend()` now follows the same retryable ownership
 contract. Direct callers must handle a surfaced component, snapshot-lease, or
@@ -653,6 +733,14 @@ under the selected bundled backend prefix. Correct common legacy spellings:
 Field type, range, enum, and Pydantic extra-field failures raise
 `pydantic.ValidationError`. Unknown adapter settings, unsupported capabilities,
 and project cross-field constraints raise `ConfigurationError`.
+
+Removed RabbitMQ/MongoDB settings such as `cluster_node_type` and
+`atlas_cluster_name` (R141-F16 dead-config cleanup) highlight one asymmetry of
+that rejection: pydantic-settings silently ignores unknown prefixed environment
+variables such as `SCRAPY_RABBITMQ_CLUSTER_NODE_TYPE` or
+`SCRAPY_MONGO_ATLAS_CLUSTER_NAME` — only the constructor path rejects the
+removed fields. Clean up those environment variables during the upgrade so the
+stale values cannot mislead operators.
 
 Several timeout settings now reject non-finite values and are capped at 86400 s
 (24 h), so a deployment carrying `SCRAPY_REDIS_SOCKET_TIMEOUT=inf`,
@@ -708,6 +796,16 @@ retryable. `pop_with_ack()` no longer also populates the legacy tokenless slot,
 so direct integrations must retain and settle the returned token; code that
 intentionally uses tokenless settlement must continue to call `pop()`.
 
+Kafka physical topic naming is now explicit. The default
+`SCRAPY_KAFKA_TOPIC_NAME_GENERATION=auto` preserves the historical
+`scrapy-<queue>` topic only when that complete name is a valid Kafka topic;
+logical names containing `:`, Unicode, or exceeding the Kafka byte limit resolve
+to a deterministic `scrapyext-v2-<digest>` topic. `v2` opts every queue into the
+hashed mapping and `legacy` is retained only while draining representable old
+topics. There is no automatic dual-read or migration: stop producers, drain the
+old physical topic, then switch the setting and verify the new destination.
+The logical queue identity and scheduler key do not change.
+
 Kafka `clear_queue()` now raises `QueueError`. The previous
 delete-and-immediately-recreate sequence was not a completion barrier: topic
 deletion propagates asynchronously, newly accepted records can race the old
@@ -715,6 +813,12 @@ delete, and a reused consumer group can carry incompatible offsets into the
 replacement topic. Stop all producers and consumers, drain or delete the topic
 with Kafka's operator tooling, verify cluster metadata convergence, and choose
 an intentional consumer-group offset policy before restarting.
+
+Kafka send response loss is now surfaced as `QueueOutcomeIndeterminateError`.
+The producer may have committed the record, so no durability receipt is issued;
+retry is at-least-once and may duplicate. Reconcile with an application-level
+idempotency key before retrying. `request_timeout_ms` controls the Kafka future
+wait instead of a hard-coded ten-second deadline.
 
 Kafka SASL validation is now mechanism-specific. `SASL_*` without a mechanism,
 incomplete or blank PLAIN/SCRAM credentials, GSSAPI combined with ignored

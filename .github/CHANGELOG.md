@@ -105,6 +105,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   These wrappers previously became recoverable queue/storage payload values.
   Explicitly encrypt a value before serialization, or intentionally unwrap it
   only after accepting the persistence risk.
+- **Fan-out queue strategies now default to versioned `v2` physical names.**
+  `priority` and `work_stealing` previously published colon-delimited physical
+  names (`{queue}:p{n}` / `{queue}:{worker}`); their default is now the
+  versioned `scrapyext-v2-…` digest namespace, which cannot alias another
+  fan-out strategy or a literal `passthrough` queue such as `jobs:p0`. There is
+  **no dual-read**: after upgrading, a settings-driven deployment on a
+  legacy-colon backend (redis, mongodb, elasticsearch, pulsar, rabbitmq)
+  immediately reads and writes the new physical queues, and backlog left in the
+  old colon-named queues is never read again. To drain an existing backlog,
+  stop every producer and consumer, set `SCRAPY_QUEUE_NAME_GENERATION="legacy_v1"`
+  (the validated knob that selects the old names; default `v2`), drain the old
+  physical queues to the agreed empty state, stop the drainers, then remove the
+  setting and restart the full worker group on `v2`. The drain knob has two
+  explicitly excluded surfaces: strict topic/queue-name backends such as SQS
+  are not in the legacy-colon set, so `legacy_v1` is a no-op there — the
+  strategy keeps reading and writing the `v2` names and a one-time warning is
+  logged when `legacy_v1` is requested; and pre-flip hash names
+  (`scrapyext-<ns>-<blake2s16>`, including the `scrapyext-worker-<digest>`
+  names used by colon-bearing discriminator identities) are unreachable under
+  both knob values and must be located and drained manually by the old name
+  format. Never mix generations: a
+  mixed fleet splits one logical backlog across two physical namespaces.
+  Colon-bearing worker IDs also change destination under `v2` — and never
+  return to the colon layout under `legacy_v1`, which hashed them away even
+  before the flip; keep worker IDs
+  stable across the migration. See
+  [`docs/migration-guide.md`](../docs/migration-guide.md).
 
 Round-9/14 hardening introduced config-time validators that **refuse to start**
 crawlers carrying unsafe or incoherent config. Each item is security-motivated
@@ -323,20 +350,18 @@ upgrading.
   `AWS_ENDPOINT_URL_DYNAMODB`, and shared-config custom endpoints can no longer
   bypass cloud-mode HTTPS validation; the normal credential provider chain and
   FIPS/dual-stack endpoint selection remain available.
-- **DynamoDB clear now reports a bounded, non-transactional outcome.** The
-  boto3 `BatchWriter` could retry persistent `UnprocessedItems` forever in a
-  hot loop while blocking every storage operation and disconnect. Clear now
-  sends at most 25 deletes per physical request, retries only the validated
-  unprocessed subset with up to seven full-jitter sleeps (eight
-  application-level BatchWriteItem submissions per batch), and raises
-  `StorageError(operation="clear_storage", key=None)` on
-  exhaustion, malformed Scan/BatchWrite responses, repeated pagination
-  cursors, or SDK failure. An error may follow accepted deletes and no rollback
-  is attempted; callers must treat it as a possibly partial clear. Success
-  means all keys observed by that Scan were accepted for deletion, not that an
-  externally written table is empty. Botocore's own retries and network
-  timeouts remain a separate inner budget, so this is not a wire-attempt or
-  wall-clock bound.
+- **DynamoDB clear now reports a non-transactional, possibly partial
+  outcome.** Clear walks its strongly consistent Scan and sends one
+  revision-conditioned `DeleteItem(ALL_OLD)` per observed row, validating the
+  returned old-item identity; each delete RPC is bounded only by botocore's
+  own configured retries and network timeouts. Clear raises
+  `StorageError(operation="clear_storage", key=None)` on a lost revision
+  condition (concurrent write), a malformed Scan or conditional delete
+  response, a repeated pagination cursor, or an SDK failure. An error may
+  follow accepted deletes and no rollback is attempted; callers must treat it
+  as a possibly partial clear and rerun it as a new convergent pass. Success
+  means every row observed by that Scan was conditionally deleted, not that an
+  externally written table is empty.
 - **Pulsar acknowledgement tokens now have one terminal outcome.** A successful
   direct token ack or nack suppresses every later terminal action, including a
   concurrent opposite action. Client failures raise `QueueError` but restore
@@ -472,6 +497,19 @@ upgrading.
 
 ### Added
 
+- Lease-scoped connection-manager acquisition and breaker-policy APIs:
+  `ConnectionManager.acquire_lease()`, `ConnectionManagerLease`,
+  `release_manager_acquire()`, and `ConnectionManager.apply_scrapy_breaker_policy()`
+  are documented public exports of `scrapy_extension.backends.connectors`,
+  tiered **Experimental** in [`STABILITY.md`](STABILITY.md). Each
+  `acquire_lease()` call is released by exactly one idempotent
+  `lease.release()`, and `release_manager_acquire(owner, exact=True)` rolls
+  back one acquire (the default `exact=False` closes the shared manager) with
+  one safe retry while preserving the factory's primary failure.
+  `apply_scrapy_breaker_policy(settings)` applies an explicit Scrapy
+  `SCRAPY_CIRCUIT_BREAKER_*` policy to an already-resolved shared manager
+  without changing pool identity. Experimental means signatures or semantics
+  may evolve in a pre-1.0 minor release with changelog notice.
 - Locked Scrapy 2.17.0 and setuptools 83.0.0. The dependency audit documents
   one exact exception, `PYSEC-2017-83`: the reviewed
   [GHSA-h7wm-ph43-c39p](https://github.com/advisories/GHSA-h7wm-ph43-c39p)
