@@ -96,15 +96,18 @@ def test_connect_raises_when_consumer_constructor_returns_none(mocker) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_push_raises_when_producer_becomes_none_after_connect_check(mocker) -> None:
-    """``is_connected()`` passed, but the producer became ``None`` before
-    ``send()`` (concurrent disconnect). push must raise a clean ``QueueError``
-    rather than ``AttributeError`` on ``None.send()``."""
+def test_push_uses_leased_producer_when_mirror_becomes_none(mocker) -> None:
+    """A connected generation does not consult a mutable producer mirror."""
     backend = _connected_backend(mocker)
-    backend._producer = None  # simulate the race window after is_connected() passed
-    mocker.patch.object(backend, "is_connected", return_value=True)
-    with pytest.raises(QueueError, match="producer is None"):
-        backend.push("q", b"x")
+    generation = backend._generation_gate.current
+    assert generation is not None
+    leased_producer = generation.value.producer
+    backend._producer = None
+    mocker.patch.object(backend, "is_connected", return_value=False)
+
+    backend.push("q", b"x")
+
+    leased_producer.send.assert_called_once()
 
 
 def test_receive_raises_when_consumer_becomes_none_after_connect_check(mocker) -> None:

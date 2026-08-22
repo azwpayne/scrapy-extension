@@ -20,12 +20,18 @@ from __future__ import annotations
 import logging
 from _thread import start_new_thread
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from threading import Condition, Event, Lock, Thread, current_thread
 from time import monotonic
 from typing import Any, cast
 
+from scrapy_extension.backends._generation import (
+    GenerationLeaseGate,
+    GenerationRecord,
+    GenerationUnavailable,
+)
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
 
 try:
@@ -38,7 +44,7 @@ except ImportError as e:
         "Install with: pip install scrapy-extension[pulsar]"
     ) from e
 
-from scrapy_extension.backends._redaction import _redact
+from scrapy_extension.backends._redaction import _diagnostic_repr, _redact
 from scrapy_extension.backends.base import (
     Backend,
     BackendType,
@@ -57,7 +63,10 @@ from scrapy_extension.exceptions._redaction import (
     queue_operation_error_boundary,
 )
 from scrapy_extension.settings import PulsarMode, PulsarSettings
-from scrapy_extension.settings.pulsar import validate_pulsar_connection
+from scrapy_extension.settings.pulsar import (
+    validate_pulsar_connection,
+    validate_pulsar_subscription_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -128,11 +137,18 @@ class _PulsarAckToken:
         "_settlement_lock",
         "_settlement_state",
         "consumer",
+        "generation",
         "message_id",
         "topic",
     )
 
-    def __init__(self, message_id: Any, topic: str, consumer: Any = None) -> None:
+    def __init__(
+        self,
+        message_id: Any,
+        topic: str,
+        consumer: Any = None,
+        generation: int | None = None,
+    ) -> None:
         """Initialize the token.
 
         Args:
@@ -144,6 +160,7 @@ class _PulsarAckToken:
         self.message_id = message_id
         self.topic = topic
         self.consumer = consumer
+        self.generation = generation
         self._settlement_lock = Lock()
         self._settlement_state = "pending"
 
@@ -182,6 +199,7 @@ class _PulsarAckToken:
             self.message_id is other.message_id
             and self.topic == other.topic
             and self.consumer is other.consumer
+            and self.generation == other.generation
         )
 
     def __hash__(self) -> int:
@@ -193,10 +211,18 @@ class _PulsarAckToken:
         # robust across all client versions. Equality mirrors this (identity
         # on message_id) so the token that came out of the set is the one
         # ``discard`` removes.
-        return hash((id(self.message_id), self.topic, id(self.consumer)))
+        return hash(
+            (id(self.message_id), self.topic, id(self.consumer), self.generation)
+        )
 
     def __repr__(self) -> str:
-        return f"_PulsarAckToken(topic={self.topic!r}, message_id={self.message_id!r})"
+        # Topics are caller-controlled and MessageId implementations vary; do
+        # not render either opaque delivery value into diagnostic output.
+        return (
+            f"_PulsarAckToken(topic={_diagnostic_repr(self.topic)}, "
+            "message_id=<redacted>, "
+            f"generation={self.generation!r})"
+        )
 
 
 @dataclass(frozen=True)
@@ -218,6 +244,7 @@ class _PulsarCloseTask:
     completed: bool = False
     error: BaseException | None = None
     worker: Thread | None = None
+    completed_event: Event = field(default_factory=Event)
 
     def run(self) -> None:
         """Close the handle and publish the outcome only while still admitted."""
@@ -230,6 +257,7 @@ class _PulsarCloseTask:
             if self.accepting_outcome:
                 self.error = error
                 self.completed = True
+        self.completed_event.set()
 
     def fence_and_collect(self) -> tuple[bool, BaseException | None]:
         """Stop late result publication and return the admitted outcome."""
@@ -253,6 +281,7 @@ class _PulsarConsumerRetirement:
     accepting_outcome: bool = True
     outcome_completed: bool = False
     control_error: BaseException | None = None
+    generation_record: GenerationRecord[_PulsarGenerationHandles] | None = None
 
     def fence_and_collect(self) -> tuple[bool, BaseException | None]:
         """Stop late result publication and return the admitted close outcome."""
@@ -281,6 +310,7 @@ class _PulsarReceivePump:
     stopped: Event = field(default_factory=Event)
     worker: Thread | None = None
     retirement: _PulsarConsumerRetirement | None = None
+    receive_thread: Thread | None = None
 
     def stop_admission(self) -> None:
         """Fence this pump and wake local waiters before its consumer closes."""
@@ -309,6 +339,19 @@ class _PulsarConnectionSnapshot:
     tls_trust_certs_file: str | None
     allow_insecure_connection: bool
     tls_validate_hostname: bool
+
+
+@dataclass(slots=True, eq=False)
+class _PulsarGenerationHandles:
+    """Client, caches, and legacy delivery state owned by one generation."""
+
+    client: Any
+    producers: dict[str, Any]
+    consumers: dict[str, Any]
+    snapshot: _PulsarConnectionSnapshot | None
+    lifecycle_generation: int = 0
+    legacy_message: Any = None
+    legacy_delivery: tuple[Any, Any] | None = None
 
 
 def _consumer_type(value: str) -> Any:
@@ -419,6 +462,9 @@ class PulsarBackend(Backend, QueueBackend):
         self.config = config
         self._client: Any = None
         self._connection_snapshot: _PulsarConnectionSnapshot | None = None
+        self._generation_gate: GenerationLeaseGate[_PulsarGenerationHandles] = (
+            GenerationLeaseGate()
+        )
         self._producers: dict[str, Any] = {}
         self._consumers: dict[str, Any] = {}
         self._lifecycle_lock = Lock()
@@ -445,6 +491,7 @@ class PulsarBackend(Backend, QueueBackend):
         # Compatibility view for callers/tests that inspect the historical
         # single-consumer state. Message-token routing uses ``_consumers``.
         self._consumer: Any = None
+        self._deferred_receive_client: Any = None
         self._subscribed_topic: str | None = None
         # Legacy single-slot for the ``ack(token=None)`` fallback path. Kept so
         # external callers that pop() then ack() without a token still work.
@@ -479,7 +526,10 @@ class PulsarBackend(Backend, QueueBackend):
         tls_validate_hostname = self.config.tls_validate_hostname
         allow_remote_plaintext = self.config.allow_remote_plaintext
 
-        if mode not in (PulsarMode.STANDALONE, PulsarMode.CLUSTER):
+        if type(mode) is not PulsarMode or mode not in (
+            PulsarMode.STANDALONE,
+            PulsarMode.CLUSTER,
+        ):
             raise ConfigurationError(
                 "Unsupported Pulsar mode.",
                 setting_name="mode",
@@ -498,22 +548,25 @@ class PulsarBackend(Backend, QueueBackend):
             tls_validate_hostname,
             allow_remote_plaintext,
         )
-        if not isinstance(subscription_name, str) or not subscription_name.strip():
-            raise ConfigurationError(
-                "Pulsar subscription_name must be a non-empty string.",
-                setting_name="subscription_name",
-            )
-        if consumer_type not in ("Shared", "Failover", "Exclusive", "Key_Shared"):
+        subscription_name = validate_pulsar_subscription_name(subscription_name)
+        if type(consumer_type) is not str or consumer_type not in (
+            "Shared",
+            "Failover",
+            "Exclusive",
+            "Key_Shared",
+        ):
             raise ConfigurationError(
                 "Pulsar consumer_type is invalid.", setting_name="consumer_type"
             )
-        if initial_position not in ("Earliest", "Latest"):
+        if type(initial_position) is not str or initial_position not in (
+            "Earliest",
+            "Latest",
+        ):
             raise ConfigurationError(
                 "Pulsar initial_position is invalid.", setting_name="initial_position"
             )
         if (
-            isinstance(negative_ack_redelivery_delay_ms, bool)
-            or not isinstance(negative_ack_redelivery_delay_ms, int)
+            type(negative_ack_redelivery_delay_ms) is not int
             or negative_ack_redelivery_delay_ms < 0
         ):
             raise ConfigurationError(
@@ -603,6 +656,7 @@ class PulsarBackend(Backend, QueueBackend):
                 published_generation = self._lifecycle_generation
                 self._client = client
                 self._connection_snapshot = snapshot
+                self._publish_generation_locked()
             # Publication above is the linearization point for this generation.
             # This message is only telemetry: a custom log handler must not turn a
             # completed connection into a failed one, nor abort its live client.
@@ -643,6 +697,54 @@ class PulsarBackend(Backend, QueueBackend):
             # cannot survive through ``__cause__`` or ``__context__``.
             raise startup_error
 
+    def _publish_generation_locked(self, *, allow_empty: bool = False) -> None:
+        """Publish the complete client/cache graph as one lease generation."""
+        if self._client is None and not allow_empty:
+            return
+        if self._generation_gate.current is not None:
+            return
+        self._generation_gate.publish(
+            _PulsarGenerationHandles(
+                client=self._client,
+                producers=self._producers,
+                consumers=self._consumers,
+                snapshot=self._connection_snapshot,
+                lifecycle_generation=self._lifecycle_generation,
+            )
+        )
+
+    @contextmanager
+    def _lease_generation(
+        self, operation: str
+    ) -> Iterator[GenerationRecord[_PulsarGenerationHandles] | None]:
+        """Lease a live Pulsar client for one blocking SDK operation.
+
+        Direct private-handle injection remains supported for older integrations;
+        when no client generation exists the caller continues through its existing
+        disconnected/TOCTOU guard instead of manufacturing a lease.
+        """
+        current = self._generation_gate.current
+        if current is None:
+            with self._lifecycle_lock:
+                if self._generation_gate.current is None and self._client is not None:
+                    self._publish_generation_locked()
+                current = self._generation_gate.current
+        if current is None:
+            yield None
+            return
+        try:
+            with self._generation_gate.lease(operation) as record:
+                yield record
+        except GenerationUnavailable:
+            raise QueueError(
+                "Pulsar backend is disconnected.", operation=operation
+            ) from None
+
+    def _retire_generation(self) -> BaseException | None:
+        """Stop admission and drain admitted SDK work outside lifecycle locks."""
+        retired = self._generation_gate.retire()
+        return self._generation_gate.drain(retired)
+
     def _abort_failed_connect(
         self, client: Any, published_generation: int | None
     ) -> int:
@@ -666,16 +768,21 @@ class PulsarBackend(Backend, QueueBackend):
         handles: list[Any] = []
         pumps: list[_PulsarReceivePump] = []
         abort_retirements: list[_PulsarConsumerRetirement] = []
+        consumers: dict[int, Any] = {}
+        producers: dict[int, Any] = {}
+        retired_generation = None
         if published_generation is None:
             # Construction completed but publication did not.  No public teardown
-            # could have claimed this private candidate, so this connect owns it.
-            handles.append(client)
+            # could have claimed this private candidate; the common cleanup below
+            # owns it.
+            pass
         else:
             with self._lifecycle_lock:
                 if (
                     self._client is client
                     and self._lifecycle_generation == published_generation
                 ):
+                    retired_generation = self._generation_gate.retire()
                     consumers = {
                         id(consumer): consumer for consumer in self._consumers.values()
                     }
@@ -692,7 +799,7 @@ class PulsarBackend(Backend, QueueBackend):
                             retirement = pump.retirement
                             if retirement is None:
                                 retirement = self._start_consumer_retirement_locked(
-                                    pump, pump.consumer
+                                    pump, pump.consumer, retired_generation
                                 )
                             abort_retirements.append(retirement)
                         elif not pump.stopped.is_set():
@@ -701,12 +808,18 @@ class PulsarBackend(Backend, QueueBackend):
                                 retirement = self._new_consumer_retirement_locked(pump)
                             abort_retirements.append(retirement)
                     self._receive_pumps.clear()
-                    self._consumers.clear()
+                    # Replace, rather than clear, generation-local maps. An
+                    # admitted operation retains the retired map until its lease
+                    # drains; new callers see an empty map immediately.
+                    self._consumers = {}
                     self._consumer = None
                     self._subscribed_topic = None
-                    self._producers.clear()
+                    self._producers = {}
                     self._client = None
                     self._connection_snapshot = None
+                    if retired_generation is not None:
+                        retired_generation.value.legacy_message = self._last_msg
+                        retired_generation.value.legacy_delivery = self._last_delivery
                     self._last_msg = None
                     self._last_delivery = None
                     with self._in_flight_lock:
@@ -715,8 +828,18 @@ class PulsarBackend(Backend, QueueBackend):
                     # Invalidate in-flight producer/consumer creations that observed
                     # this client before the post-publication failure was noticed.
                     self._lifecycle_generation += 1
-                    handles = [*consumers.values(), *producers.values(), client]
 
+        # Retire/drain before closing detached handles. The drain is outside the
+        # lifecycle lock so an admitted operation can finish its publication.
+        self._generation_gate.drain(retired_generation)
+        handles = [*consumers.values(), *producers.values(), client]
+        if retired_generation is not None:
+            # Receive consumers are owned by their retirement tombstones. Only
+            # producer candidates created after the detach need to be recovered
+            # from the retired generation map here.
+            for handle in retired_generation.value.producers.values():
+                if all(handle is not existing for existing in handles):
+                    handles.append(handle)
         teardown_deadline = monotonic() + max(0.0, self._receive_shutdown_timeout)
         close_errors, close_timeout_count = self._run_bounded_close_tasks(
             *handles, deadline=teardown_deadline
@@ -725,7 +848,13 @@ class PulsarBackend(Backend, QueueBackend):
         # handled. The normal failure path logs after this helper returns.
         cleanup_failure_count = len(close_errors) + close_timeout_count
         for retirement in abort_retirements:
-            retirement.completed.wait(max(0.0, teardown_deadline - monotonic()))
+            try:
+                retirement.completed.wait(max(0.0, teardown_deadline - monotonic()))
+            except BaseException:
+                # Candidate cleanup is secondary to the connection failure already
+                # being normalized by the caller. Keep draining sibling retirements
+                # without allowing a wait interruption to replace that primary.
+                cleanup_failure_count += 1
             completed, _control_error = retirement.fence_and_collect()
             if not completed:
                 cleanup_failure_count += 1
@@ -743,8 +872,11 @@ class PulsarBackend(Backend, QueueBackend):
         return cleanup_failure_count
 
     def disconnect(self) -> None:
-        """Fence receive pumps, interrupt them, and release all SDK handles."""
+        """Fence receive pumps, drain admitted SDK work, and release handles."""
+        retired = None
+        generation_control_error: BaseException | None = None
         with self._lifecycle_lock:
+            retired = self._generation_gate.retire()
             consumers = {
                 id(consumer): consumer for consumer in self._consumers.values()
             }
@@ -768,10 +900,19 @@ class PulsarBackend(Backend, QueueBackend):
                 if pump.consumer is not None:
                     consumers.pop(id(pump.consumer), None)
                     retirement = pump.retirement
+                    receive_is_reentrant = pump.receive_thread is current_thread()
                     if retirement is None:
-                        retirement = self._start_consumer_retirement_locked(
-                            pump, pump.consumer
-                        )
+                        if receive_is_reentrant:
+                            # The SDK callback synchronously re-entered disconnect.
+                            # Publish ownership now, but let the pump close its
+                            # consumer after receive() returns.
+                            retirement = self._new_consumer_retirement_locked(
+                                pump, pump.consumer, retired
+                            )
+                        else:
+                            retirement = self._start_consumer_retirement_locked(
+                                pump, pump.consumer, retired
+                            )
                     disconnect_retirements.append(retirement)
                 elif not pump.stopped.is_set():
                     retirement = pump.retirement
@@ -779,36 +920,94 @@ class PulsarBackend(Backend, QueueBackend):
                         retirement = self._new_consumer_retirement_locked(pump)
                     disconnect_retirements.append(retirement)
             client = self._client
+            if any(pump.receive_thread is current_thread() for pump in pumps):
+                # A same-thread receive callback re-entered disconnect. The client
+                # is part of that SDK call's handle graph too; defer it alongside
+                # the consumer until the callback returns.
+                self._deferred_receive_client = client
             self._lifecycle_generation += 1
             self._receive_pumps.clear()
-            self._consumers.clear()
+            # Detach maps by replacement so the retired generation's record keeps
+            # its exact opaque handles available to admitted operations.
+            self._consumers = {}
             self._consumer = None
             self._subscribed_topic = None
-            self._producers.clear()
+            self._producers = {}
             self._client = None
             self._connection_snapshot = None
+            if retired is not None:
+                retired.value.legacy_message = self._last_msg
+                retired.value.legacy_delivery = self._last_delivery
             self._last_msg = None
             self._last_delivery = None
             with self._in_flight_lock:
                 self._in_flight.clear()
                 self._in_flight_overflow_warned = False
+        # Do not hold lifecycle_lock while waiting: an admitted producer/cache
+        # operation may need it to publish its generation-local handle. The gate,
+        # not the mutable compatibility mirrors above, is the ownership fence.
         handles = [*consumers.values(), *producers.values()]
         if client is not None:
             handles.append(client)
+        if retired is not None:
+            for handle in retired.value.producers.values():
+                if all(handle is not existing for existing in handles):
+                    handles.append(handle)
         # Detached handle closes, topic retirements, and receive-pump joins spend
         # one teardown budget. Multiple stuck topics cannot multiply the configured
-        # shutdown timeout.
+        # shutdown timeout.  Most importantly, the close is a generation finalizer:
+        # a same-thread disconnect from inside producer.send/acknowledge returns
+        # without closing that handle mid-callback, and the lease releases it after
+        # the SDK call has returned.
         teardown_deadline = monotonic() + max(0.0, self._receive_shutdown_timeout)
         close_error: BaseException | None = None
-        try:
-            # Consumers are first so close() interrupts any blocked sync receive.
-            self._close_detached_handles(*handles, deadline=teardown_deadline)
-        except BaseException as error:
-            close_error = error
+
+        def finalize_handles() -> None:
+            nonlocal close_error
+            try:
+                handles_to_close = (
+                    [
+                        handle
+                        for handle in handles
+                        if handle is not self._deferred_receive_client
+                    ]
+                    if self._deferred_receive_client is not None
+                    else handles
+                )
+                # Consumers are first so close() interrupts any blocked sync receive.
+                self._close_detached_handles(
+                    *handles_to_close, deadline=teardown_deadline
+                )
+            except BaseException as error:
+                close_error = error
+
+        generation_control_error = self._generation_gate.drain(
+            retired, finalize_handles
+        )
 
         retirement_errors: list[BaseException] = []
+        generation_owned_by_caller = bool(
+            retired is not None
+            and retired.active_threads is not None
+            and retired.active_threads.get(current_thread().ident or -1, 0) > 0
+        )
         for retirement in disconnect_retirements:
-            retirement.completed.wait(max(0.0, teardown_deadline - monotonic()))
+            if generation_owned_by_caller or any(
+                pump.retirement is retirement
+                and pump.receive_thread is current_thread()
+                for pump in pumps
+            ):
+                # This disconnect is running inside that worker's SDK receive
+                # callback. Waiting here would deadlock the callback before it can
+                # return and perform the deferred close.
+                continue
+            try:
+                retirement.completed.wait(max(0.0, teardown_deadline - monotonic()))
+            except BaseException as error:
+                # A teardown wait is cleanup, not a license to replace an earlier
+                # primary control signal. Continue fencing every sibling and retain
+                # the first wait error only as a last-resort teardown result.
+                retirement_errors.append(error)
             completed, outcome_error = retirement.fence_and_collect()
             if not completed:
                 self._log_close_shutdown_timeout()
@@ -830,7 +1029,12 @@ class PulsarBackend(Backend, QueueBackend):
             # local references (without ACK/NACK) leaves them for broker redelivery.
             pump.discard_buffered()
         retirement_error = retirement_errors[0] if retirement_errors else None
-        terminal_error = close_error or retirement_error or join_error
+        # ``drain`` runs before every detached close/join. If it observed a
+        # process-control interruption, that earlier primary must win over any
+        # later cleanup signal.
+        terminal_error = (
+            generation_control_error or close_error or retirement_error or join_error
+        )
         if terminal_error is not None:
             # Raise only after every pump buffer and detached handle has completed
             # its bookkeeping. The exception and its graph are caller/SDK-owned:
@@ -885,9 +1089,22 @@ class PulsarBackend(Backend, QueueBackend):
             try:
                 worker.start()
             except BaseException as error:
-                # Fence immediately: this handle has no worker that could publish.
-                task.fence_and_collect()
+                # Thread.start() may raise after launching the target. Retain that
+                # worker when its identity proves it started; otherwise use the
+                # lower-level daemon launcher so a close-time interrupt cannot
+                # silently leak the detached handle.
                 management_errors.append(error)
+                if not self._thread_definitely_unstarted(worker):
+                    started.append(task)
+                    continue
+                try:
+                    start_new_thread(task.run, ())
+                except BaseException as fallback_error:
+                    task.fence_and_collect()
+                    management_errors.append(fallback_error)
+                else:
+                    task.worker = None
+                    started.append(task)
             else:
                 started.append(task)
 
@@ -895,10 +1112,11 @@ class PulsarBackend(Backend, QueueBackend):
             deadline = monotonic() + max(0.0, self._receive_shutdown_timeout)
         for task in started:
             close_worker = task.worker
-            if close_worker is None:
-                continue
             try:
-                close_worker.join(max(0.0, deadline - monotonic()))
+                if close_worker is not None:
+                    close_worker.join(max(0.0, deadline - monotonic()))
+                else:
+                    task.completed_event.wait(max(0.0, deadline - monotonic()))
             except BaseException as error:
                 management_errors.append(error)
 
@@ -972,25 +1190,21 @@ class PulsarBackend(Backend, QueueBackend):
         _validate_key_name(queue_name, "queue_name")
         return f"scrapy-{queue_name}"
 
-    def _producer_for(self, topic: str) -> Any:
-        """Get or create the cached producer for ``topic``.
-
-        Args:
-            topic: The Pulsar topic.
-
-        Returns:
-            A Producer instance.
-
-        Raises:
-            QueueError: If the producer cannot be created.
-        """
+    def _producer_for(
+        self,
+        topic: str,
+        generation: GenerationRecord[_PulsarGenerationHandles] | None = None,
+    ) -> Any:
+        """Get or create a producer in the operation's generation cache."""
         with self._producer_creation_lock:
+            handles = generation.value if generation is not None else None
+            producers = handles.producers if handles is not None else self._producers
             with self._lifecycle_lock:
-                producer = self._producers.get(topic)
+                producer = producers.get(topic)
                 if producer is not None:
                     return producer
-                client = self._client
-                generation = self._lifecycle_generation
+                client = handles.client if handles is not None else self._client
+                lifecycle_generation = self._lifecycle_generation
             if client is None:
                 raise QueueError(
                     f"Cannot create Pulsar producer for {topic}: backend is disconnected",
@@ -1009,24 +1223,33 @@ class PulsarBackend(Backend, QueueBackend):
             try:
                 with self._lifecycle_lock:
                     if (
+                        handles is not None
+                        and generation is not None
+                        and generation.accepting
+                    ):
+                        # The lease captured this map atomically. It remains the
+                        # authoritative destination while the generation is live.
+                        producers[topic] = producer
+                        published = True
+                        return producer
+                    if (
                         self._client is client
-                        and self._lifecycle_generation == generation
+                        and self._lifecycle_generation == lifecycle_generation
                     ):
                         self._producers[topic] = producer
-                        # Mark publication before the context manager exits: an extension
-                        # lock may raise from ``__exit__`` after the live cache has taken
-                        # ownership.  That handle belongs to the active generation and
-                        # must not be closed by this candidate-abort path.
                         published = True
                         return producer
             except BaseException:
                 # The SDK constructor can have allocated native resources before a
-                # control-flow exception interrupts cache publication.  Once a handle
+                # control-flow exception interrupts cache publication. Once a handle
                 # is published the generation owns it; otherwise this creator does.
                 if not published:
                     self._close_aborted_handle(producer)
                 raise
-            self._close_detached_handles(producer)
+            # This candidate is already secondary to the connection-change
+            # outcome. Suppress even a close-time BaseException so cleanup cannot
+            # replace the stable QueueError below.
+            self._close_aborted_handle(producer)
             raise QueueError(
                 f"Failed to create Pulsar producer for {topic}: connection changed",
                 queue_name=topic,
@@ -1055,8 +1278,12 @@ class PulsarBackend(Backend, QueueBackend):
         del priority
         topic = self._topic_name(queue_name)
         try:
-            producer = self._producer_for(topic)
-            producer.send(item)
+            # Hold the exact generation through producer lookup and send. A
+            # disconnect may retire admission, but it cannot close this producer
+            # until the SDK call has returned.
+            with self._lease_generation("push") as generation:
+                producer = self._producer_for(topic, generation)
+                producer.send(item)
         except QueueError:
             raise
         except Exception as e:
@@ -1148,6 +1375,7 @@ class PulsarBackend(Backend, QueueBackend):
                 message_id=record.message_id,
                 topic=topic,
                 consumer=record.consumer,
+                generation=self._lifecycle_generation,
             )
             self._track_in_flight(token)
             return (record, token)
@@ -1311,15 +1539,28 @@ class PulsarBackend(Backend, QueueBackend):
                         0.0 if deadline is None else max(0.0, deadline - monotonic())
                     )
                     close_wait = min(shutdown_budget, caller_remaining)
-                    if close_wait > 0 and not retirement.completed.wait(close_wait):
-                        if shutdown_budget <= caller_remaining:
+                    if close_wait > 0:
+                        try:
+                            retirement_completed = retirement.completed.wait(close_wait)
+                        except BaseException:
+                            # The receive/pump failure is the primary outcome. A
+                            # control signal while waiting for its best-effort
+                            # retirement must not replace it.
+                            retirement_completed = True
+                        if (
+                            not retirement_completed
+                            and shutdown_budget <= caller_remaining
+                        ):
                             self._log_close_shutdown_timeout()
                 # Retirement cleanup must not replace either a static QueueError or a
                 # preserved process-control exception crossing the worker boundary.
                 raise terminal_error
 
     def _new_consumer_retirement_locked(
-        self, pump: _PulsarReceivePump, consumer: Any = None
+        self,
+        pump: _PulsarReceivePump,
+        consumer: Any = None,
+        generation_record: GenerationRecord[_PulsarGenerationHandles] | None = None,
     ) -> _PulsarConsumerRetirement:
         """Publish one topic tombstone before an old consumer can be replaced."""
         retirement = _PulsarConsumerRetirement(
@@ -1327,16 +1568,22 @@ class PulsarBackend(Backend, QueueBackend):
             client=pump.client,
             generation=pump.generation,
             consumer=consumer,
+            generation_record=generation_record,
         )
         pump.retirement = retirement
         self._consumer_retirements[pump.topic] = retirement
         return retirement
 
     def _start_consumer_retirement_locked(
-        self, pump: _PulsarReceivePump, consumer: Any
+        self,
+        pump: _PulsarReceivePump,
+        consumer: Any,
+        generation_record: GenerationRecord[_PulsarGenerationHandles] | None = None,
     ) -> _PulsarConsumerRetirement:
         """Publish and start one consumer retirement under the lifecycle lock."""
-        retirement = self._new_consumer_retirement_locked(pump, consumer)
+        retirement = self._new_consumer_retirement_locked(
+            pump, consumer, generation_record
+        )
         worker = Thread(
             target=self._run_consumer_retirement,
             args=(retirement,),
@@ -1398,6 +1645,11 @@ class PulsarBackend(Backend, QueueBackend):
         ordinary_failure = False
         control_error: BaseException | None = None
         try:
+            if retirement.generation_record is not None:
+                # A receive/subscribe lease may be executing on another thread (or
+                # the disconnect callback may be reentrant on this one). Wait for
+                # that exact SDK operation before closing its consumer.
+                self._generation_gate.drain(retirement.generation_record)
             retirement.consumer.close()
         except Exception:
             # Ordinary SDK failures stay behind a static diagnostic boundary.
@@ -1596,7 +1848,12 @@ class PulsarBackend(Backend, QueueBackend):
                 control_error: BaseException | None = None
                 message: Any = None
                 message_id: Any = None
+                with pump.condition:
+                    pump.receive_thread = current_thread()
                 try:
+                    # The receive pump has its own lifecycle/generation fence;
+                    # disconnect must be able to close the consumer to interrupt a
+                    # blocked SDK receive before joining the worker.
                     message = pump.consumer.receive(
                         timeout_millis=_PULSAR_RECEIVE_TIMEOUT_MS
                     )
@@ -1609,6 +1866,10 @@ class PulsarBackend(Backend, QueueBackend):
                     # Process-control exceptions retain their historical identity,
                     # but cross the worker boundary through the waiting public poll.
                     control_error = error
+                finally:
+                    with pump.condition:
+                        pump.receive_thread = None
+                        pump.condition.notify_all()
 
                 if timed_out:
                     # Avoid a hot loop with test doubles or SDKs that return timeout
@@ -1658,7 +1919,28 @@ class PulsarBackend(Backend, QueueBackend):
                 # Bootstrap exited without producing a handle. No old subscription
                 # can survive, so the disconnect-created tombstone can now retire.
                 self._finish_consumer_retirement(retirement)
+            elif (
+                retirement is not None
+                and retirement.worker is None
+                and retirement.consumer is pump.consumer
+            ):
+                # A same-thread reentrant disconnect deliberately deferred this
+                # close until the SDK receive call returned.
+                retirement.worker = current_thread()
+                self._run_consumer_retirement(retirement)
             pump.stopped.set()
+            deferred_client = None
+            with self._lifecycle_lock:
+                if self._deferred_receive_client is pump.client:
+                    deferred_client = self._deferred_receive_client
+                    self._deferred_receive_client = None
+            if deferred_client is not None:
+                try:
+                    deferred_client.close()
+                except BaseException:
+                    # A deferred close is cleanup after the worker's broker call;
+                    # it cannot replace the already-fenced receive result.
+                    pass
 
     @queue_operation_error_boundary(
         "ack",
@@ -1694,24 +1976,39 @@ class PulsarBackend(Backend, QueueBackend):
             return
         if token is not None:
             return
-        # Legacy path: ack the tracked last-popped message.
-        if self._last_msg is None:
-            return
-        if self._last_delivery is not None:
-            consumer, message = self._last_delivery
-        else:
-            consumer, message = self._consumer, self._last_msg
-        if consumer is None:
-            return
-        try:
-            consumer.acknowledge(message)
-        except Exception as e:
-            raise QueueError(
-                f"Failed to ack Pulsar message: {e}", operation="ack"
-            ) from e
-        else:
-            self._last_msg = None
-            self._last_delivery = None
+        # Legacy settlement is also a blocking SDK operation. Hold the same
+        # generation lease as token settlement so disconnect cannot close the
+        # consumer underneath acknowledge().
+        with self._lease_generation("ack") as generation:
+            if generation is not None and not generation.accepting:
+                handles = generation.value
+                message_value = handles.legacy_message
+                delivery = handles.legacy_delivery
+            else:
+                handles = None
+                message_value = self._last_msg
+                delivery = self._last_delivery
+            if message_value is None:
+                return
+            if delivery is not None:
+                consumer, message = delivery
+            else:
+                consumer, message = (
+                    (self._consumer, message_value)
+                    if handles is None
+                    else (next(iter(handles.consumers.values()), None), message_value)
+                )
+            if consumer is None:
+                return
+            try:
+                consumer.acknowledge(message)
+            except Exception as e:
+                raise QueueError(
+                    f"Failed to ack Pulsar message: {e}", operation="ack"
+                ) from e
+            else:
+                self._last_msg = None
+                self._last_delivery = None
 
     def _ack_token(self, token: _PulsarAckToken) -> None:
         """Ack the specific message identified by ``token``.
@@ -1721,22 +2018,28 @@ class PulsarBackend(Backend, QueueBackend):
         terminal broker action, while a client exception restores the token to
         its retryable pending state.
         """
-        consumer = self._consumer_for_token(token)
-        if consumer is None:
-            token._settle("stale", lambda: None)
+        with self._lease_generation("ack") as generation:
+            handles = generation.value if generation is not None else None
+            consumer = self._consumer_for_token(
+                token,
+                handles.consumers if handles is not None else None,
+                handles.lifecycle_generation if handles is not None else None,
+            )
+            if consumer is None:
+                token._settle("stale", lambda: None)
+                self._discard_in_flight(token)
+                return
+
+            def acknowledge() -> None:
+                try:
+                    consumer.acknowledge(token.message_id)
+                except Exception as e:
+                    raise QueueError(
+                        f"Failed to ack Pulsar message: {e}", operation="ack"
+                    ) from e
+
+            token._settle("acked", acknowledge)
             self._discard_in_flight(token)
-            return
-
-        def acknowledge() -> None:
-            try:
-                consumer.acknowledge(token.message_id)
-            except Exception as e:
-                raise QueueError(
-                    f"Failed to ack Pulsar message: {e}", operation="ack"
-                ) from e
-
-        token._settle("acked", acknowledge)
-        self._discard_in_flight(token)
 
     @queue_operation_error_boundary(
         "nack",
@@ -1769,61 +2072,95 @@ class PulsarBackend(Backend, QueueBackend):
             return
         if token is not None:
             return
-        # Legacy path: nack the tracked last-popped message.
-        if self._last_msg is None:
-            return
-        if self._last_delivery is not None:
-            consumer, message = self._last_delivery
-        else:
-            consumer, message = self._consumer, self._last_msg
-        if consumer is None:
-            return
-        try:
-            nack = getattr(consumer, "negative_acknowledge", None)
-            if callable(nack):
-                nack(message)
-            # else: leave unacked -> redelivered on consumer restart/disconnect
-        except Exception as e:
-            raise QueueError(
-                f"Failed to nack Pulsar message: {e}", operation="nack"
-            ) from e
-        else:
-            self._last_msg = None
-            self._last_delivery = None
-
-    def _nack_token(self, token: _PulsarAckToken) -> None:
-        """Nack one token exactly once, retaining it after client failure."""
-        consumer = self._consumer_for_token(token)
-        if consumer is None:
-            token._settle("stale", lambda: None)
-            self._discard_in_flight(token)
-            return
-
-        def negative_acknowledge() -> None:
+        # Legacy settlement is also a blocking SDK operation. Hold the same
+        # generation lease as token settlement so disconnect cannot close the
+        # consumer underneath negative_acknowledge().
+        with self._lease_generation("nack") as generation:
+            if generation is not None and not generation.accepting:
+                handles = generation.value
+                message_value = handles.legacy_message
+                delivery = handles.legacy_delivery
+            else:
+                handles = None
+                message_value = self._last_msg
+                delivery = self._last_delivery
+            if message_value is None:
+                return
+            if delivery is not None:
+                consumer, message = delivery
+            else:
+                consumer, message = (
+                    (self._consumer, message_value)
+                    if handles is None
+                    else (next(iter(handles.consumers.values()), None), message_value)
+                )
+            if consumer is None:
+                return
             try:
                 nack = getattr(consumer, "negative_acknowledge", None)
                 if callable(nack):
-                    nack(token.message_id)
-                # Older clients without the method leave the message unacked,
-                # redelivered only on consumer restart/disconnect (no unacked
-                # message timeout is configured); accepting nack is still
-                # terminal locally.
+                    nack(message)
+                # else: leave unacked -> redelivered on consumer restart/disconnect
             except Exception as e:
                 raise QueueError(
                     f"Failed to nack Pulsar message: {e}", operation="nack"
                 ) from e
+            else:
+                self._last_msg = None
+                self._last_delivery = None
 
-        token._settle("nacked", negative_acknowledge)
-        self._discard_in_flight(token)
+    def _nack_token(self, token: _PulsarAckToken) -> None:
+        """Nack one token exactly once, retaining it after client failure."""
+        with self._lease_generation("nack") as generation:
+            handles = generation.value if generation is not None else None
+            consumer = self._consumer_for_token(
+                token,
+                handles.consumers if handles is not None else None,
+                handles.lifecycle_generation if handles is not None else None,
+            )
+            if consumer is None:
+                token._settle("stale", lambda: None)
+                self._discard_in_flight(token)
+                return
+
+            def negative_acknowledge() -> None:
+                try:
+                    nack = getattr(consumer, "negative_acknowledge", None)
+                    if callable(nack):
+                        nack(token.message_id)
+                    # Older clients without the method leave the message unacked,
+                    # redelivered only on consumer restart/disconnect (no unacked
+                    # message timeout is configured); accepting nack is still
+                    # terminal locally.
+                except Exception as e:
+                    raise QueueError(
+                        f"Failed to nack Pulsar message: {e}", operation="nack"
+                    ) from e
+
+            token._settle("nacked", negative_acknowledge)
+            self._discard_in_flight(token)
 
     def _discard_in_flight(self, token: _PulsarAckToken) -> None:
         """Remove a terminal token from the bounded diagnostic set."""
         with self._in_flight_lock:
             self._in_flight.discard(token)
 
-    def _consumer_for_token(self, token: _PulsarAckToken) -> Any:
-        """Return the active consumer that originally issued ``token``."""
-        consumer = self._consumers.get(token.topic)
+    def _consumer_for_token(
+        self,
+        token: _PulsarAckToken,
+        consumers: dict[str, Any] | None = None,
+        generation: int | None = None,
+    ) -> Any:
+        """Return the consumer that issued ``token`` in the selected generation."""
+        if token.generation is not None:
+            if generation is None or token.generation != generation:
+                return None
+        elif generation is not None and token.consumer is None:
+            # Compatibility tokens without an owner may be used by direct legacy
+            # injections, but cannot settle a replacement live generation.
+            return None
+        consumer_map = self._consumers if consumers is None else consumers
+        consumer = consumer_map.get(token.topic)
         if token.consumer is not None:
             return consumer if consumer is token.consumer else None
         if consumer is not None:
@@ -1937,7 +2274,10 @@ class PulsarBackend(Backend, QueueBackend):
                 if not published:
                     self._close_aborted_handle(consumer)
                 raise
-            self._close_detached_handles(consumer)
+            # The stale candidate is not the public operation's primary result;
+            # suppress all cleanup failures, including BaseException, before
+            # publishing the stable connection-change QueueError.
+            self._close_aborted_handle(consumer)
             raise QueueError(
                 f"Failed to subscribe to Pulsar topic {topic}: connection changed",
                 queue_name=topic,

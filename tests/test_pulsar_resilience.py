@@ -21,10 +21,12 @@ lines + 6 partial branches). 8 tests pin the documented contracts:
 from __future__ import annotations
 
 import logging
+import threading
 from unittest.mock import MagicMock
 
 import pytest
 
+import scrapy_extension.backends.pulsar as pulsar_backend_module
 from scrapy_extension.backends.pulsar import (
     _MAX_IN_FLIGHT,
     PulsarBackend,
@@ -64,6 +66,28 @@ def test_suppress_pulsar_errors_does_not_suppress_base_exception() -> None:
 # ---------------------------------------------------------------------------
 # disconnect() client-None branch (line 280->284)
 # ---------------------------------------------------------------------------
+
+
+def test_bounded_close_fallback_closes_candidate_once_after_thread_start_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _backend()
+    client = MagicMock()
+    real_start = threading.Thread.start
+    start_error = RuntimeError("close thread start failed")
+
+    def fail_close_thread_start(worker: threading.Thread) -> None:
+        if worker.name == "pulsar-sdk-close-cleanup":
+            raise start_error
+        real_start(worker)
+
+    monkeypatch.setattr(pulsar_backend_module.Thread, "start", fail_close_thread_start)
+
+    errors, timeout_count = backend._run_bounded_close_tasks(client)
+
+    assert errors == [start_error]
+    assert timeout_count == 0
+    client.close.assert_called_once_with()
 
 
 def test_disconnect_is_noop_when_client_already_none() -> None:
@@ -129,6 +153,32 @@ def test_ack_token_raises_when_acknowledge_fails(mocker) -> None:
     assert exc.value.operation == "ack"
 
 
+def test_ack_failure_restores_token_for_exactly_one_retry(mocker) -> None:
+    backend = _backend()
+    client = mocker.MagicMock()
+    consumer = mocker.MagicMock()
+    consumer.acknowledge.side_effect = [RuntimeError("first ack lost"), None]
+    backend._client = client
+    backend._lifecycle_generation = 1
+    backend._consumers["scrapy-t"] = consumer
+    token = _PulsarAckToken("message-id", "scrapy-t", consumer, generation=1)
+    backend._in_flight.add(token)
+
+    with pytest.raises(QueueError, match="Failed to ack Pulsar message"):
+        backend.ack("t", token=token)
+    assert token in backend._in_flight
+
+    backend.ack("t", token=token)
+    backend.ack("t", token=token)
+
+    consumer.acknowledge.assert_has_calls(
+        [mocker.call("message-id"), mocker.call("message-id")]
+    )
+    assert consumer.acknowledge.call_count == 2
+    assert token not in backend._in_flight
+    backend.disconnect()
+
+
 # ---------------------------------------------------------------------------
 # nack legacy: consumer lacks negative_acknowledge (570->576 false branch)
 # ---------------------------------------------------------------------------
@@ -165,6 +215,23 @@ def test_nack_token_raises_when_negative_acknowledge_fails() -> None:
 
     assert exc_info.value.operation == "nack"
     assert token in backend._in_flight
+
+
+def test_nack_failure_restores_token_for_one_retry() -> None:
+    backend = _backend()
+    backend._consumer = MagicMock()
+    backend._consumer.negative_acknowledge.side_effect = [RuntimeError("lost"), None]
+    token = _PulsarAckToken(message_id="id", topic="t")
+    backend._in_flight.add(token)
+
+    with pytest.raises(QueueError):
+        backend.nack("q", token=token)
+    assert token in backend._in_flight
+    backend.nack("q", token=token)
+    backend.nack("q", token=token)
+
+    assert backend._consumer.negative_acknowledge.call_count == 2
+    assert token not in backend._in_flight
 
 
 # ---------------------------------------------------------------------------

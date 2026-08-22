@@ -13,7 +13,11 @@ import pulsar
 import pytest
 
 import scrapy_extension.backends.pulsar as pulsar_backend_module
-from scrapy_extension.backends.pulsar import PulsarBackend, _PulsarAckToken
+from scrapy_extension.backends.pulsar import (
+    PulsarBackend,
+    _PulsarAckToken,
+    _PulsarReceivePump,
+)
 from scrapy_extension.exceptions import QueueError
 from scrapy_extension.schedule.scheduler import BackendScheduler
 from scrapy_extension.settings import PulsarSettings
@@ -131,6 +135,31 @@ def _wait_until(predicate: Any, timeout: float = 1.0) -> bool:
             return True
         Event().wait(0.005)
     return bool(predicate())
+
+
+def test_stale_candidate_finalizer_owns_exactly_one_close() -> None:
+    backend = PulsarBackend(PulsarSettings(consumer_type="Exclusive"))
+    client = MagicMock(name="stale-client")
+    candidate = MagicMock(name="stale-candidate")
+    pump = _PulsarReceivePump(
+        topic="scrapy-stale",
+        client=client,
+        snapshot=None,
+        generation=1,
+        capacity=1,
+    )
+    backend._client = client
+    backend._lifecycle_generation = 1
+    backend._receive_pumps[pump.topic] = pump
+
+    backend._close_stale_pump_candidate(pump, candidate)
+
+    retirement = pump.retirement
+    assert retirement is not None
+    assert retirement.completed.wait(timeout=1.0)
+    assert _wait_until(lambda: backend._consumer_retirements == {})
+    assert candidate.close.call_count == 1
+    assert backend._receive_pumps[pump.topic] is pump
 
 
 def test_first_poll_never_waits_outside_budget_for_blocked_subscribe(

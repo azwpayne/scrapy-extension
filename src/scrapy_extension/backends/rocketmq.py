@@ -27,12 +27,21 @@ the broker must run with ``--enable-proxy`` (see tests/integration/docker-compos
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
+from _thread import start_new_thread
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any
 
+from scrapy_extension.backends._generation import (
+    GenerationLeaseGate,
+    GenerationRecord,
+    GenerationUnavailable,
+)
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
 from scrapy_extension.backends._redaction import _redact
 from scrapy_extension.backends.base import (
@@ -70,10 +79,12 @@ _ROCKETMQ_CONFIGURATION_SETTING_NAMES: frozenset[str] = frozenset(
 _ROCKETMQ_SEND_TIMEOUT_ERROR = (
     "RocketMQ send_timeout must be an integer between 0 and 300000 milliseconds."
 )
+_ROCKETMQ_TOPIC_PREFIX_ERROR = "RocketMQ topic_prefix is invalid."
 _ROCKETMQ_SAFE_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
     {
         ROCKETMQ_NAMESRV_ENDPOINTS_ERROR,
         _ROCKETMQ_SEND_TIMEOUT_ERROR,
+        _ROCKETMQ_TOPIC_PREFIX_ERROR,
         "Unsupported RocketMQ mode.",
         "Cloud mode requires access_key and secret_key.",
     }
@@ -96,6 +107,10 @@ _ROCKETMQ_TOPIC_ALREADY_SELECTED_ERROR = (
     "RocketMQ consumer generation already selected a different queue."
 )
 _ROCKETMQ_RECEIVE_PUMP_ERROR = "RocketMQ receive pump failed."
+_ROCKETMQ_CONNECTION_CHANGED_PUSH_ERROR = "RocketMQ connection changed during push."
+_ROCKETMQ_CONNECTION_CHANGED_OPERATION_ERROR = (
+    "RocketMQ connection changed during operation."
+)
 _ROCKETMQ_DISCONNECT_ERROR = "Failed to disconnect from RocketMQ."
 _ROCKETMQ_SAFE_QUEUE_MESSAGES: frozenset[str] = frozenset(
     {
@@ -105,6 +120,8 @@ _ROCKETMQ_SAFE_QUEUE_MESSAGES: frozenset[str] = frozenset(
         _ROCKETMQ_MAX_MESSAGE_SIZE_ERROR,
         _ROCKETMQ_CLEAR_QUEUE_UNSUPPORTED_MESSAGE,
         _ROCKETMQ_TOPIC_ALREADY_SELECTED_ERROR,
+        _ROCKETMQ_CONNECTION_CHANGED_PUSH_ERROR,
+        _ROCKETMQ_CONNECTION_CHANGED_OPERATION_ERROR,
     }
 )
 _ROCKETMQ_QUEUE_LEN_UNSUPPORTED_MESSAGE = (
@@ -131,6 +148,12 @@ _MIN_INVISIBLE_DURATION = 10
 # its polling floor. Match that server contract so short/non-blocking interface
 # requests remain consumable instead of failing deterministically.
 _MIN_LONG_POLL_DURATION = 5
+_ROCKETMQ_TOPIC_PREFIX_PATTERN = re.compile(r"^[a-zA-Z0-9._-]+\Z")
+
+
+class _RocketMQConnectionAttemptFenced(RuntimeError):
+    """Internal signal that teardown won a private connection attempt."""
+
 
 # R22-A: ceiling (seconds) for the gRPC per-RPC ``request_timeout`` derived from
 # ``send_timeout``. Matches the Field ``le=300_000`` (ms) in ``RocketMQSettings``
@@ -158,6 +181,21 @@ def _validate_queue_name_argument(
     _validate_key_name(queue_name, "queue_name")
 
 
+def _validate_topic_prefix(topic_prefix: object) -> str:
+    """Validate the physical prefix at the connection snapshot boundary."""
+    if (
+        type(topic_prefix) is not str
+        or not topic_prefix
+        or len(topic_prefix.encode("utf-8")) > 127
+        or _ROCKETMQ_TOPIC_PREFIX_PATTERN.fullmatch(topic_prefix) is None
+    ):
+        raise ConfigurationError(
+            _ROCKETMQ_TOPIC_PREFIX_ERROR,
+            setting_name="topic_prefix",
+        )
+    return topic_prefix
+
+
 def _validate_send_timeout(send_timeout: object) -> int:
     """Revalidate mutable settings before deriving an SDK timeout."""
     if type(send_timeout) is not int or send_timeout < 0 or send_timeout > 300_000:
@@ -171,13 +209,20 @@ def _validate_send_timeout(send_timeout: object) -> int:
 class _RocketMQCleanupResult:
     """Fence one daemon shutdown task's result after its join budget expires."""
 
-    __slots__ = ("_accepting", "_completed", "_error", "_lock")
+    __slots__ = (
+        "_accepting",
+        "_completed",
+        "_completed_event",
+        "_error",
+        "_lock",
+    )
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._accepting = True
         self._completed = False
         self._error: BaseException | None = None
+        self._completed_event = threading.Event()
 
     def publish(self, error: BaseException | None) -> None:
         """Publish completion only while the disconnect generation accepts it."""
@@ -185,12 +230,34 @@ class _RocketMQCleanupResult:
             if self._accepting:
                 self._completed = True
                 self._error = error
+        self._completed_event.set()
 
     def fence(self) -> tuple[bool, BaseException | None]:
         """Reject late publication and return the result visible at the fence."""
         with self._lock:
             self._accepting = False
             return self._completed, self._error
+
+
+@dataclass(frozen=True, slots=True)
+class _RocketMQOperationSnapshot:
+    """Immutable operation settings fixed for one client generation."""
+
+    topic_prefix: str
+    max_message_size: int
+    invisible_duration: int
+
+
+@dataclass(slots=True, eq=False)
+class _RocketMQGenerationHandles:
+    """Clients and legacy delivery state retained for admitted operations."""
+
+    producer: Any
+    consumer: Any
+    snapshot: _RocketMQOperationSnapshot
+    consumer_generation: int
+    legacy_message: Any = None
+    legacy_delivery: tuple[Any, int, Any] | None = None
 
 
 class _RocketMQAckToken:
@@ -262,10 +329,19 @@ class RocketMQBackend(Backend, QueueBackend):
         self.config = config
         self._producer: Any = None
         self._consumer: Any = None
+        self._connection_snapshot: _RocketMQOperationSnapshot | None = None
         # Producer and consumer form one client generation.  ``connect`` must not
         # publish a second generation while the first is starting, and
         # ``disconnect`` must not detach a half-started pair underneath it.
         self._connection_lock = threading.RLock()
+        # A disconnect fences SDK constructors before waiting for this lock. The
+        # connect single-flight remains serialized, preserving idempotent setup.
+        self._lifecycle_lock = threading.RLock()
+        self._lifecycle_epoch = 0
+        self._connect_attempt_epoch: int | None = None
+        self._generation_gate: GenerationLeaseGate[_RocketMQGenerationHandles] = (
+            GenerationLeaseGate()
+        )
         self._consumer_generation = 0
         self._subscribed_topics: set[str] = set()
         # RocketMQ Proxy mandates a blocking long poll. Keep that RPC off scheduler
@@ -275,7 +351,10 @@ class RocketMQBackend(Backend, QueueBackend):
         self._receive_worker: threading.Thread | None = None
         self._receive_stop: threading.Event | None = None
         self._receive_consumer: Any = None
+        self._receive_call_thread: threading.Thread | None = None
+        self._deferred_receive_consumer: Any = None
         self._receive_generation = 0
+        self._receive_snapshot: _RocketMQOperationSnapshot | None = None
         self._selected_topic: str | None = None
         # Pump failures are terminal for this consumer generation. Retaining only
         # a boolean for ordinary failures avoids keeping a sensitive driver graph
@@ -293,6 +372,67 @@ class RocketMQBackend(Backend, QueueBackend):
         # depend on this slot.
         self._last_msg: Any = None
         self._last_delivery: tuple[Any, int, Any] | None = None
+
+    def _connect_attempt_is_fenced(self) -> bool:
+        with self._lifecycle_lock:
+            epoch = self._connect_attempt_epoch
+            return epoch is not None and epoch != self._lifecycle_epoch
+
+    def _operation_snapshot(self) -> _RocketMQOperationSnapshot:
+        """Capture and validate naming and delivery settings for a generation."""
+        return _RocketMQOperationSnapshot(
+            topic_prefix=_validate_topic_prefix(self.config.topic_prefix),
+            max_message_size=self.config.max_message_size,
+            invisible_duration=self.config.invisible_duration,
+        )
+
+    def _publish_generation_locked(self, *, allow_empty: bool = False) -> None:
+        """Publish the producer/consumer pair as one opaque generation."""
+        del allow_empty
+        if self._producer is None and self._consumer is None:
+            return
+        if self._generation_gate.current is not None:
+            return
+        self._generation_gate.publish(
+            _RocketMQGenerationHandles(
+                self._producer,
+                self._consumer,
+                self._connection_snapshot or self._operation_snapshot(),
+                self._consumer_generation,
+            )
+        )
+
+    @contextmanager
+    def _lease_generation(
+        self, operation: str
+    ) -> Iterator[GenerationRecord[_RocketMQGenerationHandles] | None]:
+        """Lease a RocketMQ handle for the complete SDK operation."""
+        with self._connection_lock:
+            current = self._generation_gate.current
+            if current is None:
+                if operation == "push":
+                    has_required_graph = self._producer is not None
+                elif operation in {"ack", "nack", "pop"}:
+                    has_required_graph = self._consumer is not None
+                else:
+                    has_required_graph = (
+                        self._producer is not None or self._consumer is not None
+                    )
+                if has_required_graph:
+                    self._publish_generation_locked()
+                current = self._generation_gate.current
+        if current is None:
+            # Preserve direct-injection compatibility; the existing public
+            # connected guards produce the stable QueueError for this case.
+            yield None
+            return
+        try:
+            with self._generation_gate.lease(operation) as record:
+                yield record
+        except GenerationUnavailable:
+            raise QueueError(
+                "RocketMQ backend is disconnected", operation=operation
+            ) from None
 
     @import_error_traceback_boundary
     @backend_connection_error_boundary(
@@ -317,18 +457,24 @@ class RocketMQBackend(Backend, QueueBackend):
         """
         with self._connection_lock:
             # A complete generation remains owned by this backend until an explicit
-            # disconnect.  Repeated (or overlapping) connects are therefore no-ops
-            # rather than silently leaking an earlier Producer/Consumer pair.
+            # disconnect. Repeated (or overlapping) connects are no-ops.
             if self._producer is not None and self._consumer is not None:
                 return
-            # A failed/interrupted historical connect could leave one side assigned.
-            # Retire it before beginning a fresh generation; this preserves the
-            # failure cleanup contract while preventing a one-sided client leak.
             if self._producer is not None or self._consumer is not None:
                 residual_cleanup_failed = self._abort_partial_connect()
                 if residual_cleanup_failed:
                     self._log_cleanup_diagnostic()
-            self._connect_unlocked()
+                # A shutdown/logger callback may have synchronously installed a
+                # replacement. Do not overwrite that callback-owned generation.
+                if self._producer is not None and self._consumer is not None:
+                    return
+            with self._lifecycle_lock:
+                self._connect_attempt_epoch = self._lifecycle_epoch
+            try:
+                self._connect_unlocked()
+            finally:
+                with self._lifecycle_lock:
+                    self._connect_attempt_epoch = None
 
     @import_error_traceback_boundary
     @backend_connection_error_boundary(
@@ -363,8 +509,8 @@ class RocketMQBackend(Backend, QueueBackend):
                 allow_remote_plaintext,
             )
         )
+        snapshot = self._operation_snapshot()
 
-        missing_dependency = False
         try:
             from rocketmq import (
                 ClientConfiguration,
@@ -375,27 +521,30 @@ class RocketMQBackend(Backend, QueueBackend):
         except ImportError as e:
             if not _is_missing_optional_dependency(e, "rocketmq"):
                 raise
-            missing_dependency = True
-        if missing_dependency:
             raise BackendConnectionError(
                 "rocketmq-python-client not installed.", backend_type="rocketmq"
-            )
+            ) from None
 
-        startup_error: BackendConnectionError | None = None
+        producer: Any = None
+        consumer: Any = None
         invariant_error: BackendConnectionError | None = None
         cleanup_diagnostic_pending = False
+
+        def cleanup_candidates() -> None:
+            nonlocal cleanup_diagnostic_pending
+            cleanup_diagnostic_pending = self._shutdown_detached_clients(
+                (consumer, "consumer"),
+                (producer, "producer"),
+                suppress_control_errors=True,
+            )
+
         try:
-            # Credentials: empty Credentials() for no-auth (the broker fixture runs
-            # with auth disabled); Credentials(ak, sk) when both are provided.
             if key_text is not None and secret_text is not None:
                 credentials = Credentials(_redact(key_text), _redact(secret_text))
             else:
                 credentials = Credentials()
+            fenced = self._connect_attempt_is_fenced()
 
-            # ``namesrv_address`` is, in this gRPC rewrite, the PROXY endpoints
-            # (``host:8081``). The field name is kept for settings-schema
-            # compatibility; the value must point at the broker's gRPC proxy, NOT the
-            # legacy NameServer (9876). The broker must run with ``--enable-proxy``.
             request_timeout = min(
                 max(3, send_timeout // 1000),
                 _MAX_REQUEST_TIMEOUT_S,
@@ -405,69 +554,70 @@ class RocketMQBackend(Backend, QueueBackend):
                 credentials=credentials,
                 request_timeout=request_timeout,
             )
+            fenced = fenced or self._connect_attempt_is_fenced()
 
-            self._producer = Producer(config_obj, tls_enable=tls_enabled)
-            if self._producer is None:
+            producer = Producer(config_obj, tls_enable=tls_enabled)
+            fenced = fenced or self._connect_attempt_is_fenced()
+            if producer is None:
                 invariant_error = BackendConnectionError(
                     "RocketMQBackend producer initialization returned None",
                     backend_type="rocketmq",
                 )
             else:
-                self._producer.startup()
-
-                # The client defaults await_duration to 20 seconds, so initialize it to
-                # zero; each receive replaces it with the requested duration clamped to
-                # RocketMQ Proxy's five-second server floor.
-                self._consumer = SimpleConsumer(
+                producer.startup()
+                fenced = fenced or self._connect_attempt_is_fenced()
+                consumer = SimpleConsumer(
                     config_obj,
                     consumer_group,
                     await_duration=0,
                     tls_enable=tls_enabled,
                 )
-                if self._consumer is None:
+                fenced = fenced or self._connect_attempt_is_fenced()
+                if consumer is None:
                     invariant_error = BackendConnectionError(
                         "RocketMQBackend consumer initialization returned None",
                         backend_type="rocketmq",
                     )
                 else:
-                    self._consumer.startup()
+                    consumer.startup()
+                    fenced = fenced or self._connect_attempt_is_fenced()
+
+            if fenced:
+                raise _RocketMQConnectionAttemptFenced()
+            if invariant_error is None:
+                with self._lifecycle_lock:
+                    if self._connect_attempt_is_fenced():
+                        raise _RocketMQConnectionAttemptFenced()
+                    self._producer = producer
+                    self._consumer = consumer
+                    self._connection_snapshot = snapshot
                     self._consumer_generation += 1
+                    self._publish_generation_locked()
+        except _RocketMQConnectionAttemptFenced:
+            cleanup_candidates()
+            if cleanup_diagnostic_pending:
+                self._log_cleanup_diagnostic()
+            return
         except Exception:
-            cleanup_diagnostic_pending = self._abort_partial_connect()
+            cleanup_candidates()
             startup_error = BackendConnectionError(
                 "Failed to connect to RocketMQ.", backend_type="rocketmq"
             )
+            if cleanup_diagnostic_pending:
+                self._log_cleanup_diagnostic()
+            raise startup_error from None
         except BaseException:
-            # KeyboardInterrupt/SystemExit are not ``Exception`` subclasses, so the
-            # arms above cannot catch them — without this arm a Ctrl+C raised after
-            # ``self._producer = Producer(...)`` / ``startup()`` skips
-            # ``_abort_partial_connect()``, leaking both clients (TCP sockets + bg
-            # threads) and wedging the backend. Detach the partially-built clients
-            # before re-raising. Mirrors mongodb.py / elasticsearch.py / kafka
-            # ``except BaseException`` arms.
-            self._abort_partial_connect()
+            cleanup_candidates()
             raise
 
         if invariant_error is not None:
-            # These local contract violations use fixed text, so preserve their
-            # existing public diagnostics while still raising outside any handler.
-            cleanup_diagnostic_pending = self._abort_partial_connect()
-            startup_error = invariant_error
-
+            cleanup_candidates()
+            if cleanup_diagnostic_pending:
+                self._log_cleanup_diagnostic()
+            raise invariant_error
         if cleanup_diagnostic_pending:
-            # The startup handler has finished, so a logging extension cannot
-            # recover the raw driver failure through ``sys.exc_info()``.
             self._log_cleanup_diagnostic()
 
-        if startup_error is not None:
-            # Raise outside the driver exception handler so endpoint/credential text
-            # cannot survive through ``__cause__`` or ``__context__``.
-            raise startup_error
-
-        # A complete producer/consumer pair is live once the generation advances.
-        # Diagnostics after that publication are strictly observational: an
-        # extension logger is allowed to fail (including with a control exception)
-        # without treating the published clients as an aborted private candidate.
         try:
             logger.debug("Connected to RocketMQ proxy")
         except BaseException:
@@ -492,52 +642,92 @@ class RocketMQBackend(Backend, QueueBackend):
             self._receive_control_error = None
             self._receive_consumer = None
             self._receive_generation = 0
+            self._receive_snapshot = None
             self._selected_topic = None
             self._receive_demand = 0
             self._receive_condition.notify_all()
             return worker
 
-    def _finish_receive_pump_shutdown(self, worker: threading.Thread | None) -> bool:
-        """Bound the detached-worker join and report whether it really stopped."""
-        if (
-            worker is not None
-            and worker is not threading.current_thread()
-            and worker.ident is not None
-        ):
-            worker.join(timeout=_RECEIVE_PUMP_JOIN_TIMEOUT_S)
-        worker_stopped = (
-            worker is None
-            or worker is threading.current_thread()
-            or not worker.is_alive()
-        )
-        with self._receive_condition:
-            # Clear admission even when the SDK left the old daemon blocked. Its
-            # captured stop event and generation identity fence all late results;
-            # a reconnect may therefore install a fresh pump without stale
-            # publication or the old worker clearing the replacement reference.
-            if self._receive_worker is worker:
-                self._receive_worker = None
-            self._receive_stop = None
-            self._receive_condition.notify_all()
-        return worker_stopped
+    @staticmethod
+    def _thread_definitely_unstarted(worker: threading.Thread) -> bool:
+        """Return true only when the launch state proves no target ran."""
+        try:
+            started = getattr(worker, "_started", None)
+            return started is not None and not started.is_set() and worker.ident is None
+        except BaseException:
+            return False
+
+    def _finish_receive_pump_shutdown(
+        self, worker: threading.Thread | None
+    ) -> tuple[bool, BaseException | None]:
+        """Bound the detached-worker join and retain a control failure."""
+        join_error: BaseException | None = None
+        try:
+            if (
+                worker is not None
+                and worker is not threading.current_thread()
+                and worker.ident is not None
+            ):
+                worker.join(timeout=_RECEIVE_PUMP_JOIN_TIMEOUT_S)
+            worker_stopped = (
+                worker is None
+                or worker is threading.current_thread()
+                or not worker.is_alive()
+            )
+        except BaseException as error:
+            # Joining is cleanup. Finish the state fence before returning the
+            # exact signal to the caller, rather than leaving a wedged worker
+            # reference that can poison the next generation.
+            join_error = error
+            worker_stopped = False
+        try:
+            with self._receive_condition:
+                # Clear admission even when the SDK left the old daemon blocked.
+                # Its captured stop event and generation identity fence all late
+                # results; a reconnect may therefore install a fresh pump without
+                # stale publication or the old worker clearing the replacement
+                # reference.
+                if self._receive_worker is worker:
+                    self._receive_worker = None
+                    self._receive_stop = None
+                elif worker is None and self._receive_worker is None:
+                    # No replacement was installed while cleanup ran. Do not
+                    # clear a newer generation's stop event by unconditional
+                    # mirror assignment.
+                    self._receive_stop = None
+                self._receive_condition.notify_all()
+        except BaseException as error:
+            if join_error is None:
+                join_error = error
+            worker_stopped = False
+        return worker_stopped, join_error
 
     def _abort_partial_connect(self) -> bool:
         """Detach and best-effort stop clients created by a failed connect."""
+        retired = self._generation_gate.retire()
         producer = self._producer
         consumer = self._consumer
         self._producer = None
         self._consumer = None
         self._consumer_generation += 1
         self._subscribed_topics.clear()
+        if retired is not None:
+            retired.value.legacy_message = self._last_msg
+            retired.value.legacy_delivery = self._last_delivery
         self._last_msg = None
         self._last_delivery = None
+        self._connection_snapshot = None
         worker = self._fence_receive_pump_unlocked()
+        # The helper is called while connection setup owns the lifecycle lock;
+        # drain after detaching the mirrors so an admitted operation can finish
+        # without re-entering that lock.
+        self._generation_gate.drain(retired)
         cleanup_failed = self._shutdown_detached_clients(
             (consumer, "consumer"),
             (producer, "producer"),
             suppress_control_errors=True,
         )
-        worker_stopped = self._finish_receive_pump_shutdown(worker)
+        worker_stopped, _pump_control_error = self._finish_receive_pump_shutdown(worker)
         return cleanup_failed or not worker_stopped
 
     @control_exception_traceback_boundary
@@ -551,45 +741,92 @@ class RocketMQBackend(Backend, QueueBackend):
 
     def _disconnect(self) -> None:
         """Tear down one generation behind the terminal public error boundary."""
+        # Fence private constructors before waiting for the connect single-flight.
+        with self._lifecycle_lock:
+            self._lifecycle_epoch += 1
         with self._connection_lock:
-            # Detach first so no public pop can enter this generation while its
-            # blocking receive is being interrupted and joined.
-            producer = self._producer
-            consumer = self._consumer
+            # Retire admission and detach compatibility mirrors atomically. The
+            # authoritative handles remain in the retired record until every
+            # admitted SDK operation has returned.
+            retired = self._generation_gate.retire()
+            generation_handles = retired.value if retired is not None else None
+            producer = (
+                generation_handles.producer
+                if generation_handles is not None
+                else self._producer
+            )
+            consumer = (
+                generation_handles.consumer
+                if generation_handles is not None
+                else self._consumer
+            )
             self._producer = None
             self._consumer = None
             self._consumer_generation += 1
             self._subscribed_topics.clear()
+            if retired is not None:
+                retired.value.legacy_message = self._last_msg
+                retired.value.legacy_delivery = self._last_delivery
             self._last_msg = None
             self._last_delivery = None
-            worker = self._fence_receive_pump_unlocked()
-            cleanup_failed = False
-            control_error: BaseException | None = None
-            try:
-                cleanup_failed = self._shutdown_detached_clients(
-                    (consumer, "consumer"), (producer, "producer")
+            self._connection_snapshot = None
+            with self._receive_condition:
+                defer_receive_shutdown = (
+                    self._receive_call_thread is threading.current_thread()
+                    and self._receive_consumer is consumer
                 )
+                if defer_receive_shutdown:
+                    self._deferred_receive_consumer = consumer
+            worker = self._fence_receive_pump_unlocked()
+
+        # Do not hold connection_lock while draining an admitted producer/ack
+        # operation. A bounded caller wait never releases this authoritative lease.
+        # Shutdown is a generation finalizer rather than an unconditional action
+        # after drain: a same-thread disconnect from producer.send/ack must not
+        # shut down the client from inside its own SDK callback.
+        cleanup_failed = False
+        control_error: BaseException | None = None
+
+        def finalize_clients() -> None:
+            nonlocal cleanup_failed, control_error
+            try:
+                shutdown_clients = (
+                    ((producer, "producer"),)
+                    if defer_receive_shutdown
+                    else ((consumer, "consumer"), (producer, "producer"))
+                )
+                cleanup_failed = self._shutdown_detached_clients(*shutdown_clients)
             except BaseException as error:
                 # Finish the bounded pump join before restoring process-control
                 # flow. This preserves KeyboardInterrupt/SystemExit without an
                 # unbounded wait when receive ignored the failed shutdown.
                 control_error = error
-            worker_stopped = self._finish_receive_pump_shutdown(worker)
-            if control_error is not None:
-                raise control_error
-            if cleanup_failed or not worker_stopped:
-                self._log_cleanup_diagnostic()
-                raise BackendConnectionError(
-                    _ROCKETMQ_DISCONNECT_ERROR,
-                    backend_type="rocketmq",
-                )
-            # This diagnostic follows the completed disconnect state transition. A
-            # misbehaving logging handler must not report the completed operation as
-            # failed or resurrect an already-detached client generation.
-            try:
-                logger.debug("Disconnected from RocketMQ")
-            except BaseException:
-                pass
+
+        generation_control_error = self._generation_gate.drain(
+            retired, finalize_clients
+        )
+        worker_stopped, pump_control_error = self._finish_receive_pump_shutdown(worker)
+        if generation_control_error is not None:
+            # The drain wait precedes detached shutdown and pump joining. Preserve
+            # that earlier primary control signal over later cleanup signals.
+            raise generation_control_error
+        if control_error is not None:
+            raise control_error
+        if pump_control_error is not None:
+            raise pump_control_error
+        if cleanup_failed or not worker_stopped:
+            self._log_cleanup_diagnostic()
+            raise BackendConnectionError(
+                _ROCKETMQ_DISCONNECT_ERROR,
+                backend_type="rocketmq",
+            )
+        # This diagnostic follows the completed disconnect state transition. A
+        # misbehaving logging handler must not report the completed operation as
+        # failed or resurrect an already-detached client generation.
+        try:
+            logger.debug("Disconnected from RocketMQ")
+        except BaseException:
+            pass
 
     @staticmethod
     def _shutdown_detached_client(closer: Any, result: _RocketMQCleanupResult) -> None:
@@ -608,7 +845,8 @@ class RocketMQBackend(Backend, QueueBackend):
         suppress_control_errors: bool = False,
     ) -> bool:
         """Bound all SDK shutdowns and retain the first ordered control error."""
-        tasks: list[tuple[threading.Thread, _RocketMQCleanupResult]] = []
+        tasks: list[tuple[threading.Thread | None, _RocketMQCleanupResult]] = []
+        management_errors: list[BaseException] = []
         for closer, label in clients:
             if closer is None:
                 continue
@@ -619,20 +857,41 @@ class RocketMQBackend(Backend, QueueBackend):
                 name=f"rocketmq-shutdown-{label}",
                 daemon=True,
             )
-            tasks.append((worker, result))
             try:
                 worker.start()
             except BaseException as start_error:
-                result.publish(start_error)
+                # Thread.start() may raise after launching the target. Retain that
+                # worker when its identity proves it started; otherwise use the
+                # lower-level daemon launcher so the detached client is still
+                # offered shutdown before the result fence.
+                management_errors.append(start_error)
+                if not cls._thread_definitely_unstarted(worker):
+                    tasks.append((worker, result))
+                    continue
+                try:
+                    start_new_thread(cls._shutdown_detached_client, (closer, result))
+                except BaseException as fallback_error:
+                    management_errors.append(fallback_error)
+                    result.publish(fallback_error)
+                    tasks.append((None, result))
+                else:
+                    tasks.append((None, result))
+            else:
+                tasks.append((worker, result))
 
         deadline = time.monotonic() + _CLIENT_SHUTDOWN_JOIN_TIMEOUT_S
-        for worker, _result in tasks:
-            if worker.ident is None:
-                continue
+        for task_worker, result in tasks:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            worker.join(timeout=remaining)
+            try:
+                if task_worker is not None:
+                    if task_worker.ident is not None:
+                        task_worker.join(timeout=remaining)
+                else:
+                    result._completed_event.wait(timeout=remaining)
+            except BaseException as wait_error:
+                management_errors.append(wait_error)
 
         cleanup_failed = False
         primary_control_error: BaseException | None = None
@@ -644,6 +903,12 @@ class RocketMQBackend(Backend, QueueBackend):
                 cleanup_failed = True
             elif shutdown_error is not None and primary_control_error is None:
                 primary_control_error = shutdown_error
+
+        for management_error in management_errors:
+            if isinstance(management_error, Exception):
+                cleanup_failed = True
+            elif primary_control_error is None:
+                primary_control_error = management_error
 
         if primary_control_error is not None:
             if not suppress_control_errors:
@@ -684,7 +949,11 @@ class RocketMQBackend(Backend, QueueBackend):
         """Return backend type."""
         return BackendType.ROCKETMQ
 
-    def _get_topic_name(self, queue_name: str) -> str:
+    def _get_topic_name(
+        self,
+        queue_name: str,
+        snapshot: _RocketMQOperationSnapshot | None = None,
+    ) -> str:
         """Get full topic name for queue.
 
         Args:
@@ -694,7 +963,8 @@ class RocketMQBackend(Backend, QueueBackend):
           Full topic name.
         """
         _validate_key_name(queue_name, "queue_name")
-        return f"{self.config.topic_prefix}_{queue_name}"
+        prefix = self.config.topic_prefix if snapshot is None else snapshot.topic_prefix
+        return f"{prefix}_{queue_name}"
 
     @queue_operation_error_boundary(
         "push",
@@ -714,33 +984,54 @@ class RocketMQBackend(Backend, QueueBackend):
           QueueError: If push fails.
         """
         _validate_key_name(queue_name, "queue_name")
-        if not self.is_connected():
-            msg = "Not connected to RocketMQ"
-            raise QueueError(msg, queue_name=queue_name, operation="push")
-        # R22-C: enforce the documented client-side size cap (fail-fast) so an
-        # operator who tightens ``max_message_size`` below ``queue_max_item_bytes``
-        # gets a clear QueueError at push, not an opaque broker-side rejection. The
-        # Field was previously dead config (declared, never read).
-        if len(item) > self.config.max_message_size:
-            msg = _ROCKETMQ_MAX_MESSAGE_SIZE_ERROR
-            raise QueueError(msg, queue_name=queue_name, operation="push")
-
         try:
-            from rocketmq import Message
+            with self._lease_generation("push") as generation:
+                snapshot = (
+                    generation.value.snapshot
+                    if generation is not None
+                    else self._operation_snapshot()
+                )
+                # R22-C: enforce the documented client-side size cap from the
+                # generation snapshot, never from mutable live settings.
+                if len(item) > snapshot.max_message_size:
+                    raise QueueError(
+                        _ROCKETMQ_MAX_MESSAGE_SIZE_ERROR,
+                        queue_name=queue_name,
+                        operation="push",
+                    )
+                producer = (
+                    generation.value.producer
+                    if generation is not None
+                    else self._producer
+                )
+                if generation is None:
+                    if producer is None or not self.is_connected():
+                        raise QueueError(
+                            "Not connected to RocketMQ",
+                            queue_name=queue_name,
+                            operation="push",
+                        )
+                elif producer is None:
+                    error = "RocketMQBackend not connected: producer is None"
+                    raise QueueError(error, queue_name=queue_name, operation="push")
+                from rocketmq import Message
 
-            topic_name = self._get_topic_name(queue_name)
-            msg = Message()
-            msg.topic = topic_name
-            msg.body = item
-            # apache Message has no native priority field; carry it as ``keys`` so a
-            # priority-aware consumer could read it. rocketmq topic ordering is by
-            # queue, not priority — the priority arg is accepted for interface
-            # symmetry but does not reorder within a topic.
-            msg.keys = str(priority)
-            if self._producer is None:
-                error = "RocketMQBackend not connected: producer is None"
-                raise QueueError(error, queue_name=queue_name, operation="push")
-            self._producer.send(msg)
+                topic_name = self._get_topic_name(queue_name, snapshot)
+                msg = Message()
+                msg.topic = topic_name
+                msg.body = item
+                # apache Message has no native priority field; carry it as ``keys``
+                # so a priority-aware consumer could read it. RocketMQ topic
+                # ordering is by queue, not priority — the priority arg is accepted
+                # for interface symmetry but does not reorder within a topic.
+                msg.keys = str(priority)
+                producer.send(msg)
+                if generation is not None and not generation.accepting:
+                    raise QueueError(
+                        _ROCKETMQ_CONNECTION_CHANGED_PUSH_ERROR,
+                        queue_name=queue_name,
+                        operation="push",
+                    )
         except QueueError:
             raise
         except Exception as e:
@@ -756,11 +1047,12 @@ class RocketMQBackend(Backend, QueueBackend):
         topic_name = self._selected_topic
         stop = self._receive_stop
         generation = self._receive_generation
-        if consumer is None or topic_name is None or stop is None:
+        snapshot = self._receive_snapshot
+        if consumer is None or topic_name is None or stop is None or snapshot is None:
             return
         worker = threading.Thread(
             target=self._receive_pump,
-            args=(consumer, generation, topic_name, stop),
+            args=(consumer, generation, topic_name, stop, snapshot),
             name=f"rocketmq-receive-{generation}",
             daemon=True,
         )
@@ -793,10 +1085,22 @@ class RocketMQBackend(Backend, QueueBackend):
         generation: int,
         topic_name: str,
         stop: threading.Event,
+        snapshot: _RocketMQOperationSnapshot,
     ) -> None:
         """Run bounded broker long polls and publish one local delivery at a time."""
         try:
-            consumer.subscribe(topic_name)
+            # Subscribe is a blocking SDK operation too. The active-thread marker
+            # lets a same-thread callback defer shutdown, while a cross-thread
+            # disconnect may still close the consumer to bound cleanup.
+            with self._receive_condition:
+                self._receive_call_thread = threading.current_thread()
+            try:
+                consumer.subscribe(topic_name)
+            finally:
+                with self._receive_condition:
+                    if self._receive_call_thread is threading.current_thread():
+                        self._receive_call_thread = None
+                    self._receive_condition.notify_all()
             with self._receive_condition:
                 if not self._pump_is_current_locked(consumer, generation, stop):
                     return
@@ -812,7 +1116,20 @@ class RocketMQBackend(Backend, QueueBackend):
                     if not self._pump_is_current_locked(consumer, generation, stop):
                         return
                     self._receive_demand -= 1
-                messages = consumer.receive(1, self.config.invisible_duration)
+                # The receive pump has its own stop event and generation fence;
+                # disconnect closes a cross-thread consumer to interrupt this
+                # bounded cleanup operation. The active-thread marker handles the
+                # exceptional same-thread reentrant callback without closing the
+                # consumer from inside receive().
+                with self._receive_condition:
+                    self._receive_call_thread = threading.current_thread()
+                try:
+                    messages = consumer.receive(1, snapshot.invisible_duration)
+                finally:
+                    with self._receive_condition:
+                        if self._receive_call_thread is threading.current_thread():
+                            self._receive_call_thread = None
+                        self._receive_condition.notify_all()
                 with self._receive_condition:
                     if not self._pump_is_current_locked(consumer, generation, stop):
                         return
@@ -846,18 +1163,38 @@ class RocketMQBackend(Backend, QueueBackend):
                     self._receive_cycle += 1
                     self._receive_condition.notify_all()
         finally:
+            deferred_consumer = None
             with self._receive_condition:
                 if self._receive_worker is threading.current_thread():
                     self._receive_worker = None
+                if self._deferred_receive_consumer is consumer:
+                    deferred_consumer = self._deferred_receive_consumer
+                    self._deferred_receive_consumer = None
                 self._receive_condition.notify_all()
+            if deferred_consumer is not None:
+                try:
+                    deferred_consumer.shutdown()
+                except BaseException:
+                    # The receive/pump result is already fenced; deferred cleanup
+                    # cannot replace it or re-enter the public boundary.
+                    pass
 
     def _receive_delivery(
         self, queue_name: str, timeout: float
     ) -> tuple[Any | None, Any, int]:
         """Take one exact delivery from the generation-scoped local buffer."""
         _validate_key_name(queue_name, "queue_name")
-        topic_name = self._get_topic_name(queue_name)
         with self._connection_lock:
+            generation_record = self._generation_gate.current
+            if generation_record is None and self._consumer is not None:
+                self._publish_generation_locked()
+                generation_record = self._generation_gate.current
+            snapshot = (
+                generation_record.value.snapshot
+                if generation_record is not None
+                else self._operation_snapshot()
+            )
+            topic_name = self._get_topic_name(queue_name, snapshot)
             if not self.is_connected():
                 msg = "Not connected to RocketMQ"
                 raise QueueError(msg, queue_name=queue_name, operation="pop")
@@ -876,6 +1213,7 @@ class RocketMQBackend(Backend, QueueBackend):
                     self._selected_topic = topic_name
                     self._receive_consumer = consumer
                     self._receive_generation = generation
+                    self._receive_snapshot = snapshot
                     self._receive_stop = threading.Event()
                     self._receive_failed = False
                     self._receive_control_error = None
@@ -931,6 +1269,20 @@ class RocketMQBackend(Backend, QueueBackend):
         message, _consumer, _generation = self._receive_delivery(queue_name, timeout)
         return message
 
+    def _receive_generation_is_current_locked(
+        self, consumer: Any, generation: int
+    ) -> bool:
+        """Check the delivery's gate identity before publishing compatibility state."""
+        current = self._generation_gate.current
+        return bool(
+            current is not None
+            and current.accepting
+            and current.value.consumer is consumer
+            and current.value.consumer_generation == generation
+            and self._consumer is consumer
+            and self._consumer_generation == generation
+        )
+
     @queue_operation_error_boundary(
         "pop",
         "Failed to pop RocketMQ message.",
@@ -961,8 +1313,15 @@ class RocketMQBackend(Backend, QueueBackend):
         msg, consumer, generation = self._receive_delivery(queue_name, timeout)
         if msg is None:
             return None
-        self._last_msg = msg
-        self._last_delivery = (consumer, generation, msg)
+        with self._connection_lock:
+            if not self._receive_generation_is_current_locked(consumer, generation):
+                raise QueueError(
+                    _ROCKETMQ_CONNECTION_CHANGED_OPERATION_ERROR,
+                    queue_name=queue_name,
+                    operation="pop",
+                )
+            self._last_msg = msg
+            self._last_delivery = (consumer, generation, msg)
         return self._extract_body(msg)
 
     @queue_operation_error_boundary(
@@ -996,7 +1355,14 @@ class RocketMQBackend(Backend, QueueBackend):
         msg, consumer, generation = self._receive_delivery(queue_name, timeout)
         if msg is None:
             return (None, None)
-        token = _RocketMQAckToken(msg, consumer, generation)
+        with self._connection_lock:
+            if not self._receive_generation_is_current_locked(consumer, generation):
+                raise QueueError(
+                    _ROCKETMQ_CONNECTION_CHANGED_OPERATION_ERROR,
+                    queue_name=queue_name,
+                    operation="pop",
+                )
+            token = _RocketMQAckToken(msg, consumer, generation)
         return (self._extract_body(msg), token)
 
     @staticmethod
@@ -1021,6 +1387,45 @@ class RocketMQBackend(Backend, QueueBackend):
             return bytes(body)
         return str(body).encode()
 
+    def _ack_token(self, token: _RocketMQAckToken) -> None:
+        """Ack one token while retaining its admitted consumer generation."""
+        with self._lease_generation("ack") as generation:
+            selected_consumer = (
+                generation.value.consumer
+                if generation is not None and generation.value.consumer is not None
+                else self._consumer
+            )
+            expected_generation = (
+                generation.value.consumer_generation
+                if generation is not None
+                else self._consumer_generation
+            )
+            if (
+                token.consumer is not selected_consumer
+                or token.generation != expected_generation
+            ):
+                token._settle("stale", lambda: None)
+                return
+            target = token.message
+            consumer = token.consumer
+
+            def acknowledge() -> None:
+                try:
+                    consumer.ack(target)
+                except Exception as e:
+                    msg = f"Failed to ack RocketMQ message: {e}"
+                    raise QueueError(msg, operation="ack") from e
+
+            settled = token._settle("acked", acknowledge)
+            if generation is not None and not generation.accepting:
+                raise QueueError(
+                    _ROCKETMQ_CONNECTION_CHANGED_OPERATION_ERROR,
+                    operation="ack",
+                )
+            if settled and self._last_msg is target:
+                self._last_msg = None
+                self._last_delivery = None
+
     @queue_operation_error_boundary(
         "ack",
         "Failed to ack RocketMQ message.",
@@ -1043,53 +1448,88 @@ class RocketMQBackend(Backend, QueueBackend):
         """
         del queue_name
         if token is not None:
-            if not isinstance(token, _RocketMQAckToken):
+            if isinstance(token, _RocketMQAckToken):
+                self._ack_token(token)
+            return
+        # Legacy settlement is also a blocking SDK operation. Hold the same
+        # generation lease as token settlement so disconnect cannot shut down
+        # the consumer underneath ack().
+        with self._lease_generation("ack") as generation_record:
+            if generation_record is not None and not generation_record.accepting:
+                handles = generation_record.value
+                target = handles.legacy_message
+                delivery_state = handles.legacy_delivery
+            else:
+                handles = None
+                target = self._last_msg
+                delivery_state = self._last_delivery
+            if target is None:
                 return
+            if delivery_state is not None:
+                consumer, delivery_generation, delivery = delivery_state
+                if handles is None and (
+                    delivery is not target
+                    or delivery_generation != self._consumer_generation
+                    or consumer is not self._consumer
+                ):
+                    return
+                target = delivery
+            else:
+                consumer = self._consumer if handles is None else handles.consumer
+            if consumer is None:
+                return
+            try:
+                consumer.ack(target)
+            except Exception as e:
+                msg = f"Failed to ack RocketMQ message: {e}"
+                raise QueueError(msg, operation="ack") from e
+            if generation_record is not None and not generation_record.accepting:
+                raise QueueError(
+                    _ROCKETMQ_CONNECTION_CHANGED_OPERATION_ERROR,
+                    operation="ack",
+                )
+            # Clear the legacy slot when we acked the tracked message so a later
+            # ack(token=None) is a no-op, not a re-ack.
+            if self._last_msg is target:
+                self._last_msg = None
+                self._last_delivery = None
+
+    def _nack_token(self, token: _RocketMQAckToken) -> None:
+        """Nack one token while retaining its admitted consumer generation."""
+        with self._lease_generation("nack") as generation:
+            selected_consumer = (
+                generation.value.consumer
+                if generation is not None and generation.value.consumer is not None
+                else self._consumer
+            )
+            expected_generation = (
+                generation.value.consumer_generation
+                if generation is not None
+                else self._consumer_generation
+            )
             if (
-                token.generation != self._consumer_generation
-                or token.consumer is not self._consumer
+                token.consumer is not selected_consumer
+                or token.generation != expected_generation
             ):
                 token._settle("stale", lambda: None)
                 return
             target = token.message
             consumer = token.consumer
 
-            def acknowledge() -> None:
+            def change_invisible_duration() -> None:
                 try:
-                    consumer.ack(target)
+                    consumer.change_invisible_duration(target, _MIN_INVISIBLE_DURATION)
                 except Exception as e:
-                    msg = f"Failed to ack RocketMQ message: {e}"
-                    raise QueueError(msg, operation="ack") from e
+                    msg = f"Failed to nack RocketMQ message: {e}"
+                    raise QueueError(msg, operation="nack") from e
 
-            if token._settle("acked", acknowledge) and self._last_msg is target:
-                self._last_msg = None
-                self._last_delivery = None
-            return
-        else:
-            target = self._last_msg
-            if target is None:
-                return
-            if self._last_delivery is not None:
-                consumer, generation, delivery = self._last_delivery
-                if (
-                    delivery is not target
-                    or generation != self._consumer_generation
-                    or consumer is not self._consumer
-                ):
-                    return
-            else:
-                consumer = self._consumer
-            if consumer is None:
-                return
-        try:
-            consumer.ack(target)
-        except Exception as e:
-            msg = f"Failed to ack RocketMQ message: {e}"
-            raise QueueError(msg, operation="ack") from e
-        else:
-            # Clear the legacy slot when we acked the tracked message so a later
-            # ack(token=None) is a no-op, not a re-ack.
-            if self._last_msg is target:
+            settled = token._settle("nacked", change_invisible_duration)
+            if generation is not None and not generation.accepting:
+                raise QueueError(
+                    _ROCKETMQ_CONNECTION_CHANGED_OPERATION_ERROR,
+                    operation="nack",
+                )
+            if settled and self._last_msg is target:
                 self._last_msg = None
                 self._last_delivery = None
 
@@ -1116,53 +1556,46 @@ class RocketMQBackend(Backend, QueueBackend):
         """
         del queue_name
         if token is not None:
-            if not isinstance(token, _RocketMQAckToken):
-                return
-            if (
-                token.generation != self._consumer_generation
-                or token.consumer is not self._consumer
-            ):
-                token._settle("stale", lambda: None)
-                return
-            target = token.message
-            consumer = token.consumer
-
-            def change_invisible_duration() -> None:
-                try:
-                    consumer.change_invisible_duration(target, _MIN_INVISIBLE_DURATION)
-                except Exception as e:
-                    msg = f"Failed to nack RocketMQ message: {e}"
-                    raise QueueError(msg, operation="nack") from e
-
-            if (
-                token._settle("nacked", change_invisible_duration)
-                and self._last_msg is target
-            ):
-                self._last_msg = None
-                self._last_delivery = None
+            if isinstance(token, _RocketMQAckToken):
+                self._nack_token(token)
             return
-        else:
-            target = self._last_msg
+        # Legacy settlement is also a blocking SDK operation. Hold the same
+        # generation lease as token settlement so disconnect cannot shut down
+        # the consumer underneath change_invisible_duration().
+        with self._lease_generation("nack") as generation_record:
+            if generation_record is not None and not generation_record.accepting:
+                handles = generation_record.value
+                target = handles.legacy_message
+                delivery_state = handles.legacy_delivery
+            else:
+                handles = None
+                target = self._last_msg
+                delivery_state = self._last_delivery
             if target is None:
                 return
-            if self._last_delivery is not None:
-                consumer, generation, delivery = self._last_delivery
-                if (
+            if delivery_state is not None:
+                consumer, delivery_generation, delivery = delivery_state
+                if handles is None and (
                     delivery is not target
-                    or generation != self._consumer_generation
+                    or delivery_generation != self._consumer_generation
                     or consumer is not self._consumer
                 ):
                     return
+                target = delivery
             else:
-                consumer = self._consumer
+                consumer = self._consumer if handles is None else handles.consumer
             if consumer is None:
                 return
-        try:
-            consumer.change_invisible_duration(target, _MIN_INVISIBLE_DURATION)
-        except Exception as e:
-            msg = f"Failed to nack RocketMQ message: {e}"
-            raise QueueError(msg, operation="nack") from e
-        else:
+            try:
+                consumer.change_invisible_duration(target, _MIN_INVISIBLE_DURATION)
+            except Exception as e:
+                msg = f"Failed to nack RocketMQ message: {e}"
+                raise QueueError(msg, operation="nack") from e
+            if generation_record is not None and not generation_record.accepting:
+                raise QueueError(
+                    _ROCKETMQ_CONNECTION_CHANGED_OPERATION_ERROR,
+                    operation="nack",
+                )
             if self._last_msg is target:
                 self._last_msg = None
                 self._last_delivery = None

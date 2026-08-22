@@ -15,6 +15,8 @@ import logging
 import ssl
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
@@ -30,7 +32,12 @@ except ImportError as e:
         "RabbitMQ backend requires 'pika'. Install with: pip install scrapy-extension[rabbitmq]"
     ) from e
 
-from scrapy_extension.backends._redaction import _redact
+from scrapy_extension.backends._generation import (
+    GenerationLeaseGate,
+    GenerationRecord,
+    GenerationUnavailable,
+)
+from scrapy_extension.backends._redaction import _diagnostic_repr, _redact
 from scrapy_extension.backends.base import (
     Backend,
     BackendType,
@@ -72,6 +79,7 @@ _RABBITMQ_SAFE_QUEUE_MESSAGES: frozenset[str] = frozenset(
         "Not connected to RabbitMQ",
         "RabbitMQ publish was not confirmed.",
         "RabbitMQ connection changed while waiting for a message",
+        "RabbitMQ connection changed during publish.",
         "Cannot clear RabbitMQ queue while deliveries are in-flight.",
     }
 )
@@ -84,6 +92,7 @@ _RABBITMQ_SAFE_QUEUE_MESSAGES: frozenset[str] = frozenset(
 # signal, never the ack state). 10k is generous for normal CONCURRENT_REQUESTS
 # backpressure and tight enough to flag a real leak.
 _MAX_IN_FLIGHT = 10_000
+_RABBITMQ_GENERATION_CHANGED_MESSAGE = "RabbitMQ connection changed during operation."
 
 
 def _validate_queue_name_argument(
@@ -132,11 +141,29 @@ class _RabbitMQAckToken:
         return hash((self.delivery_tag, self.channel_generation, self.queue_name))
 
     def __repr__(self) -> str:
+        # Queue identities are caller-controlled and can contain URI-like or
+        # credential-shaped text when tokens are captured by diagnostics.
         return (
             f"_RabbitMQAckToken(delivery_tag={self.delivery_tag}, "
             f"channel_generation={self.channel_generation}, "
-            f"queue_name={self.queue_name!r})"
+            f"queue_name={_diagnostic_repr(self.queue_name)})"
         )
+
+
+@dataclass(slots=True, eq=False)
+class _RabbitMQGenerationHandles:
+    """Exact channel/connection state retained by admitted operations."""
+
+    connection: pika.BlockingConnection
+    channel: pika.channel.Channel
+    channel_generation: int
+    snapshot: _RabbitMQConnectionSnapshot | None
+    declared_queues: set[str]
+    in_flight_tags: set[_RabbitMQAckToken]
+    pending_deliveries: dict[str, int]
+    last_delivery_tag: int | None = None
+    last_delivery_queue: str | None = None
+    in_flight_overflow_warned: bool = False
 
 
 @dataclass(frozen=True)
@@ -213,11 +240,14 @@ class RabbitMQBackend(Backend, QueueBackend):
         # Serializes retirement of published handles with the next publication.
         # Private candidate construction remains outside this lock, so disconnect
         # never waits for an unbounded network connect attempt.
-        self._retirement_lock = threading.Lock()
+        self._retirement_lock = threading.RLock()
         self._connection: pika.BlockingConnection | None = None
         self._channel: pika.channel.Channel | None = None
         self._connection_snapshot: _RabbitMQConnectionSnapshot | None = None
         self._channel_generation = 0
+        self._generation_gate: GenerationLeaseGate[_RabbitMQGenerationHandles] = (
+            GenerationLeaseGate()
+        )
         # Captured when connect() is entered, before waiting for the single-flight
         # lock. disconnect() advances it at its retirement linearization point so
         # both an in-progress candidate and already-queued intents are fenced.
@@ -248,6 +278,72 @@ class RabbitMQBackend(Backend, QueueBackend):
         self._ssl_warning_emitted: bool = False
         # R14-E: one-shot guard for the in-flight-set-overflow warning.
         self._in_flight_overflow_warned: bool = False
+
+    def _publish_generation_locked(self) -> None:
+        """Publish the fully installed channel generation."""
+        if self._channel is None or self._connection is None:
+            return
+        if self._generation_gate.current is not None:
+            return
+        self._generation_gate.publish(
+            _RabbitMQGenerationHandles(
+                connection=self._connection,
+                channel=self._channel,
+                channel_generation=self._channel_generation,
+                snapshot=self._connection_snapshot,
+                declared_queues=self._declared_queues,
+                in_flight_tags=self._in_flight_tags,
+                pending_deliveries=self._pending_deliveries,
+                last_delivery_tag=self._last_delivery_tag,
+                last_delivery_queue=self._last_delivery_queue,
+                in_flight_overflow_warned=self._in_flight_overflow_warned,
+            )
+        )
+
+    @contextmanager
+    def _lease_generation(
+        self, operation: str, queue_name: str | None = None
+    ) -> Iterator[GenerationRecord[_RabbitMQGenerationHandles] | None]:
+        """Lease one exact channel generation for the complete SDK operation."""
+        with self._delivery_lock:
+            current = self._generation_gate.current
+            if current is None and self._session_is_healthy_locked():
+                self._publish_generation_locked()
+                current = self._generation_gate.current
+            if current is not None:
+                # Keep the private compatibility seams (tests and older callers
+                # may assign these mirrors) coherent at admission time. Once a
+                # record is retired its containers are never rebound here.
+                handles = current.value
+                if handles.declared_queues is not self._declared_queues:
+                    handles.declared_queues = self._declared_queues
+                if handles.in_flight_tags is not self._in_flight_tags:
+                    handles.in_flight_tags = self._in_flight_tags
+                if handles.pending_deliveries is not self._pending_deliveries:
+                    handles.pending_deliveries = self._pending_deliveries
+                handles.last_delivery_tag = self._last_delivery_tag
+                handles.last_delivery_queue = self._last_delivery_queue
+                handles.in_flight_overflow_warned = self._in_flight_overflow_warned
+        if current is None:
+            yield None
+            return
+        try:
+            with self._generation_gate.lease(
+                operation, queue_name=queue_name
+            ) as record:
+                yield record
+        except GenerationUnavailable:
+            raise QueueError(
+                "RabbitMQ connection changed while waiting for a message",
+                queue_name=queue_name,
+                operation=operation,
+            ) from None
+
+    @staticmethod
+    def _generation_is_current(
+        generation: GenerationRecord[_RabbitMQGenerationHandles],
+    ) -> bool:
+        return generation.accepting and generation.value.channel is not None
 
     def _session_is_healthy_locked(self) -> bool:
         """Return whether the atomically published channel session is usable."""
@@ -301,9 +397,15 @@ class RabbitMQBackend(Backend, QueueBackend):
         if primary_error is not None:
             raise primary_error
         if channel_close_failed:
-            logger.debug("Ignoring RabbitMQ channel-close failure")
+            try:
+                logger.debug("Ignoring RabbitMQ channel-close failure")
+            except BaseException:
+                pass
         if connection_close_failed:
-            logger.debug("Ignoring RabbitMQ connection-close failure")
+            try:
+                logger.debug("Ignoring RabbitMQ connection-close failure")
+            except BaseException:
+                pass
 
     def _publish_handles_locked(
         self,
@@ -318,12 +420,14 @@ class RabbitMQBackend(Backend, QueueBackend):
         """Install one complete session while holding ``_delivery_lock``."""
         old_channel = self._channel
         old_connection = self._connection
-        self._declared_queues.clear()
+        # Never mutate the retired generation's bookkeeping objects: an admitted
+        # operation may still be using them after the mirrors are replaced.
+        self._declared_queues = set()
         self._last_delivery_tag = None
         self._last_delivery_queue = None
-        self._in_flight_tags.clear()
+        self._in_flight_tags = set()
         self._in_flight_overflow_warned = False
-        self._pending_deliveries.clear()
+        self._pending_deliveries = {}
         self._channel_generation += 1
         self._connection = connection
         self._channel = channel
@@ -331,6 +435,7 @@ class RabbitMQBackend(Backend, QueueBackend):
         # Publish the complete ack session last. Readers see either the old
         # generation or this fully installed channel, never a mixed pair.
         self._channel_session = (self._channel_generation, channel)
+        self._publish_generation_locked()
         return old_channel, old_connection
 
     def _detach_handles_locked(
@@ -346,12 +451,14 @@ class RabbitMQBackend(Backend, QueueBackend):
         self._channel = None
         self._connection = None
         self._connection_snapshot = None
-        self._declared_queues.clear()
+        # Replace, rather than clear, these containers so a retired operation
+        # cannot write into a replacement channel's state.
+        self._declared_queues = set()
         self._last_delivery_tag = None
         self._last_delivery_queue = None
-        self._in_flight_tags.clear()
+        self._in_flight_tags = set()
         self._in_flight_overflow_warned = False
-        self._pending_deliveries.clear()
+        self._pending_deliveries = {}
         return channel, connection
 
     @configuration_error_boundary(
@@ -537,11 +644,15 @@ class RabbitMQBackend(Backend, QueueBackend):
                         return
                     if self._session_is_healthy_locked():
                         return
+                    retired_generation = self._generation_gate.retire()
                     old_channel, old_connection = self._detach_handles_locked()
                 # Retire an unhealthy generation before creating a replacement. This
                 # lets the broker recover its unacknowledged deliveries before another
                 # consumer generation becomes visible.
-                self._close_handles(old_channel, old_connection)
+                self._generation_gate.drain(
+                    retired_generation,
+                    lambda: self._close_handles(old_channel, old_connection),
+                )
             with self._delivery_lock:
                 if request_epoch != self._lifecycle_epoch:
                     return
@@ -562,6 +673,7 @@ class RabbitMQBackend(Backend, QueueBackend):
                 self._ssl_warning_emitted = True
             candidate: _RabbitMQCandidate | None = None
             published = False
+            candidate_close_started = False
             startup_error: BackendConnectionError | None = None
             try:
                 if snapshot.mode == RabbitMQMode.STANDALONE:
@@ -605,6 +717,7 @@ class RabbitMQBackend(Backend, QueueBackend):
                             published = False
                 if not published:
                     assert candidate is not None  # build try above assigned it
+                    candidate_close_started = True
                     self._close_handles(candidate.channel, candidate.connection)
                     return
                 assert candidate is not None  # build try above assigned it
@@ -632,6 +745,8 @@ class RabbitMQBackend(Backend, QueueBackend):
                 # connect() abort contract.
                 if (
                     candidate is not None
+                    and not published
+                    and not candidate_close_started
                     and self._connection is not candidate.connection
                 ):
                     # The candidate-construction/publish failure is the causal error.
@@ -805,12 +920,16 @@ class RabbitMQBackend(Backend, QueueBackend):
         """Publish prepared handles through the test-compatibility seam."""
         with self._retirement_lock:
             with self._delivery_lock:
+                retired_generation = self._generation_gate.retire()
                 old_channel, old_connection = self._detach_handles_locked()
-            self._close_handles(
-                old_channel,
-                old_connection,
-                keep_channel=channel,
-                keep_connection=connection,
+            self._generation_gate.drain(
+                retired_generation,
+                lambda: self._close_handles(
+                    old_channel,
+                    old_connection,
+                    keep_channel=channel,
+                    keep_connection=connection,
+                ),
             )
             with self._delivery_lock:
                 self._publish_handles_locked(
@@ -932,26 +1051,41 @@ class RabbitMQBackend(Backend, QueueBackend):
                 pass
 
     def disconnect(self) -> None:
-        """Fence connect intents, detach the live generation, and close it."""
-        # Invalidate the ack session before closing either handle. A concurrent
-        # stale completion can at worst retain the old channel snapshot; it can
-        # never be redirected to a later channel.
+        """Retire a channel generation, drain SDK calls, then close its handles."""
         with self._retirement_lock:
             with self._delivery_lock:
                 self._lifecycle_epoch += 1
-                channel, connection = self._detach_handles_locked()
-            self._close_handles(channel, connection)
-        # R-mq-reconnect: ack tracking was cleared before closing so it cannot leak
-        # to the next channel.
-        # Delivery tags are channel-scoped — a tag from the closed channel is
-        # invalid on the reconnect's fresh channel (basic_ack would raise
-        # PRECONDITION_FAILED). Clearing the legacy slot makes the post-reconnect
-        # ack/nack take the "nothing pending" no-op branch instead of firing a
-        # stale-tag basic_ack. The in-flight set is also channel-scoped and would
-        # otherwise leak across reconnects (unbounded token-set growth for a
-        # long-running crawler). The exact per-queue pending counters are cleared at
-        # the same boundary. At-least-once is preserved regardless — the broker
-        # requeues unacked messages on consumer disconnect.
+                retired = self._generation_gate.retire()
+                generation_handles = retired.value if retired is not None else None
+                channel = (
+                    generation_handles.channel
+                    if generation_handles is not None
+                    else self._channel
+                )
+                connection = (
+                    generation_handles.connection
+                    if generation_handles is not None
+                    else self._connection
+                )
+                self._detach_handles_locked()
+
+            cleanup_error: BaseException | None = None
+
+            def finalize() -> None:
+                nonlocal cleanup_error
+                try:
+                    self._close_handles(channel, connection)
+                except BaseException as error:
+                    cleanup_error = error
+
+            control_error = self._generation_gate.drain(retired, finalize)
+            if control_error is not None:
+                raise control_error
+            # A same-thread reentrant teardown defers this finalizer until the SDK
+            # callback releases its lease. It must not inject a late close error into
+            # that callback, so only synchronous cleanup errors are propagated here.
+            if cleanup_error is not None:
+                raise cleanup_error
 
     def is_connected(self) -> bool:
         """Check if RabbitMQ is connected.
@@ -973,9 +1107,10 @@ class RabbitMQBackend(Backend, QueueBackend):
 
     def _queue_policy_locked(
         self,
+        snapshot: _RabbitMQConnectionSnapshot | None = None,
     ) -> tuple[bool, bool, bool, int, Literal[1, 2]]:
-        """Return queue policy frozen for the published connection generation."""
-        snapshot = self._connection_snapshot
+        """Return queue policy frozen for one channel generation."""
+        snapshot = self._connection_snapshot if snapshot is None else snapshot
         if snapshot is not None:
             return (
                 snapshot.durable,
@@ -1005,7 +1140,16 @@ class RabbitMQBackend(Backend, QueueBackend):
         """
         return BackendType.RABBITMQ
 
-    def _ensure_queue_exists(self, queue_name: str) -> None:
+    def _ensure_queue_exists(
+        self,
+        queue_name: str,
+        *,
+        channel: pika.channel.Channel | None = None,
+        snapshot: _RabbitMQConnectionSnapshot | None = None,
+        declared_queues: set[str] | None = None,
+        generation: GenerationRecord[_RabbitMQGenerationHandles] | None = None,
+        operation: str = "declare",
+    ) -> None:
         """Ensure RabbitMQ queue exists.
 
         Declares the queue idempotently. After the first successful declare
@@ -1021,20 +1165,24 @@ class RabbitMQBackend(Backend, QueueBackend):
                 recovery guidance when ``PRECONDITION_FAILED`` is detected.
         """
         _validate_key_name(queue_name, "queue_name")
-        if self._channel is None:
+        target_channel = self._channel if channel is None else channel
+        target_declared = (
+            self._declared_queues if declared_queues is None else declared_queues
+        )
+        if target_channel is None:
             msg = "Not connected to RabbitMQ"
             raise QueueError(
                 msg,
                 queue_name=queue_name,
                 operation="declare",
             )
-        if queue_name in self._declared_queues:
+        if queue_name in target_declared:
             return
         durable, auto_delete, exclusive, max_priority, _delivery_mode = (
-            self._queue_policy_locked()
+            self._queue_policy_locked(snapshot)
         )
         try:
-            self._channel.queue_declare(
+            target_channel.queue_declare(
                 queue=queue_name,
                 durable=durable,
                 auto_delete=auto_delete,
@@ -1059,7 +1207,13 @@ class RabbitMQBackend(Backend, QueueBackend):
                 queue_name=queue_name,
                 operation="declare",
             ) from e
-        self._declared_queues.add(queue_name)
+        if generation is not None and not self._generation_is_current(generation):
+            raise QueueError(
+                "RabbitMQ connection changed during publish.",
+                queue_name=queue_name,
+                operation=operation,
+            )
+        target_declared.add(queue_name)
 
     # QueueBackend implementation
     @queue_operation_error_boundary(
@@ -1099,60 +1253,72 @@ class RabbitMQBackend(Backend, QueueBackend):
         connection snapshot are therefore always classified as volatile.
         """
         _validate_key_name(queue_name, "queue_name")
-        with self._delivery_lock:
-            snapshot = self._connection_snapshot
-            durable = (
-                snapshot is not None
-                and snapshot.durable is True
-                and snapshot.auto_delete is False
-                and snapshot.exclusive is False
-                and snapshot.delivery_mode == 2
-            )
-            if require_durable and not durable:
-                raise _DurablePushRequired
-            channel = self._channel
-            if channel is None:
-                msg = "Not connected to RabbitMQ"
+        with self._lease_generation("push", queue_name) as generation:
+            if generation is None:
                 raise QueueError(
-                    msg,
+                    "Not connected to RabbitMQ",
                     queue_name=queue_name,
                     operation="push",
                 )
-            try:
-                self._ensure_queue_exists(queue_name)
-                _durable, _auto_delete, _exclusive, max_priority, delivery_mode = (
-                    self._queue_policy_locked()
+            handles = generation.value
+            with self._delivery_lock:
+                snapshot = handles.snapshot
+                durable = (
+                    snapshot is not None
+                    and snapshot.durable is True
+                    and snapshot.auto_delete is False
+                    and snapshot.exclusive is False
+                    and snapshot.delivery_mode == 2
                 )
-
-                # Clamp priority to valid range
-                clamped_priority = max(0, min(int(priority), max_priority))
-
-                properties = pika.BasicProperties(
-                    priority=clamped_priority,
-                    delivery_mode=delivery_mode,
-                )
-
-                confirmed = channel.basic_publish(
-                    exchange="",
-                    routing_key=queue_name,
-                    body=item,
-                    properties=properties,
-                    mandatory=True,
-                )
-                # Pika's BlockingChannel returns None on confirmed success and raises
-                # UnroutableError/NackError on failure. Some compatible channels return
-                # a boolean instead, so reject an explicit negative confirmation too.
-                if confirmed is False:
-                    msg = "RabbitMQ publish was not confirmed."
-                    raise QueueError(msg, queue_name=queue_name, operation="push")
-            except AMQPError as e:
-                msg = f"Failed to push to queue {queue_name}: {e}"
-                raise QueueError(
-                    msg,
-                    queue_name=queue_name,
-                    operation="push",
-                ) from e
-            return _QueuePushReceipt(worker_crash_durable=durable)
+                if require_durable and not durable:
+                    raise _DurablePushRequired
+                channel = handles.channel
+                try:
+                    self._ensure_queue_exists(
+                        queue_name,
+                        channel=channel,
+                        snapshot=snapshot,
+                        declared_queues=handles.declared_queues,
+                        generation=generation,
+                        operation="push",
+                    )
+                    _durable, _auto_delete, _exclusive, max_priority, delivery_mode = (
+                        self._queue_policy_locked(snapshot)
+                    )
+                    clamped_priority = max(0, min(int(priority), max_priority))
+                    properties = pika.BasicProperties(
+                        priority=clamped_priority,
+                        delivery_mode=delivery_mode,
+                    )
+                    confirmed = channel.basic_publish(
+                        exchange="",
+                        routing_key=queue_name,
+                        body=item,
+                        properties=properties,
+                        mandatory=True,
+                    )
+                    # A teardown callback may have retired this channel after the
+                    # SDK returned. Never report that ambiguous result as success.
+                    if not self._generation_is_current(generation):
+                        raise QueueError(
+                            "RabbitMQ connection changed during publish.",
+                            queue_name=queue_name,
+                            operation="push",
+                        )
+                    if confirmed is False:
+                        raise QueueError(
+                            "RabbitMQ publish was not confirmed.",
+                            queue_name=queue_name,
+                            operation="push",
+                        )
+                except AMQPError as e:
+                    msg = f"Failed to push to queue {queue_name}: {e}"
+                    raise QueueError(
+                        msg,
+                        queue_name=queue_name,
+                        operation="push",
+                    ) from e
+                return _QueuePushReceipt(worker_crash_durable=durable)
 
     @queue_operation_error_boundary(
         "pop",
@@ -1216,7 +1382,13 @@ class RabbitMQBackend(Backend, QueueBackend):
         body, token = self._basic_get(queue_name, timeout=timeout, track_in_flight=True)
         return (body, token)
 
-    def _track_in_flight(self, token: _RabbitMQAckToken) -> None:
+    def _track_in_flight(
+        self,
+        token: _RabbitMQAckToken,
+        *,
+        in_flight_tags: set[_RabbitMQAckToken] | None = None,
+        handles: _RabbitMQGenerationHandles | None = None,
+    ) -> None:
         """Add ``token`` to the diagnostic in-flight set, bounded.
 
         R14-E: the in-flight set is diagnostic (the broker tracks delivery
@@ -1231,11 +1403,21 @@ class RabbitMQBackend(Backend, QueueBackend):
             token: The channel-scoped acknowledgement token to track.
         """
         with self._delivery_lock:
-            if len(self._in_flight_tags) < _MAX_IN_FLIGHT:
-                self._in_flight_tags.add(token)
+            target = self._in_flight_tags if in_flight_tags is None else in_flight_tags
+            warned = (
+                self._in_flight_overflow_warned
+                if handles is None
+                else handles.in_flight_overflow_warned
+            )
+            if len(target) < _MAX_IN_FLIGHT:
+                target.add(token)
                 return
-            if not self._in_flight_overflow_warned:
-                self._in_flight_overflow_warned = True
+            if not warned:
+                if handles is None:
+                    self._in_flight_overflow_warned = True
+                else:
+                    handles.in_flight_overflow_warned = True
+                    self._in_flight_overflow_warned = True
                 # The message and its broker-side acknowledgement state are already
                 # established. This is diagnostics only: a broken log handler must
                 # not turn a successfully claimed delivery into a failed pop.
@@ -1250,21 +1432,37 @@ class RabbitMQBackend(Backend, QueueBackend):
                 except BaseException:
                     pass
 
-    def _record_pending_delivery(self, queue_name: str) -> None:
-        """Record one broker-unacked delivery while holding ``_delivery_lock``."""
-        self._pending_deliveries[queue_name] = (
-            self._pending_deliveries.get(queue_name, 0) + 1
+    def _record_pending_delivery(
+        self,
+        queue_name: str,
+        pending_deliveries: dict[str, int] | None = None,
+    ) -> None:
+        """Record one broker-unacked delivery while holding the lock."""
+        target = (
+            self._pending_deliveries
+            if pending_deliveries is None
+            else pending_deliveries
         )
+        target[queue_name] = target.get(queue_name, 0) + 1
 
-    def _settle_pending_delivery(self, queue_name: str | None) -> None:
-        """Release one queue barrier count after a confirmed ack or nack."""
+    def _settle_pending_delivery(
+        self,
+        queue_name: str | None,
+        pending_deliveries: dict[str, int] | None = None,
+    ) -> None:
+        """Release one queue barrier count after a confirmed settlement."""
         if queue_name is None:
             return
-        pending = self._pending_deliveries.get(queue_name, 0)
+        target = (
+            self._pending_deliveries
+            if pending_deliveries is None
+            else pending_deliveries
+        )
+        pending = target.get(queue_name, 0)
         if pending <= 1:
-            self._pending_deliveries.pop(queue_name, None)
+            target.pop(queue_name, None)
         else:
-            self._pending_deliveries[queue_name] = pending - 1
+            target[queue_name] = pending - 1
 
     def _basic_get(
         self,
@@ -1292,71 +1490,89 @@ class RabbitMQBackend(Backend, QueueBackend):
         """
         _validate_key_name(queue_name, "queue_name")
         deadline = time.monotonic() + timeout if timeout > 0 else None
-        expected_generation: int | None = None
-        try:
-            while True:
-                with self._delivery_lock:
-                    session = self._channel_session
-                    if session is None:
-                        raise QueueError(
-                            "Not connected to RabbitMQ",
-                            queue_name=queue_name,
-                            operation="pop",
-                        )
-                    if expected_generation is None:
-                        expected_generation = session[0]
-                    elif session[0] != expected_generation:
-                        raise QueueError(
-                            "RabbitMQ connection changed while waiting for a message",
-                            queue_name=queue_name,
-                            operation="pop",
-                        )
-                    self._ensure_queue_exists(queue_name)
-                    channel_generation, channel = session
-                    method_frame, _header_frame, body = channel.basic_get(
-                        queue=queue_name,
-                        auto_ack=False,
-                    )
-
-                    if method_frame:
-                        delivery_tag = method_frame.delivery_tag
-                        token = _RabbitMQAckToken(
-                            delivery_tag,
-                            channel_generation,
+        with self._lease_generation("pop", queue_name) as generation:
+            if generation is None:
+                raise QueueError(
+                    "Not connected to RabbitMQ",
+                    queue_name=queue_name,
+                    operation="pop",
+                )
+            handles = generation.value
+            channel_generation = handles.channel_generation
+            channel = handles.channel
+            try:
+                while True:
+                    with self._delivery_lock:
+                        if not self._generation_is_current(generation):
+                            raise QueueError(
+                                "RabbitMQ connection changed while waiting for a message",
+                                queue_name=queue_name,
+                                operation="pop",
+                            )
+                        self._ensure_queue_exists(
                             queue_name,
-                        )
-                        self._record_pending_delivery(queue_name)
-                        if track_in_flight:
-                            self._track_in_flight(token)
-                        else:
-                            self._last_delivery_tag = delivery_tag
-                            self._last_delivery_queue = queue_name
-                        return (body, token)
-                if deadline is None:
-                    return (None, None)
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return (None, None)
-                with self._delivery_lock:
-                    session = self._channel_session
-                    if session is None or session[0] != expected_generation:
-                        raise QueueError(
-                            "RabbitMQ connection changed while waiting for a message",
-                            queue_name=queue_name,
+                            channel=channel,
+                            snapshot=handles.snapshot,
+                            declared_queues=handles.declared_queues,
+                            generation=generation,
                             operation="pop",
                         )
-                    connection = self._connection
-                    if connection is not None:
-                        connection.process_data_events(time_limit=min(0.05, remaining))
-                    else:
-                        time.sleep(min(0.05, remaining))
-        except AMQPError as e:
-            msg = f"Failed to pop from queue {queue_name}: {e}"
-            raise QueueError(
-                msg,
-                queue_name=queue_name,
-                operation="pop",
-            ) from e
+                        method_frame, _header_frame, body = channel.basic_get(
+                            queue=queue_name,
+                            auto_ack=False,
+                        )
+                        if method_frame:
+                            delivery_tag = method_frame.delivery_tag
+                            token = _RabbitMQAckToken(
+                                delivery_tag,
+                                channel_generation,
+                                queue_name,
+                            )
+                            self._record_pending_delivery(
+                                queue_name, handles.pending_deliveries
+                            )
+                            if track_in_flight:
+                                self._track_in_flight(
+                                    token,
+                                    in_flight_tags=handles.in_flight_tags,
+                                    handles=handles,
+                                )
+                            else:
+                                handles.last_delivery_tag = delivery_tag
+                                handles.last_delivery_queue = queue_name
+                            if not self._generation_is_current(generation):
+                                raise QueueError(
+                                    "RabbitMQ connection changed while waiting for a message",
+                                    queue_name=queue_name,
+                                    operation="pop",
+                                )
+                            # Keep compatibility mirrors coherent only while this
+                            # exact generation is still accepting admissions.
+                            self._last_delivery_tag = handles.last_delivery_tag
+                            self._last_delivery_queue = handles.last_delivery_queue
+                            return (body, token)
+                    if deadline is None:
+                        return (None, None)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return (None, None)
+                    with self._delivery_lock:
+                        if not self._generation_is_current(generation):
+                            raise QueueError(
+                                "RabbitMQ connection changed while waiting for a message",
+                                queue_name=queue_name,
+                                operation="pop",
+                            )
+                        handles.connection.process_data_events(
+                            time_limit=min(0.05, remaining)
+                        )
+            except AMQPError as e:
+                msg = f"Failed to pop from queue {queue_name}: {e}"
+                raise QueueError(
+                    msg,
+                    queue_name=queue_name,
+                    operation="pop",
+                ) from e
 
     @queue_operation_error_boundary(
         "ack",
@@ -1388,40 +1604,61 @@ class RabbitMQBackend(Backend, QueueBackend):
         Raises:
             QueueError: If ``basic_ack`` fails at the AMQP layer.
         """
-        if token is not None:
-            if not isinstance(token, _RabbitMQAckToken):
+        if token is not None and not isinstance(token, _RabbitMQAckToken):
+            return
+        with self._lease_generation("ack", queue_name) as generation:
+            if generation is None:
                 return
+            handles = generation.value
             with self._delivery_lock:
-                if token._completed:
+                if token is not None:
+                    if (
+                        token._completed
+                        or token.channel_generation != handles.channel_generation
+                    ):
+                        return
+                    try:
+                        handles.channel.basic_ack(
+                            delivery_tag=token.delivery_tag, multiple=False
+                        )
+                    except AMQPError as e:
+                        msg = f"Failed to ack RabbitMQ message: {e}"
+                        raise QueueError(
+                            msg, queue_name=queue_name, operation="ack"
+                        ) from e
+                    token._completed = True
+                    handles.in_flight_tags.discard(token)
+                    self._settle_pending_delivery(
+                        token.queue_name, handles.pending_deliveries
+                    )
+                    if not self._generation_is_current(generation):
+                        raise QueueError(
+                            "RabbitMQ connection changed during publish.",
+                            queue_name=queue_name,
+                            operation="ack",
+                        )
                     return
-                session = self._channel_session
-                if session is None or token.channel_generation != session[0]:
+                tag = handles.last_delivery_tag
+                if tag is None:
                     return
-                channel = session[1]
                 try:
-                    channel.basic_ack(delivery_tag=token.delivery_tag, multiple=False)
+                    handles.channel.basic_ack(delivery_tag=tag)
                 except AMQPError as e:
                     msg = f"Failed to ack RabbitMQ message: {e}"
                     raise QueueError(msg, queue_name=queue_name, operation="ack") from e
-                else:
-                    token._completed = True
-                    self._in_flight_tags.discard(token)
-                    self._settle_pending_delivery(token.queue_name)
-            return
-        # Legacy path: ack the tracked last-popped tag.
-        with self._delivery_lock:
-            session = self._channel_session
-            if session is None or self._last_delivery_tag is None:
-                return
-            try:
-                session[1].basic_ack(delivery_tag=self._last_delivery_tag)
-            except AMQPError as e:
-                msg = f"Failed to ack RabbitMQ message: {e}"
-                raise QueueError(msg, queue_name=queue_name, operation="ack") from e
-            else:
-                self._settle_pending_delivery(self._last_delivery_queue)
+                self._settle_pending_delivery(
+                    handles.last_delivery_queue, handles.pending_deliveries
+                )
+                handles.last_delivery_tag = None
+                handles.last_delivery_queue = None
                 self._last_delivery_tag = None
                 self._last_delivery_queue = None
+                if not self._generation_is_current(generation):
+                    raise QueueError(
+                        "RabbitMQ connection changed during publish.",
+                        queue_name=queue_name,
+                        operation="ack",
+                    )
 
     @queue_operation_error_boundary(
         "nack",
@@ -1443,45 +1680,63 @@ class RabbitMQBackend(Backend, QueueBackend):
         Raises:
             QueueError: If ``basic_nack`` fails at the AMQP layer.
         """
-        if token is not None:
-            if not isinstance(token, _RabbitMQAckToken):
+        if token is not None and not isinstance(token, _RabbitMQAckToken):
+            return
+        with self._lease_generation("nack", queue_name) as generation:
+            if generation is None:
                 return
+            handles = generation.value
             with self._delivery_lock:
-                if token._completed:
+                if token is not None:
+                    if (
+                        token._completed
+                        or token.channel_generation != handles.channel_generation
+                    ):
+                        return
+                    try:
+                        handles.channel.basic_nack(
+                            delivery_tag=token.delivery_tag, requeue=True
+                        )
+                    except AMQPError as e:
+                        msg = f"Failed to nack RabbitMQ message: {e}"
+                        raise QueueError(
+                            msg, queue_name=queue_name, operation="nack"
+                        ) from e
+                    token._completed = True
+                    handles.in_flight_tags.discard(token)
+                    self._settle_pending_delivery(
+                        token.queue_name, handles.pending_deliveries
+                    )
+                    if not self._generation_is_current(generation):
+                        raise QueueError(
+                            "RabbitMQ connection changed during publish.",
+                            queue_name=queue_name,
+                            operation="nack",
+                        )
                     return
-                session = self._channel_session
-                if session is None or token.channel_generation != session[0]:
+                tag = handles.last_delivery_tag
+                if tag is None:
                     return
-                channel = session[1]
                 try:
-                    channel.basic_nack(delivery_tag=token.delivery_tag, requeue=True)
+                    handles.channel.basic_nack(delivery_tag=tag, requeue=True)
                 except AMQPError as e:
                     msg = f"Failed to nack RabbitMQ message: {e}"
                     raise QueueError(
                         msg, queue_name=queue_name, operation="nack"
                     ) from e
-                else:
-                    token._completed = True
-                    self._in_flight_tags.discard(token)
-                    self._settle_pending_delivery(token.queue_name)
-            return
-        # Legacy path: nack the tracked last-popped tag.
-        with self._delivery_lock:
-            session = self._channel_session
-            if session is None or self._last_delivery_tag is None:
-                return
-            try:
-                session[1].basic_nack(
-                    delivery_tag=self._last_delivery_tag,
-                    requeue=True,
+                self._settle_pending_delivery(
+                    handles.last_delivery_queue, handles.pending_deliveries
                 )
-            except AMQPError as e:
-                msg = f"Failed to nack RabbitMQ message: {e}"
-                raise QueueError(msg, queue_name=queue_name, operation="nack") from e
-            else:
-                self._settle_pending_delivery(self._last_delivery_queue)
+                handles.last_delivery_tag = None
+                handles.last_delivery_queue = None
                 self._last_delivery_tag = None
                 self._last_delivery_queue = None
+                if not self._generation_is_current(generation):
+                    raise QueueError(
+                        "RabbitMQ connection changed during publish.",
+                        queue_name=queue_name,
+                        operation="nack",
+                    )
 
     @queue_operation_error_boundary(
         "queue_len",
@@ -1502,28 +1757,38 @@ class RabbitMQBackend(Backend, QueueBackend):
             QueueError: If the queue_len operation fails.
         """
         _validate_key_name(queue_name, "queue_name")
-        with self._delivery_lock:
-            channel = self._channel
-            if channel is None:
-                msg = "Not connected to RabbitMQ"
-                raise QueueError(msg, queue_name=queue_name, operation="queue_len")
-            try:
-                # R139-F2: a passive declare of a never-created queue is answered
-                # by the broker with a 404 that closes the channel (queue_len
-                # would raise instead of returning 0). Declare first, mirroring
-                # push/_basic_get, so the passive probe can only hit an existing
-                # queue.
-                self._ensure_queue_exists(queue_name)
-                result = channel.queue_declare(
-                    queue=queue_name,
-                    passive=True,
-                )
-            except AMQPError as e:
-                msg = f"Failed to get queue length for {queue_name}: {e}"
+        with self._lease_generation("queue_len", queue_name) as generation:
+            if generation is None:
                 raise QueueError(
-                    msg, queue_name=queue_name, operation="queue_len"
-                ) from e
-            return cast(int, result.method.message_count)
+                    "Not connected to RabbitMQ",
+                    queue_name=queue_name,
+                    operation="queue_len",
+                )
+            handles = generation.value
+            with self._delivery_lock:
+                channel = handles.channel
+                try:
+                    self._ensure_queue_exists(
+                        queue_name,
+                        channel=channel,
+                        snapshot=handles.snapshot,
+                        declared_queues=handles.declared_queues,
+                        generation=generation,
+                        operation="queue_len",
+                    )
+                    result = channel.queue_declare(queue=queue_name, passive=True)
+                    if not self._generation_is_current(generation):
+                        raise QueueError(
+                            "RabbitMQ connection changed while waiting for a message",
+                            queue_name=queue_name,
+                            operation="queue_len",
+                        )
+                except AMQPError as e:
+                    msg = f"Failed to get queue length for {queue_name}: {e}"
+                    raise QueueError(
+                        msg, queue_name=queue_name, operation="queue_len"
+                    ) from e
+                return cast(int, result.method.message_count)
 
     @queue_operation_error_boundary(
         "clear_queue",
@@ -1548,32 +1813,42 @@ class RabbitMQBackend(Backend, QueueBackend):
                 at the AMQP layer.
         """
         _validate_key_name(queue_name, "queue_name")
-        with self._delivery_lock:
-            session = self._channel_session
-            if session is None:
+        with self._lease_generation("clear_queue", queue_name) as generation:
+            if generation is None:
                 raise QueueError(
                     "Not connected to RabbitMQ",
                     queue_name=queue_name,
                     operation="clear_queue",
                 )
-            pending = self._pending_deliveries.get(queue_name, 0)
-            if pending:
-                raise QueueError(
-                    "Cannot clear RabbitMQ queue while deliveries are in-flight.",
-                    queue_name=queue_name,
-                    operation="clear_queue",
-                )
-            try:
-                # R139-F3: queue_purge of a never-created queue is answered by
-                # the broker with a 404 that closes the channel (sibling Redis
-                # DEL / Mongo delete_many are silent no-ops on missing keys).
-                # Declare first so purging a fresh queue is a harmless no-op.
-                self._ensure_queue_exists(queue_name)
-                session[1].queue_purge(queue=queue_name)
-            except AMQPError as e:
-                msg = f"Failed to clear queue {queue_name}: {e}"
-                raise QueueError(
-                    msg,
-                    queue_name=queue_name,
-                    operation="clear_queue",
-                ) from e
+            handles = generation.value
+            with self._delivery_lock:
+                pending = handles.pending_deliveries.get(queue_name, 0)
+                if pending:
+                    raise QueueError(
+                        "Cannot clear RabbitMQ queue while deliveries are in-flight.",
+                        queue_name=queue_name,
+                        operation="clear_queue",
+                    )
+                try:
+                    self._ensure_queue_exists(
+                        queue_name,
+                        channel=handles.channel,
+                        snapshot=handles.snapshot,
+                        declared_queues=handles.declared_queues,
+                        generation=generation,
+                        operation="clear_queue",
+                    )
+                    handles.channel.queue_purge(queue=queue_name)
+                    if not self._generation_is_current(generation):
+                        raise QueueError(
+                            "RabbitMQ connection changed while waiting for a message",
+                            queue_name=queue_name,
+                            operation="clear_queue",
+                        )
+                except AMQPError as e:
+                    msg = f"Failed to clear queue {queue_name}: {e}"
+                    raise QueueError(
+                        msg,
+                        queue_name=queue_name,
+                        operation="clear_queue",
+                    ) from e

@@ -681,6 +681,26 @@ def test_connect_uses_one_validated_settings_snapshot(mocker) -> None:
     )
 
 
+def test_operations_use_immutable_settings_from_connected_generation(mocker) -> None:
+    """Post-connect setting mutation cannot retarget or reject old clients."""
+    backend, producer, _consumer, message_cls = _make_connected_backend(
+        mocker,
+        topic_prefix="original",
+        max_message_size=10,
+    )
+    message = MagicMock()
+    message_cls.return_value = message
+    config = backend.config
+    config.topic_prefix = "mutated"
+    config.max_message_size = 1
+    config.invisible_duration = 1
+
+    backend.push("jobs", b"payload")
+
+    assert message.topic == "original_jobs"
+    producer.send.assert_called_once_with(message)
+
+
 def test_send_timeout_field_rejects_above_ceiling():
     """R22-A: ``send_timeout`` has a 5 min (300_000 ms) ceiling so a stray-zero
     typo (e.g. a microseconds copy-paste) cannot wedge the gRPC per-RPC deadline
@@ -925,6 +945,25 @@ def test_disconnect_connected(mocker) -> None:
     mock_consumer.shutdown.assert_called_once()
     assert backend._producer is None
     assert backend._consumer is None
+
+
+def test_shutdown_fallback_offers_candidate_exactly_once_after_thread_start_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = MagicMock()
+    real_start = threading.Thread.start
+
+    def fail_shutdown_thread_start(worker: threading.Thread) -> None:
+        if worker.name.startswith("rocketmq-shutdown-"):
+            raise RuntimeError("thread start interrupted")
+        real_start(worker)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_shutdown_thread_start)
+
+    cleanup_failed = RocketMQBackend._shutdown_detached_clients((client, "producer"))
+
+    assert cleanup_failed is True
+    client.shutdown.assert_called_once_with()
 
 
 def test_disconnect_reports_typed_shutdown_failure_after_closing_peers(mocker) -> None:

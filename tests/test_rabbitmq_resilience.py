@@ -15,6 +15,7 @@ from unittest.mock import MagicMock
 import pytest
 from pika.exceptions import AMQPError
 
+from scrapy_extension.backends._generation import GenerationUnavailable
 from scrapy_extension.backends.rabbitmq import (
     _MAX_IN_FLIGHT,
     RabbitMQBackend,
@@ -45,6 +46,26 @@ def _token(backend: RabbitMQBackend, delivery_tag: int) -> _RabbitMQAckToken:
 # ---------------------------------------------------------------------------
 # _connect_cluster null-on-failure cleanup (lines 304-311, R14-E)
 # ---------------------------------------------------------------------------
+
+
+def test_operation_lease_maps_generation_race_to_typed_queue_error(mocker) -> None:
+    backend, _channel = _connected_backend()
+    mocker.patch.object(
+        backend._generation_gate,
+        "lease",
+        side_effect=GenerationUnavailable("push", "jobs"),
+    )
+
+    with pytest.raises(QueueError) as exc_info:
+        with backend._lease_generation("push", "jobs"):
+            pass
+
+    assert (
+        str(exc_info.value) == "RabbitMQ connection changed while waiting for a message"
+    )
+    assert exc_info.value.queue_name == "jobs"
+    assert exc_info.value.operation == "push"
+    backend.disconnect()
 
 
 def test_connect_cluster_cleans_up_on_qos_failure(mocker) -> None:
