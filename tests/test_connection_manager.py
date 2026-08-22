@@ -203,6 +203,27 @@ def test_close_sanitizes_failed_registry_key_normalization():
     _assert_package_traceback_locals_are_redacted(error, marker)
 
 
+def test_close_tears_down_live_backend_when_registry_key_validation_fails(mocker):
+    """Malformed mutable settings must not strand an already-live backend."""
+
+    class _ExplosiveRegistryValue:
+        def __getattribute__(self, name: str) -> object:
+            if name == "__dict__":
+                raise RuntimeError("normalization failed")
+            return super().__getattribute__(name)
+
+    manager = ConnectionManager("redis", {"value": _ExplosiveRegistryValue()})
+    backend = mocker.MagicMock()
+    manager._backend = backend
+
+    with pytest.raises(ConfigurationError):
+        manager.close()
+
+    backend.disconnect.assert_called_once_with()
+    assert manager._backend is None
+    assert manager._retired is True
+
+
 def test_connection_manager_get_manager_singleton():
     """Test that get_manager returns singleton for same params."""
     manager1 = ConnectionManager.get_manager(BackendType.REDIS)

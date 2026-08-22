@@ -140,7 +140,7 @@ _SAFE_MANAGER_CONNECTION_MESSAGES: frozenset[str] = frozenset(
     {
         "Cannot connect a released ConnectionManager",
         "Cannot access a released ConnectionManager",
-        "ConnectionManager was released while connecting",
+        "Connection manager was released while connecting",
         "connect() did not produce a backend",
         "Connection completed after ConnectionManager release; backend discarded",
     }

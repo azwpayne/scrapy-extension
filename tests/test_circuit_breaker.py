@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 import time
+import traceback
 from typing import Any
 
 import pytest
@@ -20,9 +21,16 @@ from scrapy_extension.backends.circuit_breaker import (
     CircuitBreakerOpenError,
     _BackendProxyBase,
     _CallAdmission,
+    _ProtectedBoundOperation,
     wrap_queue_backend,
     wrap_set_backend,
     wrap_storage_backend,
+)
+from scrapy_extension.exceptions import (
+    BackendConnectionError,
+    BackendError,
+    QueueError,
+    StorageError,
 )
 
 # ---------------------------------------------------------------------------
@@ -115,6 +123,21 @@ class TestCircuitBreakerConstruction:
         b = CircuitBreaker("x", reset_timeout=CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S)
         assert b.reset_timeout == CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S
 
+    def test_new_generation_is_closed_and_keeps_clock_policy(self):
+        clock = FakeClock()
+        original = CircuitBreaker(
+            "redis-queue", failure_threshold=2, reset_timeout=4.0, time_fn=clock
+        )
+        replacement = original.new_generation()
+
+        assert replacement is not original
+        assert replacement.name == original.name
+        assert replacement.failure_threshold == 2
+        assert replacement.reset_timeout == 4.0
+        assert replacement.state is BreakerState.CLOSED
+        assert replacement.last_failure_time is None
+        assert replacement._time_fn is clock
+
 
 # ---------------------------------------------------------------------------
 # CLOSED → OPEN at threshold
@@ -181,6 +204,17 @@ class TestOpenRejectsFast:
         with pytest.raises(CircuitBreakerOpenError) as exc_info:
             b.call(_ok)
         assert isinstance(exc_info.value, BackendError)
+
+    def test_open_error_does_not_render_transport_name(self):
+        b = CircuitBreaker(
+            "https://user:secret@example.test/queue", failure_threshold=1
+        )
+        with pytest.raises(RuntimeError):
+            b.call(_boom)
+        with pytest.raises(CircuitBreakerOpenError) as exc_info:
+            b.call(_ok)
+        assert exc_info.value.name == "backend-operation"
+        assert "secret" not in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
@@ -534,6 +568,17 @@ class TestSignalPassthrough:
             b.call(raises_se)
         assert b.state is BreakerState.CLOSED
 
+    def test_generator_exit_does_not_trip(self):
+        b = CircuitBreaker("q", failure_threshold=1)
+
+        def raises_generator_exit(*_args, **_kwargs):
+            raise GeneratorExit()
+
+        with pytest.raises(GeneratorExit):
+            b.call(raises_generator_exit)
+        assert b.state is BreakerState.CLOSED
+        assert b.failure_count == 0
+
 
 class TestCountedFailureContract:
     def test_non_counted_exception_does_not_trip_or_reset_failures(self):
@@ -767,6 +812,23 @@ class _FakeStorageBackend(StorageBackend):
 
 
 class TestQueueBackendProxy:
+    def test_missing_plugin_methods_fail_closed_instead_of_hitting_abc_stubs(self):
+        class _MissingMethods:
+            def push(self, *_args: Any, **_kwargs: Any) -> None:
+                return None
+
+        proxy = wrap_queue_backend(_MissingMethods(), CircuitBreaker("q"))
+        assert proxy.requires_ack is False
+        assert proxy.supports_concurrent_ack is False
+
+        with pytest.raises(QueueError) as exc_info:
+            proxy.pop("q")
+
+        assert type(exc_info.value) is QueueError
+        assert str(exc_info.value) == "Backend operation is unavailable."
+        assert exc_info.value.operation == "pop"
+        assert exc_info.value.__context__ is None
+
     def test_isinstance_preserved(self):
         b = CircuitBreaker("q", failure_threshold=2)
         wrapped = wrap_queue_backend(_FakeQueueBackend(), b)
@@ -780,8 +842,10 @@ class TestQueueBackendProxy:
         breaker = CircuitBreaker("q", failure_threshold=1)
         wrapped = wrap_queue_backend(backend, breaker)
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(QueueError) as exc_info:
             wrapped.push("q", b"x")
+        assert str(exc_info.value) == "Backend operation failed."
+        assert exc_info.value.operation == "push"
         assert breaker.state is BreakerState.OPEN
 
         # The OPEN breaker rejects push WITHOUT calling the backend.
@@ -806,8 +870,10 @@ class TestQueueBackendProxy:
         wrapped = wrap_queue_backend(backend, breaker)
 
         # Trip the breaker via pop.
-        with pytest.raises(RuntimeError):
+        with pytest.raises(QueueError) as exc_info:
             wrapped.pop("q")
+        assert str(exc_info.value) == "Backend operation failed."
+        assert exc_info.value.operation == "pop"
         assert breaker.state is BreakerState.OPEN
 
         # Non-network admin methods must still work — they are NOT blocked by the
@@ -818,8 +884,8 @@ class TestQueueBackendProxy:
         # is_connected forwards to the wrapped backend.
         assert wrapped.is_connected() is True
 
-    def test_admin_runtime_error_stays_raw_without_affecting_breaker(self):
-        """Unknown plugin exceptions remain a raw non-counting admin contract."""
+    def test_admin_runtime_error_is_sanitized_without_affecting_breaker(self):
+        """Ordinary plugin failures are typed but remain non-counting admin errors."""
         backend = _FakeQueueBackend()
         expected_error = RuntimeError("plugin queue-length failure")
 
@@ -830,17 +896,20 @@ class TestQueueBackendProxy:
         breaker = CircuitBreaker("q", failure_threshold=1)
         wrapped = wrap_queue_backend(backend, breaker)
 
-        with pytest.raises(RuntimeError) as exc_info:
+        with pytest.raises(QueueError) as exc_info:
             wrapped.queue_len("q")
 
-        assert exc_info.value is expected_error
+        assert str(exc_info.value) == "Backend operation failed."
+        assert exc_info.value.operation == "queue_len"
+        assert str(expected_error) not in str(exc_info.value)
         assert breaker.state is BreakerState.CLOSED
         assert breaker.failure_count == 0
 
-    def test_lifecycle_runtime_error_stays_raw_forward(self):
-        """Only I/O admin forwards are protected; lifecycle methods stay raw."""
+    def test_lifecycle_runtime_error_is_sanitized_without_affecting_breaker(self):
+        """Lifecycle forwards use the non-counting privacy boundary."""
+        marker = "plugin-connect-private-marker"
         backend = _FakeQueueBackend()
-        expected_error = RuntimeError("plugin connect failure")
+        expected_error = RuntimeError(marker)
 
         def _connect_fails() -> None:
             raise expected_error
@@ -849,10 +918,19 @@ class TestQueueBackendProxy:
         breaker = CircuitBreaker("q", failure_threshold=1)
         wrapped = wrap_queue_backend(backend, breaker)
 
-        with pytest.raises(RuntimeError) as exc_info:
+        with pytest.raises(BackendError) as exc_info:
             wrapped.connect()
 
-        assert exc_info.value is expected_error
+        error = exc_info.value
+        assert type(error) is BackendError
+        assert str(error) == "Backend operation failed."
+        assert marker not in str(error)
+        assert marker not in repr(error.args)
+        assert marker not in repr(error.__dict__)
+        assert marker not in repr(error)
+        assert marker not in "".join(traceback.format_exception(error))
+        assert error.__cause__ is None
+        assert error.__context__ is None
         assert breaker.state is BreakerState.CLOSED
         assert breaker.failure_count == 0
 
@@ -1009,8 +1087,10 @@ class TestQueueBackendProxy:
         breaker = CircuitBreaker("q", failure_threshold=1)
         wrapped = wrap_queue_backend(backend, breaker)
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(QueueError) as exc_info:
             wrapped.pop_with_ack("q", 0.0)
+        assert str(exc_info.value) == "Backend operation failed."
+        assert exc_info.value.operation == "pop"
         # The backend override WAS called (not the ABC default that calls self.pop).
         assert calls == [("q", 0.0)]
         # And the breaker recorded the failure (pop_with_ack is hot-path).
@@ -1028,8 +1108,9 @@ class TestSetBackendProxy:
         wrapped = wrap_set_backend(backend, breaker)
         assert isinstance(wrapped, SetBackend)
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(BackendConnectionError) as exc_info:
             wrapped.add("s", b"x")
+        assert str(exc_info.value) == "Backend operation failed."
         assert breaker.state is BreakerState.OPEN
         # non-hot-path forwarded
         wrapped.clear_set("s")
@@ -1045,8 +1126,10 @@ class TestStorageBackendProxy:
         wrapped = wrap_storage_backend(backend, breaker)
         assert isinstance(wrapped, StorageBackend)
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(StorageError) as exc_info:
             wrapped.store("k", b"v")
+        assert str(exc_info.value) == "Backend operation failed."
+        assert exc_info.value.operation == "store"
         assert breaker.state is BreakerState.OPEN
         # exists / clear_storage are NOT hot-path -> forwarded through __getattr__
         assert wrapped.exists("k") is False
@@ -1060,6 +1143,32 @@ class TestStorageBackendProxy:
         wrapped.store("k", b"v", ttl=10)
         assert backend.stored == [("k", b"v")]
         assert breaker.failure_count == 0
+
+    def test_list_storage_keys_sanitizes_third_party_failures(self):
+        backend = _FakeStorageBackend()
+        backend.list_storage_keys = lambda prefix="", *, limit=1000: (
+            _ for _ in ()
+        ).throw(NotImplementedError)  # type: ignore[method-assign]
+        wrapped = wrap_storage_backend(backend, CircuitBreaker("st"))
+
+        with pytest.raises(StorageError) as exc_info:
+            wrapped.list_storage_keys("queue:", limit=10)
+        assert str(exc_info.value) == "Backend operation failed."
+        assert exc_info.value.operation == "list_storage_keys"
+
+    def test_list_storage_keys_sanitizes_package_errors(self):
+        backend = _FakeStorageBackend()
+
+        def fail(*_args, **_kwargs):
+            raise StorageError("secret storage detail", operation="list_storage_keys")
+
+        backend.list_storage_keys = fail  # type: ignore[method-assign]
+        wrapped = wrap_storage_backend(backend, CircuitBreaker("st"))
+
+        with pytest.raises(StorageError) as exc_info:
+            wrapped.list_storage_keys("queue:")
+        assert str(exc_info.value) == "Backend operation failed."
+        assert exc_info.value.operation == "list_storage_keys"
 
 
 # ---------------------------------------------------------------------------
@@ -1086,8 +1195,10 @@ class TestQueueLenNotHotPath:
 
         # Hammer queue_len well past the failure threshold.
         for _ in range(10):
-            with pytest.raises(RuntimeError):
+            with pytest.raises(QueueError) as exc_info:
                 wrapped.queue_len("q")
+            assert str(exc_info.value) == "Backend operation failed."
+            assert exc_info.value.operation == "queue_len"
 
         # Breaker must remain CLOSED — queue_len is an admin probe, not traffic.
         assert breaker.state is BreakerState.CLOSED
@@ -1234,3 +1345,91 @@ class TestBackendProxyBaseConstructionSkips:
 
         # custom_attr is not a method bound in __init__ → __getattr__ forwards it.
         assert proxy.custom_attr == "forwarded-value"
+        with pytest.raises(BackendError) as missing_info:
+            getattr(proxy, "missing_backend_attribute")
+        assert str(missing_info.value) == "Backend attribute is unavailable."
+        assert missing_info.value.__cause__ is None
+        assert missing_info.value.__context__ is None
+
+    def test_initialization_and_getattr_failures_publish_static_errors(self) -> None:
+        marker = "proxy-lookup-private-marker"
+
+        class _ExplosiveBackend:
+            def __getattribute__(self, name: str) -> object:
+                if name in {"push", "connect", "private_attr"}:
+                    raise RuntimeError(marker)
+                return object.__getattribute__(self, name)
+
+        class _PartialProxy(_BackendProxyBase):
+            _HOT_PATH = ("push",)
+            _FORWARDED = ("connect",)
+
+        proxy = _PartialProxy(_ExplosiveBackend(), CircuitBreaker("q"))
+
+        # Constructor lookup failures install a safe callable rather than
+        # retaining the plugin exception in a proxy attribute or traceback.
+        with pytest.raises(BackendError) as hot_info:
+            proxy.push("queue", b"payload")
+        with pytest.raises(BackendError) as lifecycle_info:
+            proxy.connect()
+        with pytest.raises(BackendError) as attr_info:
+            getattr(proxy, "private_attr")
+
+        for info in (hot_info, lifecycle_info, attr_info):
+            error = info.value
+            assert marker not in repr(error.args)
+            assert marker not in repr(error.__dict__)
+            assert marker not in repr(error)
+            assert marker not in str(error)
+            assert marker not in "".join(traceback.format_exception(error))
+            assert error.__cause__ is None
+            assert error.__context__ is None
+
+    def test_bound_operation_returns_static_error_after_backend_disappears(
+        self,
+    ) -> None:
+        marker = "weak-backend-private-marker"
+
+        class _EphemeralBackend:
+            def push(self, queue_name: str, item: bytes) -> None:
+                del queue_name
+                del item
+                raise RuntimeError(marker)
+
+        def make_operation() -> _ProtectedBoundOperation:
+            backend = _EphemeralBackend()
+            return _ProtectedBoundOperation(
+                CircuitBreaker("q"), backend, "push", backend.push
+            )
+
+        operation = make_operation()
+        import gc
+
+        gc.collect()
+        with pytest.raises(BackendError) as exc_info:
+            operation("queue", b"payload")
+
+        error = exc_info.value
+        assert type(error) is BackendError
+        assert str(error) == "Backend operation is unavailable."
+        assert marker not in repr(error.args)
+        assert marker not in repr(error.__dict__)
+        assert marker not in "".join(traceback.format_exception(error))
+
+    def test_proxy_preserves_identity_of_direct_baseexception(self) -> None:
+        class PluginSignal(BaseException):
+            pass
+
+        signal = PluginSignal()
+        backend = _FakeQueueBackend()
+
+        def raise_signal(*_args: Any, **_kwargs: Any) -> None:
+            raise signal
+
+        backend.push = raise_signal  # type: ignore[method-assign]
+        proxy = wrap_queue_backend(backend, CircuitBreaker("q"))
+
+        with pytest.raises(PluginSignal) as exc_info:
+            proxy.push("queue", b"payload")
+
+        assert exc_info.value is signal

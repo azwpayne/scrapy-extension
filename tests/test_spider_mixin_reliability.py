@@ -13,6 +13,7 @@ from twisted.internet.defer import Deferred
 from scrapy_extension.backends.base import BackendType
 from scrapy_extension.backends.connectors import ConnectionManager
 from scrapy_extension.exceptions import QueueError
+from scrapy_extension.spider import spider_mixin as spider_module
 from scrapy_extension.spider.spider_mixin import (
     BackendSpiderMixin,
     _ComponentConstruction,
@@ -29,6 +30,54 @@ def _spider_with_manager(mocker):
     spider = _Spider()
     spider._connection_manager = mocker.MagicMock(spec=ConnectionManager)
     return spider
+
+
+def test_spider_queue_close_submission_failure_is_retryable(monkeypatch) -> None:
+    class Queue:
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "scrapy_extension.queue.queue.BackendQueue",
+        Queue,
+    )
+    monkeypatch.setattr(spider_module, "reactor_is_running", lambda: True)
+    jobs: list[object] = []
+    workers: list[Deferred[object]] = []
+    attempts = 0
+
+    def submit(function, *_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("queue close submission failed")
+        worker: Deferred[object] = Deferred()
+        jobs.append(function)
+        workers.append(worker)
+        return worker
+
+    monkeypatch.setattr(spider_module, "deferToThread", submit)
+    spider = _Spider()
+    manager = MagicMock(spec=ConnectionManager)
+    spider._connection_manager = manager
+    queue = Queue()
+    spider._queue = queue
+
+    first = spider.close_backend()
+    assert isinstance(first, Deferred)
+    first.addErrback(lambda _failure: None)
+    assert first.called
+    assert spider._queue is queue
+    assert spider._close_in_progress is False
+
+    second = spider.close_backend()
+    assert isinstance(second, Deferred)
+    assert jobs and workers
+    jobs[0]()
+    workers[0].callback(None)
+    assert second.called
+    assert spider._queue is None
+    manager.close.assert_called_once_with()
 
 
 def test_spider_closed_signal_returns_async_close_deferred(mocker) -> None:

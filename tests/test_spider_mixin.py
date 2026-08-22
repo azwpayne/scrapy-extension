@@ -1697,6 +1697,64 @@ class TestGetQueue:
         assert queue2 is queue  # cached instance, not rebuilt
         assert isinstance(queue._monitor, ScrapyStatsMonitor)
 
+    def test_get_queue_upgrade_applies_pop_rate_window_after_early_setup(self, mocker):
+        """R141-F10 (re-confirms R138-F5): upgrading the early-setup
+        NullMonitor must also apply the operator-tuned pop-rate window.
+        Pre-fix, the upgrade swapped only the monitor — the queue's
+        ``_pop_rate_window_s`` stayed frozen at the 60.0 constructor default,
+        so ``SCRAPY_MONITOR_POP_RATE_WINDOW_S`` was a dead setting on exactly
+        the upgrade path (fresh construction honors it; upgrades did not)."""
+        from scrapy_extension.monitor import NullMonitor
+
+        class TestSpider(BackendSpiderMixin, Spider):
+            name = "test_spider"
+
+        spider = TestSpider()
+        spider._connection_manager = mocker.MagicMock(spec=ConnectionManager)
+
+        # Early setup window: no crawler -> NullMonitor + default window.
+        queue = spider.get_queue()
+        assert isinstance(queue._monitor, NullMonitor)
+        assert queue._pop_rate_window_s == 60.0
+
+        # Crawler attached (as from_crawler does) with a tuned window.
+        crawler = mocker.MagicMock()
+        crawler.stats = mocker.MagicMock()
+        crawler.settings = ScrapySettings({"SCRAPY_MONITOR_POP_RATE_WINDOW_S": 300.0})
+        spider.crawler = crawler
+
+        queue2 = spider.get_queue()
+        assert queue2 is queue  # cached instance, not rebuilt
+        assert isinstance(queue._monitor, ScrapyStatsMonitor)
+        assert queue._pop_rate_window_s == 300.0
+
+    def test_get_queue_never_rewires_real_monitor_window(self, mocker):
+        """R141-F10 guard: the passive window passthrough only applies on the
+        NullMonitor-upgrade branch. A queue that already carries a real
+        (stats-backed) monitor keeps its tuned window even when later settings
+        differ — preserves the R137-F5 contract for externally wired monitors."""
+        crawler = mocker.MagicMock()
+        crawler.stats = mocker.MagicMock()
+        crawler.settings = ScrapySettings({"SCRAPY_MONITOR_POP_RATE_WINDOW_S": 12.5})
+
+        class TestSpider(BackendSpiderMixin, Spider):
+            name = "test_spider"
+
+        spider = TestSpider()
+        spider._connection_manager = mocker.MagicMock(spec=ConnectionManager)
+        spider.crawler = crawler
+
+        queue = spider.get_queue()
+        wired_first = queue._monitor
+        assert isinstance(wired_first, ScrapyStatsMonitor)
+        assert queue._pop_rate_window_s == 12.5
+
+        # A later call with a DIFFERENT window must not touch the wiring.
+        crawler.settings = ScrapySettings({"SCRAPY_MONITOR_POP_RATE_WINDOW_S": 300.0})
+        spider.get_queue()
+        assert queue._monitor is wired_first
+        assert queue._pop_rate_window_s == 12.5
+
     def test_get_queue_never_rewires_a_real_monitor(self, mocker):
         """R137-F5 guard: once the queue carries a real (stats-backed)
         monitor, a later get_queue() must NOT rewire it — protects externally

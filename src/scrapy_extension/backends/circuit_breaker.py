@@ -35,9 +35,20 @@ from collections.abc import Callable
 from enum import Enum
 from typing import Any, NamedTuple
 
-from scrapy_extension.backends.base import QueueBackend, SetBackend, StorageBackend
-from scrapy_extension.exceptions import BackendError
+from scrapy_extension.backends.base import (
+    QueueBackend,
+    SetBackend,
+    StorageBackend,
+    _DurablePushRequired,
+)
+from scrapy_extension.exceptions import (
+    BackendConnectionError,
+    BackendError,
+    QueueError,
+    StorageError,
+)
 from scrapy_extension.exceptions._redaction import sanitize_backend_error
+from scrapy_extension.exceptions.base import _looks_sensitive_text
 
 __all__ = [
     "CIRCUIT_BREAKER_MAX_RESET_TIMEOUT_S",
@@ -60,7 +71,15 @@ _SAFE_QUEUE_OPERATIONS = frozenset(
     {"push", "pop", "ack", "nack", "queue_len", "clear_queue"}
 )
 _SAFE_STORAGE_OPERATIONS = frozenset(
-    {"store", "retrieve", "delete", "exists", "ttl", "clear_storage"}
+    {
+        "store",
+        "retrieve",
+        "delete",
+        "exists",
+        "ttl",
+        "list_storage_keys",
+        "clear_storage",
+    }
 )
 _QUEUE_METHOD_OPERATIONS = {
     "push": "push",
@@ -78,8 +97,81 @@ _STORAGE_METHOD_OPERATIONS = {
     "delete": "delete",
     "exists": "exists",
     "ttl": "ttl",
+    "list_storage_keys": "list_storage_keys",
     "clear_storage": "clear_storage",
 }
+_SET_METHOD_OPERATIONS = {
+    "add": "add",
+    "contains": "contains",
+    "remove": "remove",
+    "set_len": "set_len",
+    "clear_set": "clear_set",
+}
+_SAFE_NOT_IMPLEMENTED_MESSAGES = frozenset(
+    {
+        "RocketMQ queue depth is unsupported: no broker-side depth RPC",
+        "Pulsar queue depth requires the admin API, which is not configured",
+        "Memcached flush_all does not support prefix scoping; pass prefix=None only "
+        "when a server-wide flush is explicitly acceptable.",
+        "Memcached clear_storage would flush every key on the server. Set "
+        "SCRAPY_MEMCACHED_ALLOW_FLUSH_ALL=true (allow_flush_all=True) only "
+        "for a dedicated cache where that destructive scope is intended.",
+    }
+)
+
+
+def _safe_callable_name(func: Any, fallback: str) -> str:
+    """Read plugin callable metadata without allowing diagnostic hooks to run."""
+    try:
+        candidate = getattr(func, "__name__", fallback)
+    except Exception:
+        return fallback
+    return candidate if type(candidate) is str else fallback
+
+
+def _new_operation_error(method_name: str, message: str) -> BackendError:
+    """Build a typed static error for one protected proxy operation."""
+    queue_operation = _QUEUE_METHOD_OPERATIONS.get(method_name)
+    if queue_operation is not None:
+        return QueueError(message, operation=queue_operation)
+    storage_operation = _STORAGE_METHOD_OPERATIONS.get(method_name)
+    if storage_operation is not None:
+        return StorageError(message, operation=storage_operation)
+    if method_name in _SET_METHOD_OPERATIONS:
+        return BackendConnectionError(message)
+    return BackendError(message)
+
+
+def _sanitize_ordinary_failure(
+    method_name: str, error: Exception
+) -> BackendError | NotImplementedError:
+    """Rebuild one ordinary plugin failure without carrying its traceback."""
+    if type(error) is NotImplementedError:
+        try:
+            raw_args = error.args
+        except Exception:
+            raw_args = None
+        if (
+            type(raw_args) is tuple
+            and len(raw_args) == 1
+            and type(raw_args[0]) is str
+            and raw_args[0] in _SAFE_NOT_IMPLEMENTED_MESSAGES
+        ):
+            return NotImplementedError(raw_args[0])
+    return _new_operation_error(method_name, "Backend operation failed.")
+
+
+def _unavailable_proxy_operation(
+    method_name: str,
+) -> Callable[..., Any]:
+    """Return a static fallback when a plugin hides one interface method."""
+
+    def unavailable(*args: Any, **kwargs: Any) -> Any:
+        del args
+        del kwargs
+        raise _new_operation_error(method_name, "Backend operation is unavailable.")
+
+    return unavailable
 
 
 class BreakerState(str, Enum):
@@ -117,8 +209,13 @@ class CircuitBreakerOpenError(BackendError):
     """
 
     def __init__(self, name: str) -> None:
-        self.name = name
-        super().__init__(f"Circuit breaker open for {name!r}")
+        safe_name = (
+            name
+            if type(name) is str and not _looks_sensitive_text(name)
+            else "backend-operation"
+        )
+        self.name = safe_name
+        super().__init__(f"Circuit breaker open for {safe_name!r}")
 
 
 class CircuitBreaker:
@@ -176,7 +273,11 @@ class CircuitBreaker:
                 f"(an OPEN breaker must be able to recover), got {reset_timeout!r}"
             )
             raise ValueError(msg)
-        self.name = name
+        self.name = (
+            name
+            if type(name) is str and not _looks_sensitive_text(name)
+            else "backend-operation"
+        )
         self.failure_threshold = failure_threshold
         self.reset_timeout = reset_timeout
         self.failure_exceptions = failure_exceptions
@@ -372,10 +473,10 @@ class CircuitBreaker:
                 after the failure is recorded.
 
         .. note::
-            ``KeyboardInterrupt`` / ``SystemExit`` are **not** treated as backend
-            failures — they propagate immediately without touching breaker state,
-            matching the connect-path's broad-except discipline elsewhere in the
-            package.
+            ``KeyboardInterrupt`` / ``SystemExit`` / ``GeneratorExit`` are **not**
+            treated as backend failures — they propagate immediately without
+            touching breaker state, matching the connect-path's broad-except
+            discipline elsewhere in the package.
         """
         with self._lock:
             admission = self._allow_call()
@@ -385,8 +486,11 @@ class CircuitBreaker:
         try:
             result = func(*args, **kwargs)
         except BaseException as exc:
-            # Do not let Ctrl-C / interpreter shutdown perturb breaker bookkeeping.
-            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            # Do not let process-control flow perturb breaker bookkeeping. In
+            # addition to Ctrl-C/interpreter shutdown, GeneratorExit is a direct
+            # BaseException used to stop generator-owned work and is not a broker
+            # failure either.
+            if isinstance(exc, (KeyboardInterrupt, SystemExit, GeneratorExit)):
                 # Regression fix: _allow_call() claimed the single HALF_OPEN probe
                 # slot (_probe_in_flight=True) before func ran. If the signal arrives
                 # mid-probe we must release it — otherwise the breaker wedges
@@ -395,18 +499,36 @@ class CircuitBreaker:
                 if admission.state is BreakerState.HALF_OPEN:
                     with self._lock:
                         self._release_probe(admission)
+                del func
+                del args
+                del kwargs
+                del admission
+                del exc
                 raise
-            if not isinstance(exc, self.failure_exceptions):
-                # Caller/input errors are neither a backend success nor a backend
+            if isinstance(exc, _DurablePushRequired) or not isinstance(
+                exc, self.failure_exceptions
+            ):
+                # Caller/input errors and the durable-policy rejection are neither
+                # backend failures nor successful traffic.
                 # failure. A HALF_OPEN call already claimed the sole probe slot, so
                 # release it without closing or re-opening the breaker; the next
                 # eligible call can perform the real recovery probe.
                 if admission.state is BreakerState.HALF_OPEN:
                     with self._lock:
                         self._release_probe(admission)
+                del func
+                del args
+                del kwargs
+                del admission
+                del exc
                 raise
             with self._lock:
                 self._record_failure(admission)
+            del func
+            del args
+            del kwargs
+            del admission
+            del exc
             raise
         else:
             with self._lock:
@@ -423,8 +545,9 @@ class CircuitBreaker:
 # underlying backend. Administrative I/O methods (``queue_len`` / ``clear_*`` /
 # storage probes) deliberately bypass the breaker so an OPEN breaker does not,
 # e.g., block an observability query or shutdown cleanup; they still terminally
-# reconstruct package ``BackendError`` instances. Lifecycle methods such as
-# ``is_connected`` remain raw forwards. Note ``ack``/``nack`` are NOT
+# reconstruct package ``BackendError`` instances. Lifecycle methods also cross
+# the same non-counting privacy boundary, but never affect breaker state. Note
+# ``ack``/``nack`` are NOT
 # administrative on MQ backends (R34-C) and are in
 # ``_QueueBackendProxy._HOT_PATH``; see its docstring.
 #
@@ -463,9 +586,14 @@ class _BackendProxyBase:
     # A strict subset of ``_FORWARDED`` whose methods perform backend I/O but
     # intentionally do not affect breaker state.  These need the same terminal
     # BackendError reconstruction as hot-path operations, without routing
-    # through ``breaker.call``.  Lifecycle methods stay raw forwards so their
-    # established exception behavior remains unchanged.
+    # through ``breaker.call``. Lifecycle methods use this boundary as well so
+    # ordinary plugin failures cannot publish backend state.
     _PROTECTED_FORWARDED: tuple[str, ...] = ()
+    # The generic helper remains a pure optional-attribute forwarder for
+    # structural test/plugin subclasses. Concrete interface proxies override
+    # this so an absent declared method cannot fall through to an ABC stub.
+    _BIND_UNAVAILABLE_METHODS = False
+    _NON_CALLABLE_FORWARDED: frozenset[str] = frozenset()
 
     def __init__(self, backend: Any, breaker: CircuitBreaker) -> None:
         # Use object.__setattr__ to avoid recursing through our own __setattr__.
@@ -475,6 +603,19 @@ class _BackendProxyBase:
             try:
                 bound = getattr(backend, method_name)
             except AttributeError:
+                if self._BIND_UNAVAILABLE_METHODS:
+                    # A structurally compatible concrete plugin may omit an
+                    # optional method, or expose a property that raises
+                    # AttributeError. Do not leave an ABC stub visible on the
+                    # interface proxy: it could silently return ``None``.
+                    object.__setattr__(
+                        self, method_name, _unavailable_proxy_operation(method_name)
+                    )
+                continue
+            except Exception:
+                object.__setattr__(
+                    self, method_name, _unavailable_proxy_operation(method_name)
+                )
                 continue
             object.__setattr__(
                 self,
@@ -485,6 +626,22 @@ class _BackendProxyBase:
             try:
                 forwarded = getattr(backend, method_name)
             except AttributeError:
+                if (
+                    self._BIND_UNAVAILABLE_METHODS
+                    and method_name not in self._NON_CALLABLE_FORWARDED
+                ):
+                    # See the hot-path branch above. A forwarded method must
+                    # never fall through to an ABC default on an interface
+                    # proxy after a plugin property reports itself unavailable.
+                    object.__setattr__(
+                        self, method_name, _unavailable_proxy_operation(method_name)
+                    )
+                continue
+            except Exception:
+                if method_name not in self._NON_CALLABLE_FORWARDED:
+                    object.__setattr__(
+                        self, method_name, _unavailable_proxy_operation(method_name)
+                    )
                 continue
             if method_name in self._PROTECTED_FORWARDED:
                 forwarded = _wrap_forwarded_bound(backend, method_name, forwarded)
@@ -495,7 +652,18 @@ class _BackendProxyBase:
         # — e.g. ``backend_type`` property, backend-specific attributes. Forwards
         # to the wrapped backend. Non-interface attributes have zero overhead on
         # the hot path because those are bound as instance attributes above.
-        return getattr(self._backend, name)
+        try:
+            return getattr(self._backend, name)
+        except Exception as error:  # noqa: BLE001 - terminal proxy boundary
+            # Record failure without raising inside the handler: a replacement
+            # raised from an ``except`` block would retain the plugin exception
+            # as ``__context__``.  This also avoids Bandit B110's unsafe bare
+            # ``except: pass`` pattern.
+            del error
+        unavailable = BackendError("Backend attribute is unavailable.")
+        del name
+        del self
+        raise unavailable from None
 
 
 class _ProtectedBoundOperation:
@@ -505,8 +673,9 @@ class _ProtectedBoundOperation:
     traceback.  That object can expose live endpoint and credential settings
     even when a breaker is already OPEN and never calls the backend.  This
     wrapper keeps only weak references, drops resolved locals before raising,
-    and reconstructs public ``BackendError`` instances after ``breaker.call``
-    has unwound.
+    and reconstructs typed public errors after ``breaker.call`` has unwound.
+    Both package and ordinary third-party ``Exception`` failures are sanitized;
+    process-control ``BaseException`` values remain untouched.
     """
 
     __slots__ = (
@@ -525,16 +694,25 @@ class _ProtectedBoundOperation:
         func: Callable[..., Any],
     ) -> None:
         self._breaker = breaker
-        self._backend_ref = weakref.ref(backend)
+        backend_ref: Callable[[], Any]
+        try:
+            backend_ref = weakref.ref(backend)
+        except TypeError:
+            # A structurally compatible plugin object may omit weak-reference
+            # support. The owning proxy already keeps it alive; retaining it in
+            # this lookup closure is safe because call frames drop ``self``
+            # before publishing a sanitized error.
+            backend_ref = lambda: backend
+        self._backend_ref = backend_ref
         self._method_name = method_name
-        self.__name__ = getattr(func, "__name__", method_name)
+        self.__name__ = _safe_callable_name(func, method_name)
         snapshot_ref: Callable[[], Callable[..., Any] | None] | None
         try:
             if getattr(func, "__self__", None) is not None:
                 snapshot_ref = weakref.WeakMethod(func)
             else:
                 snapshot_ref = weakref.ref(func)
-        except TypeError:
+        except Exception:
             # The production backends expose Python methods, which support weak
             # references.  A non-weakrefable plugin callable remains operational by
             # resolving it through the proxy's already-owned backend on each call.
@@ -543,57 +721,84 @@ class _ProtectedBoundOperation:
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         backend = self._backend_ref()
-        method = self._snapshot_ref() if self._snapshot_ref is not None else None
-        if method is None and backend is not None:
-            method = getattr(backend, self._method_name)
-        if method is None:
-            unavailable = BackendError("Backend operation is unavailable.")
-            del args
-            del kwargs
-            del backend
-            del method
-            del self
-            raise unavailable
-
+        method_name = self._method_name
+        method: Callable[..., Any] | None = None
         breaker = self._breaker
         caught_error: BackendError | None = None
+        ordinary_failure: Exception | None = None
+        unavailable = False
         try:
+            method = self._snapshot_ref() if self._snapshot_ref is not None else None
+            if method is None and backend is not None:
+                method = getattr(backend, method_name)
+            if method is None:
+                unavailable = True
+                raise BackendError("Backend operation is unavailable.")
             return breaker.call(method, *args, **kwargs)
-        except BackendError as error:
-            caught_error = error
-        except BaseException:
+        except _DurablePushRequired:
+            # Preserve the exact internal policy signal while dropping all
+            # operation arguments and resolved backend references from this
+            # wrapper frame before re-raising it.
             del args
             del kwargs
             del backend
             del method
             del breaker
+            del caught_error
+            del ordinary_failure
+            del unavailable
+            del self
+            raise
+        except BackendError as error:
+            caught_error = error
+        except Exception as error:  # noqa: BLE001 - terminal proxy boundary
+            ordinary_failure = error
+        except BaseException:
+            # Process-control exceptions are never converted or counted here.
+            # Raising directly from this arm preserves identity without adding a
+            # second local that points at the caller-controlled exception.
+            del args
+            del kwargs
+            del backend
+            del method
+            del breaker
+            del caught_error
+            del ordinary_failure
+            del unavailable
             del self
             raise
 
-        assert caught_error is not None
-        if type(caught_error) is CircuitBreakerOpenError:
-            sanitized_error: BackendError = CircuitBreakerOpenError("backend-operation")
-        else:
-            sanitized_error = sanitize_backend_error(
-                caught_error,
-                message="Backend operation failed.",
-                safe_queue_operations=_SAFE_QUEUE_OPERATIONS,
-                safe_storage_operations=_SAFE_STORAGE_OPERATIONS,
-                fallback_queue_operation=_QUEUE_METHOD_OPERATIONS.get(
-                    self._method_name
-                ),
-                fallback_storage_operation=_STORAGE_METHOD_OPERATIONS.get(
-                    self._method_name
-                ),
+        if ordinary_failure is not None:
+            sanitized_error: BackendError | NotImplementedError = (
+                _sanitize_ordinary_failure(method_name, ordinary_failure)
             )
+        elif unavailable:
+            sanitized_error = BackendError("Backend operation is unavailable.")
+        else:
+            assert caught_error is not None
+            if type(caught_error) is CircuitBreakerOpenError:
+                sanitized_error = CircuitBreakerOpenError("backend-operation")
+            else:
+                sanitized_error = sanitize_backend_error(
+                    caught_error,
+                    message="Backend operation failed.",
+                    safe_queue_operations=_SAFE_QUEUE_OPERATIONS,
+                    safe_storage_operations=_SAFE_STORAGE_OPERATIONS,
+                    fallback_queue_operation=_QUEUE_METHOD_OPERATIONS.get(method_name),
+                    fallback_storage_operation=_STORAGE_METHOD_OPERATIONS.get(
+                        method_name
+                    ),
+                )
         del args
         del kwargs
         del backend
         del method
         del breaker
         del caught_error
+        del ordinary_failure
+        del unavailable
         del self
-        raise sanitized_error
+        raise sanitized_error from None
 
 
 def _wrap_bound(
@@ -613,9 +818,9 @@ class _ProtectedForwardedOperation:
     circuit breaker: their failures should not trip or reset traffic admission.
     They can still raise package ``BackendError`` instances, whose traceback can
     retain a bound backend, endpoint, queue name, or storage key.  This wrapper
-    only reconstructs those package errors after the backend frames unwind;
-    unknown plugin exceptions deliberately retain their raw compatibility
-    contract.
+    reconstructs typed errors after the backend frame unwinds for both package
+    errors and ordinary third-party ``Exception`` failures. Lifecycle forwards
+    use this wrapper too; ordinary plugin failures cannot publish backend state.
     """
 
     __slots__ = (
@@ -631,16 +836,23 @@ class _ProtectedForwardedOperation:
         method_name: str,
         func: Callable[..., Any],
     ) -> None:
-        self._backend_ref = weakref.ref(backend)
+        backend_ref: Callable[[], Any]
+        try:
+            backend_ref = weakref.ref(backend)
+        except TypeError:
+            # See _ProtectedBoundOperation: the proxy owns this backend already,
+            # so a strong lookup fallback does not add an escaped error graph.
+            backend_ref = lambda: backend
+        self._backend_ref = backend_ref
         self._method_name = method_name
-        self.__name__ = getattr(func, "__name__", method_name)
+        self.__name__ = _safe_callable_name(func, method_name)
         snapshot_ref: Callable[[], Callable[..., Any] | None] | None
         try:
             if getattr(func, "__self__", None) is not None:
                 snapshot_ref = weakref.WeakMethod(func)
             else:
                 snapshot_ref = weakref.ref(func)
-        except TypeError:
+        except Exception:
             # Plugin callables need not support weak references.  The owning proxy
             # already retains its backend, so resolve such a callable afresh only at
             # call time rather than retaining it in an escaped traceback frame.
@@ -649,62 +861,85 @@ class _ProtectedForwardedOperation:
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         backend = self._backend_ref()
-        method = self._snapshot_ref() if self._snapshot_ref is not None else None
-        if method is None and backend is not None:
-            method = getattr(backend, self._method_name)
-        if method is None:
-            unavailable = BackendError("Backend operation is unavailable.")
+        method_name = self._method_name
+        method: Callable[..., Any] | None = None
+        caught_error: BackendError | None = None
+        ordinary_failure: Exception | None = None
+        unavailable = False
+        try:
+            method = self._snapshot_ref() if self._snapshot_ref is not None else None
+            if method is None and backend is not None:
+                method = getattr(backend, method_name)
+            if method is None:
+                unavailable = True
+                raise BackendError("Backend operation is unavailable.")
+            return method(*args, **kwargs)
+        except _DurablePushRequired:
+            # Preserve the exact internal policy signal without retaining the
+            # operation arguments or resolved backend in this wrapper frame.
             del args
             del kwargs
             del backend
             del method
+            del caught_error
+            del ordinary_failure
+            del unavailable
             del self
-            raise unavailable
-
-        caught_error: BackendError | None = None
-        try:
-            return method(*args, **kwargs)
+            raise
         except BackendError as error:
             caught_error = error
+        except Exception as error:  # noqa: BLE001 - terminal proxy boundary
+            ordinary_failure = error
         except BaseException:
-            # Unknown plugin errors and process-control exceptions retain their
-            # historical raw behavior.  Do not count this administrative call or
-            # alter the breaker state.
+            # Process-control exceptions retain their exact identity and do not
+            # change breaker state or cross the ordinary error sanitizer.
             del args
             del kwargs
             del backend
             del method
+            del caught_error
+            del ordinary_failure
+            del unavailable
             del self
             raise
 
-        assert caught_error is not None
-        queue_operation = _QUEUE_METHOD_OPERATIONS.get(self._method_name)
-        storage_operation = _STORAGE_METHOD_OPERATIONS.get(self._method_name)
-        safe_queue_operations = (
-            (queue_operation,) if queue_operation is not None else ()
-        )
-        safe_storage_operations = (
-            (storage_operation,) if storage_operation is not None else ()
-        )
-        sanitized_error = sanitize_backend_error(
-            caught_error,
-            message="Backend operation failed.",
-            safe_queue_operations=safe_queue_operations,
-            safe_storage_operations=safe_storage_operations,
-            fallback_queue_operation=queue_operation,
-            fallback_storage_operation=storage_operation,
-        )
+        if ordinary_failure is not None:
+            sanitized_error: BackendError | NotImplementedError = (
+                _sanitize_ordinary_failure(method_name, ordinary_failure)
+            )
+        elif unavailable:
+            sanitized_error = BackendError("Backend operation is unavailable.")
+        else:
+            assert caught_error is not None
+            queue_operation = _QUEUE_METHOD_OPERATIONS.get(method_name)
+            storage_operation = _STORAGE_METHOD_OPERATIONS.get(method_name)
+            safe_queue_operations = (
+                (queue_operation,) if queue_operation is not None else ()
+            )
+            safe_storage_operations = (
+                (storage_operation,) if storage_operation is not None else ()
+            )
+            sanitized_error = sanitize_backend_error(
+                caught_error,
+                message="Backend operation failed.",
+                safe_queue_operations=safe_queue_operations,
+                safe_storage_operations=safe_storage_operations,
+                fallback_queue_operation=queue_operation,
+                fallback_storage_operation=storage_operation,
+            )
+            del queue_operation
+            del storage_operation
+            del safe_queue_operations
+            del safe_storage_operations
         del args
         del kwargs
         del backend
         del method
         del caught_error
-        del queue_operation
-        del storage_operation
-        del safe_queue_operations
-        del safe_storage_operations
+        del ordinary_failure
+        del unavailable
         del self
-        raise sanitized_error
+        raise sanitized_error from None
 
 
 def _wrap_forwarded_bound(
@@ -749,6 +984,8 @@ class _QueueBackendProxy(_BackendProxyBase, QueueBackend):
     ``(QueueError, BackendError)`` ack-error handling covers the fail-fast path.
     """
 
+    _BIND_UNAVAILABLE_METHODS = True
+    _NON_CALLABLE_FORWARDED = frozenset({"requires_ack", "supports_concurrent_ack"})
     _HOT_PATH = ("push", "_push_with_durability", "pop", "pop_with_ack", "ack", "nack")
     _FORWARDED = (
         "requires_ack",
@@ -760,12 +997,20 @@ class _QueueBackendProxy(_BackendProxyBase, QueueBackend):
         "is_connected",
         "ping",
     )
-    _PROTECTED_FORWARDED = ("queue_len", "clear_queue")
+    _PROTECTED_FORWARDED = (
+        "queue_len",
+        "clear_queue",
+        "connect",
+        "disconnect",
+        "is_connected",
+        "ping",
+    )
 
 
 class _SetBackendProxy(_BackendProxyBase, SetBackend):
     """Wrap a :class:`SetBackend`'s hot-path ops under a breaker."""
 
+    _BIND_UNAVAILABLE_METHODS = True
     _HOT_PATH = ("add", "contains", "remove")
     _FORWARDED = (
         "set_len",
@@ -775,23 +1020,41 @@ class _SetBackendProxy(_BackendProxyBase, SetBackend):
         "is_connected",
         "ping",
     )
-    _PROTECTED_FORWARDED = ("set_len", "clear_set")
+    _PROTECTED_FORWARDED = (
+        "set_len",
+        "clear_set",
+        "connect",
+        "disconnect",
+        "is_connected",
+        "ping",
+    )
 
 
 class _StorageBackendProxy(_BackendProxyBase, StorageBackend):
     """Wrap a :class:`StorageBackend`'s hot-path ops under a breaker."""
 
+    _BIND_UNAVAILABLE_METHODS = True
     _HOT_PATH = ("store", "retrieve", "delete")
     _FORWARDED = (
         "exists",
         "ttl",
+        "list_storage_keys",
         "clear_storage",
         "connect",
         "disconnect",
         "is_connected",
         "ping",
     )
-    _PROTECTED_FORWARDED = ("exists", "ttl", "clear_storage")
+    _PROTECTED_FORWARDED = (
+        "exists",
+        "ttl",
+        "list_storage_keys",
+        "clear_storage",
+        "connect",
+        "disconnect",
+        "is_connected",
+        "ping",
+    )
 
 
 # The proxies are pure forwarders: hot-path methods are installed on each
@@ -818,8 +1081,8 @@ def wrap_queue_backend(backend: QueueBackend, breaker: CircuitBreaker) -> QueueB
     ``queue_len`` is a non-counting protected forward: it is an admin /
     observability probe, and a transient stats-query failure must not cascade
     into a full traffic shutdown by tripping the breaker. ``clear_queue`` uses
-    the same package-error privacy boundary; lifecycle attributes (including
-    ``is_connected``) forward unchanged. ``push``, ``_push_with_durability``,
+    the same package-error privacy boundary. Lifecycle methods use that
+    non-counting boundary as well. ``push``, ``_push_with_durability``,
     ``pop``, ``pop_with_ack``, ``ack``, and ``nack`` are breaker-wrapped: MQ
     implementations perform broker I/O for all of them, so their failures must
     trip the breaker and fail fast while it is OPEN. Atomic-pop backends inherit

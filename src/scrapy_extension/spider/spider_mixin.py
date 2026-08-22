@@ -10,16 +10,21 @@ import logging
 import os
 import threading
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from pydispatch.errors import DispatcherKeyError
 from scrapy import Spider, signals
 from twisted.internet.defer import Deferred
+from twisted.internet.threads import deferToThread
 from twisted.python.failure import Failure as TwistedFailure
 
 from scrapy_extension.exceptions import ConfigurationError
 from scrapy_extension.monitor import NullMonitor
+from scrapy_extension.schedule._dupefilter_compat import (
+    _backend_dupefilter_lifecycle,
+)
 from scrapy_extension.utils.identity import (
     DEFAULT_DUPEFILTER_KEY_TEMPLATE,
     DEFAULT_QUEUE_KEY_TEMPLATE,
@@ -29,10 +34,32 @@ from scrapy_extension.utils.identity import (
 from scrapy_extension.utils.reactor import (
     DEFAULT_REACTOR_IO_TIMEOUT_S,
     bounded_deferred,
+    defer_to_thread_ordered,
     reactor_is_running,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _submit_thread(
+    function: Callable[..., Any], *args: Any, **kwargs: Any
+) -> Deferred[Any]:
+    """Submit lifecycle work as a settled Deferred even when the adapter rejects it."""
+    try:
+        return deferToThread(function, *args, **kwargs)
+    except BaseException as exc:
+        failed: Deferred[Any] = Deferred()
+        failed._reactor_submission_failure = "thread"  # type: ignore[attr-defined]
+        failed.errback(exc)
+        return failed
+
+
+def _emit_diagnostic(method: Any, message: str, *args: Any) -> None:
+    """Emit a static diagnostic after lifecycle cleanup has unwound."""
+    try:
+        method(message, *args)
+    except BaseException:
+        pass
 
 
 @dataclass(slots=True)
@@ -184,8 +211,17 @@ class BackendSpiderMixin(Spider):
         self._setup_attempt: _BackendSetupAttempt | None = None
         self._setup_identity: tuple[str, str] | None = None
         self._orphan_candidates: list[tuple[str, Any]] = []
+        self._orphan_candidate_operations: dict[int, Deferred[Any]] = {}
+        self._orphan_candidate_failures: dict[int, BaseException] = {}
         self._orphan_leases: list[Any] = []
         self._orphan_managers: list[Any] = []
+        self._close_wait_operation: Deferred[Any] | None = None
+        self._close_wait_owner_thread_id: int | None = None
+        self._close_wait_finishing = False
+        # Every operation is retained by identity. A named slot is unsafe here:
+        # two signal/getter callbacks may overlap, and replacing the first
+        # Deferred would let close_backend release shared ownership too early.
+        self._async_component_operations: dict[str, Deferred[Any]] = {}
 
     @classmethod
     def from_crawler(
@@ -347,14 +383,19 @@ class BackendSpiderMixin(Spider):
                     )
                 )
                 if valid:
+                    # Publish the exact acquire handle atomically with the manager.
+                    # A peer close can begin as soon as ``_setup_attempt`` is
+                    # cleared; assigning the lease after releasing this lock would
+                    # let that close fall back to ``manager.close()`` and race the
+                    # final lease publication.
                     self._connection_manager = manager
+                    self._connection_manager_lease = attempt.lease
                     self._setup_identity = desired_identity
                     published = True
                 if self._setup_attempt is attempt:
                     self._setup_attempt = None
                     attempt.done.set()
             if valid:
-                self._connection_manager_lease = attempt.lease
                 return manager
             raise RuntimeError("setup_backend() completed after close")
         except BaseException as exc:
@@ -630,12 +671,14 @@ class BackendSpiderMixin(Spider):
                     for lease in self._signal_leases
                     if lease.manager is signal_manager
                 )
+            rollback_failed = False
             try:
                 self._disconnect_lifecycle_signals(
                     signal_manager,
                     handlers=rollback_handlers,
                 )
             except BaseException:
+                rollback_failed = True
                 if signal_manager.__class__.__module__.startswith("unittest.mock"):
                     # Compatibility-only mocks have no authoritative dispatcher
                     # state; retain the lease record but keep the legacy aggregate
@@ -643,10 +686,11 @@ class BackendSpiderMixin(Spider):
                     with self._lifecycle_lock:
                         self._connected_signals = None
                         self._signals_connected = False
-                try:
-                    logger.error("Failed to roll back backend lifecycle signals")
-                except BaseException:
-                    pass
+            if rollback_failed:
+                _emit_diagnostic(
+                    logger.error,
+                    "Failed to roll back backend lifecycle signals",
+                )
             raise registration_failure
 
     def _disconnect_lifecycle_signals(
@@ -724,18 +768,68 @@ class BackendSpiderMixin(Spider):
         ):
             raise primary_error
 
-    def _on_spider_opened(self, spider: Spider) -> None:
+    def _on_spider_opened(self, spider: Spider) -> Deferred[Any] | None:
         """Handle spider_opened signal.
 
         Args:
             spider: The spider instance that was opened.
         """
         if spider is not self:
-            return
+            return None
         with self._lifecycle_lock:
             manager = self._connection_manager
+            if manager is not None and reactor_is_running():
+                # Registration and scheduling are one lifecycle transaction. The
+                # close path must see the authoritative connect worker even when
+                # the bounded signal view expires first.
+                operation, public = defer_to_thread_ordered(
+                    manager.connect,
+                    timeout=DEFAULT_REACTOR_IO_TIMEOUT_S,
+                    operation="backend manager connect",
+                )
+                self._track_async_operation_locked(
+                    "manager-connect",
+                    operation,
+                )
+                try:
+                    operation.addErrback(lambda _failure: None)
+                except BaseException:
+                    pass
+                return public
         if manager is not None:
             manager.connect()
+        return None
+
+    def _track_async_operation_locked(
+        self,
+        name: str,
+        operation: Deferred[Any],
+    ) -> None:
+        """Retain one worker Deferred until its real operation has settled.
+
+        The caller must hold ``_lifecycle_lock`` while publishing the operation.
+        This closes the small but important race where a close callback could
+        otherwise run between ``deferToThread`` scheduling and ownership
+        registration.
+        """
+        key = f"{name}:{id(operation)}"
+        self._async_component_operations[key] = operation
+
+        def clear(outcome: Any) -> Any:
+            with self._lifecycle_lock:
+                if self._async_component_operations.get(key) is operation:
+                    self._async_component_operations.pop(key, None)
+            return outcome
+
+        try:
+            operation.addBoth(clear)
+        except BaseException:
+            try:
+                operation.addBoth(clear)
+            except BaseException:
+                if operation.called:
+                    with self._lifecycle_lock:
+                        self._async_component_operations.pop(key, None)
 
     def _on_spider_closed(
         self,
@@ -1060,6 +1154,94 @@ class BackendSpiderMixin(Spider):
                 pass
         return captured
 
+    def _start_component_close(
+        self,
+        kind: str,
+        component: Any,
+        reason: str,
+    ) -> tuple[Deferred[Any] | None, BaseException | None, bool]:
+        """Start one close without running blocking component code on reactor.
+
+        The small tuple distinguishes an immediate success from an immediate
+        exception.  A returned Deferred is first replaced by the component's
+        authoritative completion, when it exposes one, before this owner can
+        capture leases or detach the component.
+        """
+
+        def invoke() -> tuple[bool, Any]:
+            if kind == "queue":
+                return True, component.close()
+            return True, component.close(reason)
+
+        offload = False
+        if kind == "queue" and reactor_is_running():
+            from scrapy_extension.queue.queue import BackendQueue
+
+            # Only the bundled composite queue has the documented synchronous
+            # snapshot/strategy close surface. Preserve generic plugin
+            # components' historical direct hook contract.
+            offload = isinstance(component, BackendQueue)
+        if offload:
+            operation = _submit_thread(invoke)
+        else:
+            try:
+                _called, result = invoke()
+            except BaseException as exc:
+                return None, exc, False
+            authoritative = self._authoritative_component_cleanup(component, result)
+            if authoritative is not None:
+                return authoritative, None, False
+            return None, None, True
+
+        def select_authority(value: Any) -> Any:
+            # The wrapper prevents Twisted from flattening a Deferred returned by
+            # ``close`` before we can select its authoritative sibling.
+            if not isinstance(value, tuple) or len(value) != 2:
+                return value
+            _called, result = value
+            authoritative = self._authoritative_component_cleanup(component, result)
+            return authoritative if authoritative is not None else result
+
+        try:
+            operation.addCallback(select_authority)
+        except BaseException:
+            try:
+                operation.addCallback(select_authority)
+            except BaseException:
+                # The accepted worker remains the only ownership authority. Its
+                # failure/success is still returned to the composite caller; a
+                # second close pass can conservatively retry the component if the
+                # adapter could not expose its nested Deferred.
+                pass
+        return operation, None, False
+
+    def _finish_orphan_candidate_close(
+        self,
+        kind: str,
+        candidate: Any,
+        outcome: Any,
+    ) -> BaseException | None:
+        """Publish one orphan outcome only after its real close has settled."""
+        with self._lifecycle_lock:
+            self._orphan_candidate_operations.pop(id(candidate), None)
+        failure = outcome if isinstance(outcome, TwistedFailure) else None
+        if failure is not None:
+            error = cast(BaseException, failure.value)
+            with self._lifecycle_lock:
+                self._orphan_candidate_failures[id(candidate)] = error
+            self._capture_candidate_leases(candidate)
+            return error
+        with self._lifecycle_lock:
+            prior_failure = self._orphan_candidate_failures.get(id(candidate))
+            if prior_failure is None:
+                self._orphan_candidate_failures.pop(id(candidate), None)
+        if prior_failure is not None:
+            self._capture_candidate_leases(candidate)
+            return prior_failure
+        self._capture_candidate_leases(candidate)
+        self._remove_orphan_candidate(candidate)
+        return None
+
     def _dispose_invalidated_candidate(
         self,
         kind: str,
@@ -1067,24 +1249,145 @@ class BackendSpiderMixin(Spider):
         reason: str,
     ) -> None:
         """Close one unpublished candidate and retain failures for retry."""
-        close_succeeded = False
         self._retain_orphan_candidate(kind, candidate)
-        try:
-            if kind == "queue":
-                candidate.close()
-            else:
-                candidate.close(reason)
-        except BaseException:
-            pass
-        else:
-            close_succeeded = True
+        with self._lifecycle_lock:
+            pending = self._orphan_candidate_operations.get(id(candidate))
+        if pending is not None:
+            return
+        operation, immediate_error, succeeded = self._start_component_close(
+            kind,
+            candidate,
+            reason,
+        )
+        if operation is not None:
+            with self._lifecycle_lock:
+                self._orphan_candidate_operations[id(candidate)] = operation
+
+            def finish(outcome: Any) -> Any:
+                self._finish_orphan_candidate_close(kind, candidate, outcome)
+                self._release_orphan_leases()
+                return outcome
+
+            try:
+                operation.addBoth(finish)
+            except BaseException:
+                try:
+                    operation.addBoth(finish)
+                except BaseException:
+                    pass
+            # Construction's primary exception is already being raised; the
+            # authoritative cleanup branch is retained for close_backend retry.
+            try:
+                operation.addErrback(lambda _failure: None)
+            except BaseException:
+                pass
+            return
         self._capture_candidate_leases(candidate)
-        if close_succeeded:
+        if succeeded:
             self._remove_orphan_candidate(candidate)
-        # Candidate cleanup is primary. Its exact leases are independent ownership
-        # and must be attempted even when candidate close raises; failed releases
-        # remain reachable on the mixin for a later close pass.
+        if immediate_error is not None:
+            # Candidate cleanup is secondary to construction, but ownership stays
+            # reachable for the next composite close pass.
+            pass
         self._release_orphan_leases()
+
+    def _start_release_operation(
+        self,
+        lease: Any,
+    ) -> tuple[Deferred[Any] | None, BaseException | None, bool]:
+        """Start one exact lease release with the same Deferred discipline."""
+        return self._start_owner_operation(lease, "release")
+
+    def _start_manager_operation(
+        self,
+        manager: Any,
+    ) -> tuple[Deferred[Any] | None, BaseException | None, bool]:
+        """Start one orphan manager close without blocking reactor callbacks."""
+        return self._start_owner_operation(manager, "close")
+
+    def _start_owner_operation(
+        self,
+        owner: Any,
+        method_name: str,
+    ) -> tuple[Deferred[Any] | None, BaseException | None, bool]:
+        """Adapt a lease/manager call while retaining any returned authority."""
+
+        def invoke() -> tuple[bool, Any]:
+            return True, getattr(owner, method_name)()
+
+        offload = False
+        if reactor_is_running():
+            from scrapy_extension.backends.connectors import (
+                ConnectionManager,
+                ConnectionManagerLease,
+            )
+
+            offload = isinstance(
+                owner, (ConnectionManager, ConnectionManagerLease)
+            ) and (not type(owner).__module__.startswith("unittest.mock"))
+        if offload:
+            operation = _submit_thread(invoke)
+        else:
+            try:
+                _called, returned = invoke()
+            except BaseException as exc:
+                return None, exc, False
+            authoritative = self._authoritative_component_cleanup(owner, returned)
+            if authoritative is not None:
+                return authoritative, None, False
+            return None, None, True
+
+        def select_authority(value: Any) -> Any:
+            if not isinstance(value, tuple) or len(value) != 2:
+                return value
+            _called, returned = value
+            authoritative = self._authoritative_component_cleanup(owner, returned)
+            return authoritative if authoritative is not None else returned
+
+        try:
+            operation.addCallback(select_authority)
+        except BaseException:
+            try:
+                operation.addCallback(select_authority)
+            except BaseException:
+                pass
+        return operation, None, False
+
+    def _finish_orphan_lease(
+        self,
+        lease: Any,
+        outcome: Any,
+        remember: Callable[[BaseException | None], None],
+    ) -> None:
+        if isinstance(outcome, TwistedFailure):
+            remember(outcome.value)
+            return
+        self._forget_orphan_lease(lease)
+
+    def _finish_orphan_manager(
+        self,
+        manager: Any,
+        outcome: Any,
+        remember: Callable[[BaseException | None], None],
+    ) -> None:
+        if isinstance(outcome, TwistedFailure):
+            remember(outcome.value)
+            return
+        self._forget_orphan_manager(manager)
+
+    def _forget_orphan_lease(self, lease: Any) -> None:
+        with self._lifecycle_lock:
+            self._orphan_leases = [
+                existing for existing in self._orphan_leases if existing is not lease
+            ]
+
+    def _forget_orphan_manager(self, manager: Any) -> None:
+        with self._lifecycle_lock:
+            self._orphan_managers = [
+                existing
+                for existing in self._orphan_managers
+                if existing is not manager
+            ]
 
     def _release_orphan_leases(self) -> BaseException | None:
         """Release every retained lease once, retaining failures for retry."""
@@ -1141,30 +1444,171 @@ class BackendSpiderMixin(Spider):
                 if entry is not candidate
             ]
 
-    def _cleanup_orphan_candidates(self, reason: str) -> BaseException | None:
-        """Retry candidates and their exact leases before parent release."""
+    def _cleanup_orphan_candidates(
+        self,
+        reason: str,
+    ) -> BaseException | Deferred[Any] | None:
+        """Retry orphan close operations before leases or managers are released.
+
+        A candidate's bounded public Deferred is never treated as ownership
+        authority when it exposes ``_close_completion_deferred``.  Every sibling
+        is still attempted after a failure; the first ordinary or control-flow
+        error remains the result, and failed ownership stays on this mixin.
+        """
         primary_error: BaseException | None = None
+        result: Deferred[Any] = Deferred()
+        phases: list[tuple[str, Any, str]] = []
         with self._lifecycle_lock:
-            candidates = tuple(self._orphan_candidates)
-        for kind, candidate in candidates:
-            try:
-                if kind == "queue":
-                    candidate.close()
-                else:
-                    candidate.close(reason)
-            except BaseException as exc:
+            phases.extend(
+                ("candidate", kind, candidate)
+                for kind, candidate in tuple(self._orphan_candidates)
+            )
+            phases.extend(("lease", "", lease) for lease in tuple(self._orphan_leases))
+            phases.extend(
+                ("manager", "", manager) for manager in tuple(self._orphan_managers)
+            )
+
+        index = 0
+
+        def remember(error: BaseException | None) -> None:
+            nonlocal primary_error
+            if error is not None and primary_error is None:
+                primary_error = error
+
+        def finish_phase(phase: tuple[str, Any, Any], outcome: Any) -> Any:
+            phase_kind, kind, owner = phase
+            if phase_kind == "candidate":
+                remember(self._finish_orphan_candidate_close(kind, owner, outcome))
+                with self._lifecycle_lock:
+                    known_leases = {
+                        id(entry)
+                        for phase_type, _kind, entry in phases
+                        if phase_type == "lease"
+                    }
+                    phases.extend(
+                        ("lease", "", lease)
+                        for lease in self._orphan_leases
+                        if id(lease) not in known_leases
+                    )
+            elif phase_kind == "lease":
+                self._finish_orphan_lease(owner, outcome, remember)
+            else:
+                self._finish_orphan_manager(owner, outcome, remember)
+            advance()
+            return outcome
+
+        def advance() -> None:
+            nonlocal index
+            if index >= len(phases):
                 if primary_error is None:
-                    primary_error = exc
-                continue
-            self._capture_candidate_leases(candidate)
-            self._remove_orphan_candidate(candidate)
-        lease_error = self._release_orphan_leases()
-        if primary_error is None:
-            primary_error = lease_error
-        manager_error = self._release_orphan_managers()
-        if primary_error is None:
-            primary_error = manager_error
-        return primary_error
+                    if not result.called:
+                        result.callback(None)
+                elif not result.called:
+                    result.errback(
+                        TwistedFailure(primary_error)  # type: ignore[no-untyped-call]
+                    )
+                return
+            phase = phases[index]
+            index += 1
+            phase_kind, kind, owner = phase
+            if phase_kind == "candidate":
+                with self._lifecycle_lock:
+                    operation = self._orphan_candidate_operations.get(id(owner))
+                immediate_error: BaseException | None = None
+                succeeded = False
+                prior_failure: BaseException | None = None
+                if operation is None:
+                    with self._lifecycle_lock:
+                        prior_failure = self._orphan_candidate_failures.pop(
+                            id(owner),
+                            None,
+                        )
+                    remember(prior_failure)
+                    operation, immediate_error, succeeded = self._start_component_close(
+                        kind,
+                        owner,
+                        reason,
+                    )
+                    if operation is not None:
+                        with self._lifecycle_lock:
+                            self._orphan_candidate_operations[id(owner)] = operation
+                if operation is not None:
+                    success = lambda value: finish_phase(phase, value)
+                    failure = lambda error: finish_phase(phase, error)
+                    try:
+                        operation.addCallbacks(success, failure)
+                    except BaseException:
+                        try:
+                            operation.addCallbacks(success, failure)
+                        except BaseException as exc:
+                            remember(exc)
+                            finish_phase(
+                                phase,
+                                TwistedFailure(exc),  # type: ignore[no-untyped-call]
+                            )
+                    try:
+                        operation.addErrback(lambda _failure: None)
+                    except BaseException:
+                        pass
+                    return
+                if immediate_error is not None:
+                    remember(immediate_error)
+                    with self._lifecycle_lock:
+                        self._orphan_candidate_failures[id(owner)] = immediate_error
+                    self._capture_candidate_leases(owner)
+                    with self._lifecycle_lock:
+                        known_leases = {
+                            id(entry)
+                            for phase_type, _kind, entry in phases
+                            if phase_type == "lease"
+                        }
+                        phases.extend(
+                            ("lease", "", lease)
+                            for lease in self._orphan_leases
+                            if id(lease) not in known_leases
+                        )
+                elif succeeded:
+                    with self._lifecycle_lock:
+                        self._orphan_candidate_failures.pop(id(owner), None)
+                    self._capture_candidate_leases(owner)
+                    self._remove_orphan_candidate(owner)
+                advance()
+                return
+
+            if phase_kind == "lease":
+                operation, immediate_error, succeeded = self._start_release_operation(
+                    owner,
+                )
+            else:
+                operation, immediate_error, succeeded = self._start_manager_operation(
+                    owner,
+                )
+            if operation is not None:
+                operation.addCallbacks(
+                    lambda value: finish_phase(phase, value),
+                    lambda failure: finish_phase(phase, failure),
+                )
+                operation.addErrback(lambda _failure: None)
+                return
+            remember(immediate_error)
+            if succeeded:
+                if phase_kind == "lease":
+                    self._forget_orphan_lease(owner)
+                else:
+                    self._forget_orphan_manager(owner)
+            advance()
+
+        advance()
+        if not result.called:
+            # A phase may be an already-settled Deferred whose callback starts a
+            # later pending phase. Looking only at the first operation's
+            # ``called`` bit would publish success before that later owner has
+            # settled.
+            return result
+        if primary_error is not None:
+            result.addErrback(lambda _failure: None)
+            return primary_error
+        return None
 
     def _invalidate_component_constructions_locked(self) -> tuple[threading.Event, ...]:
         """Invalidate candidates before close can release the shared manager."""
@@ -1206,9 +1650,13 @@ class BackendSpiderMixin(Spider):
                         setting_value=name,
                     )
             if isinstance(queue._monitor, NullMonitor):
-                monitor, _ = self._resolve_queue_monitor()
+                monitor, window = self._resolve_queue_monitor()
                 if not isinstance(monitor, NullMonitor):
-                    queue.set_monitor(monitor)
+                    # R141-F10: thread the resolved window through the upgrade
+                    # so SCRAPY_MONITOR_POP_RATE_WINDOW_S is honored on the
+                    # early-setup path too (only NullMonitor upgrades pass it;
+                    # a real external monitor keeps its tuned wiring/window).
+                    queue.set_monitor(monitor, pop_rate_window_s=window)
             return cast(BackendQueue, queue)
 
         manager, construction = reserved
@@ -1347,7 +1795,13 @@ class BackendSpiderMixin(Spider):
                                 self._request_close_after_construction()
                             return None
 
-                        authoritative_cleanup.addBoth(finish_factory_cleanup)
+                        try:
+                            authoritative_cleanup.addBoth(finish_factory_cleanup)
+                        except BaseException:
+                            try:
+                                authoritative_cleanup.addBoth(finish_factory_cleanup)
+                            except BaseException:
+                                pass
                     elif had_snapshot_manager and not construction.invalidated:
                         close_parent_after_cleanup = True
                 except BaseException:
@@ -1365,6 +1819,58 @@ class BackendSpiderMixin(Spider):
                 if construction.invalidated or close_parent_after_cleanup:
                     self._request_close_after_construction()
             raise
+
+    def get_queue_async(
+        self,
+        queue_name: str | None = None,
+        *,
+        timeout: float = DEFAULT_REACTOR_IO_TIMEOUT_S,
+    ) -> Deferred[BackendQueue]:
+        """Construct/get a queue with a cancellable close fence.
+
+        The construction worker is authoritative even after the bounded public
+        view expires.  A one-shot readiness gate lets ``close_backend`` publish
+        its invalidation before a queued worker can reserve a new generation.
+        Without a running reactor there is no callback pump for Twisted's thread
+        adapter, so use the normal synchronous construction contract instead of
+        leaving ``close_backend`` in an unwaitable Deferred loop.
+        """
+        if not reactor_is_running():
+            result: Deferred[BackendQueue] = Deferred()
+            try:
+                result.callback(self.get_queue(queue_name))
+            except BaseException as exc:
+                result.errback(exc)
+            return result
+
+        ready = threading.Event()
+
+        def construct() -> BackendQueue:
+            ready.wait()
+            return self.get_queue(queue_name)
+
+        # Keep the lifecycle lock across scheduling, publication, and opening the
+        # readiness gate. A concurrent close therefore observes this worker before
+        # it can invalidate or release the manager generation.
+        with self._lifecycle_lock:
+            try:
+                operation, public = defer_to_thread_ordered(
+                    construct,
+                    timeout=timeout,
+                    operation="backend queue construction",
+                )
+                if not operation.called:
+                    self._track_async_operation_locked("queue-construction", operation)
+            finally:
+                ready.set()
+        # The caller owns the bounded view; the operation remains lifecycle
+        # authority and is observed independently so a late constructor failure
+        # cannot become an unhandled Deferred.
+        try:
+            operation.addErrback(lambda _failure: None)
+        except BaseException:
+            pass
+        return public
 
     def get_dupefilter(self) -> BackendDupeFilter:
         """Get the backend dupefilter for this spider without locked callbacks."""
@@ -1575,7 +2081,13 @@ class BackendSpiderMixin(Spider):
                                 self._request_close_after_construction()
                             return None
 
-                        authoritative.addBoth(finish_candidate_cleanup)
+                        try:
+                            authoritative.addBoth(finish_candidate_cleanup)
+                        except BaseException:
+                            try:
+                                authoritative.addBoth(finish_candidate_cleanup)
+                            except BaseException:
+                                pass
                     else:
                         self._capture_candidate_leases(candidate)
                         self._remove_orphan_candidate(candidate)
@@ -1588,6 +2100,141 @@ class BackendSpiderMixin(Spider):
                 if construction.invalidated:
                     self._request_close_after_construction()
             raise
+
+    def _close_after_construction_wait(
+        self,
+        waiters: tuple[threading.Event, ...],
+        operations: tuple[Deferred[Any], ...],
+        current_thread: int,
+    ) -> Deferred[Any]:
+        """Fence a late getter without blocking the reactor thread."""
+        with self._lifecycle_lock:
+            if self._close_wait_operation is not None:
+                return self._close_deferred or self._close_wait_operation
+            self._close_in_progress = True
+            self._close_owner_thread_id = current_thread
+
+        def wait_for_construction() -> None:
+            for waiter in waiters:
+                waiter.wait()
+
+        wait_operation = _submit_thread(wait_for_construction)
+        gate: Deferred[Any] = Deferred()
+        remaining = len(operations) + 1
+
+        def settle_gate(_outcome: Any) -> Any:
+            nonlocal remaining
+            remaining -= 1
+            if remaining == 0 and not gate.called:
+                gate.callback(None)
+            return None
+
+        try:
+            wait_operation.addBoth(settle_gate)
+        except BaseException:
+            try:
+                wait_operation.addBoth(settle_gate)
+            except BaseException:
+                if wait_operation.called:
+                    settle_gate(None)
+        for operation in operations:
+            try:
+                operation.addBoth(settle_gate)
+            except BaseException:
+                try:
+                    operation.addBoth(settle_gate)
+                except BaseException:
+                    if operation.called:
+                        settle_gate(None)
+        composite: Deferred[Any] = Deferred()
+        public = bounded_deferred(
+            composite,
+            timeout=DEFAULT_REACTOR_IO_TIMEOUT_S,
+            operation="spider backend construction close",
+        )
+        with self._lifecycle_lock:
+            self._close_wait_operation = gate
+            self._close_wait_owner_thread_id = current_thread
+            self._close_deferred = public
+
+        def finish_wait(outcome: Any) -> Any:
+            with self._lifecycle_lock:
+                if self._close_wait_operation is gate:
+                    # Keep the close reservation held while the real teardown is
+                    # entered. A peer close must observe the same public Deferred,
+                    # not win the small transition window between the wait fence
+                    # and close_backend().
+                    self._close_wait_operation = None
+                    self._close_wait_finishing = True
+            if isinstance(outcome, TwistedFailure):
+                with self._lifecycle_lock:
+                    self._close_wait_finishing = False
+                    self._close_in_progress = False
+                    self._close_owner_thread_id = None
+                    self._close_wait_owner_thread_id = None
+                    if self._close_deferred is public:
+                        self._close_deferred = None
+                if not composite.called:
+                    composite.errback(outcome)
+                return None
+            inner: Deferred[Any] | None = None
+            try:
+                inner = self.close_backend()
+            except BaseException as exc:
+                if not composite.called:
+                    composite.errback(
+                        TwistedFailure(exc)  # type: ignore[no-untyped-call]
+                    )
+                return None
+            finally:
+                with self._lifecycle_lock:
+                    self._close_wait_finishing = False
+                    self._close_wait_owner_thread_id = None
+                    if isinstance(inner, Deferred) and self._close_in_progress:
+                        # close_backend() may have installed a narrower internal
+                        # public view; the construction fence remains the caller's
+                        # stable concurrent-close result.
+                        self._close_deferred = public
+            if isinstance(inner, Deferred):
+                success = lambda value: (
+                    composite.callback(value) if not composite.called else value
+                )
+                failure = lambda error: (
+                    composite.errback(error) if not composite.called else None
+                )
+                try:
+                    inner.addCallbacks(success, failure)
+                except BaseException as exc:
+                    try:
+                        inner.addCallbacks(success, failure)
+                    except BaseException:
+                        if not composite.called:
+                            composite.errback(exc)
+                try:
+                    inner.addErrback(lambda _failure: None)
+                except BaseException:
+                    pass
+            elif not composite.called:
+                composite.callback(inner)
+            return None
+
+        try:
+            gate.addBoth(finish_wait)
+        except BaseException as exc:
+            try:
+                gate.addBoth(finish_wait)
+            except BaseException:
+                if not composite.called:
+                    composite.errback(exc)
+        try:
+            gate.addErrback(lambda _failure: None)
+        except BaseException:
+            pass
+        try:
+            composite.addErrback(lambda _failure: None)
+        except BaseException:
+            pass
+        return public
 
     def close_backend(self) -> Deferred[Any] | None:
         """Retryably close mixin-owned components and manager references.
@@ -1602,11 +2249,23 @@ class BackendSpiderMixin(Spider):
         while True:
             with self._lifecycle_lock:
                 if self._close_in_progress:
-                    if self._close_owner_thread_id == current_thread:
-                        return self._close_deferred
-                    if self._close_deferred is not None:
-                        return self._close_deferred
-                    raise RuntimeError("Backend spider close is already in progress")
+                    if (
+                        self._close_wait_finishing
+                        and self._close_owner_thread_id == current_thread
+                    ):
+                        # Transfer the construction-wait reservation to this real
+                        # teardown pass; the branch below immediately reclaims it.
+                        self._close_wait_finishing = False
+                        self._close_in_progress = False
+                        self._close_owner_thread_id = None
+                    else:
+                        if self._close_owner_thread_id == current_thread:
+                            return self._close_deferred
+                        if self._close_deferred is not None:
+                            return self._close_deferred
+                        raise RuntimeError(
+                            "Backend spider close is already in progress"
+                        )
                 setup_attempt = self._setup_attempt
                 if setup_attempt is not None:
                     setup_attempt.invalidated = True
@@ -1619,9 +2278,13 @@ class BackendSpiderMixin(Spider):
                 else:
                     setup_waiter = None
                 active = tuple(self._component_constructions.values())
+                for key, operation in tuple(self._async_component_operations.items()):
+                    if operation.called:
+                        self._async_component_operations.pop(key, None)
+                async_operations = tuple(self._async_component_operations.values())
                 if setup_waiter is not None:
                     waiters = (setup_waiter,)
-                elif not active:
+                elif not active and not async_operations:
                     self._close_in_progress = True
                     self._close_owner_thread_id = current_thread
                     break
@@ -1640,10 +2303,26 @@ class BackendSpiderMixin(Spider):
                 # published component; manager release never overtakes construction.
                 if setup_waiter is None:
                     waiters = tuple(construction.done for construction in active)
+                if (waiters or async_operations) and reactor_is_running():
+                    if active:
+                        self._invalidate_component_constructions_locked()
+                    return self._close_after_construction_wait(
+                        waiters,
+                        async_operations,
+                        current_thread,
+                    )
+                if async_operations:
+                    # Deferred callbacks cannot be pumped once the reactor has
+                    # stopped. Failing explicitly is safer than spinning forever
+                    # while retaining the manager generation for a later retry.
+                    raise RuntimeError(
+                        "Backend spider close cannot await an active reactor operation"
+                    )
             for waiter in waiters:
                 waiter.wait()
 
         asynchronous = False
+        dupefilter_async_attempted = False
 
         def reset_close_state() -> None:
             with self._lifecycle_lock:
@@ -1653,6 +2332,13 @@ class BackendSpiderMixin(Spider):
 
         try:
             primary_error: BaseException | None = None
+            # Teardown owns the generation present when close was reserved. A
+            # callback may publish a replacement while an older component is
+            # closing; never release that replacement as if it were the old
+            # generation's manager.
+            with self._lifecycle_lock:
+                closing_manager = self._connection_manager
+                closing_manager_lease = self._connection_manager_lease
             signal_managers = {lease.manager for lease in self._signal_leases}
             if self._connected_signals is not None:
                 signal_managers.add(self._connected_signals)
@@ -1677,38 +2363,160 @@ class BackendSpiderMixin(Spider):
                 if scheduler is not None
                 else None
             )
+            scheduler_queue = (
+                getattr(scheduler, "_queue", None) if scheduler is not None else None
+            )
+
+            queue_attempted = False
+            snapshot_release_attempted = False
+            queue_release_attempted = False
+            parent_release_attempted = False
+            orphan_attempted = False
 
             def continue_after_scheduler() -> Deferred[Any] | None:
                 """Run every dependency after scheduler close has settled."""
-                nonlocal primary_error
+                nonlocal primary_error, dupefilter_async_attempted, asynchronous
+                nonlocal queue_attempted
+                nonlocal snapshot_release_attempted, queue_release_attempted
+                nonlocal parent_release_attempted
 
                 queue = self._queue
-                if queue is not None:
-                    queue_error: BaseException | None = None
-                    queue_ordinary_error = False
-                    try:
-                        queue.close()
-                    except Exception as exc:
-                        queue_error = exc
-                        queue_ordinary_error = True
-                    except BaseException as exc:  # noqa: BLE001 - preserve control flow
-                        queue_error = exc
-                    else:
-                        if self._queue is queue:
-                            self._queue = None
-                            self._queue_name = None
+                if queue is not None and not queue_attempted:
+                    queue_attempted = True
+                    operation, immediate_error, succeeded = self._start_component_close(
+                        "queue",
+                        queue,
+                        "",
+                    )
+                    if operation is not None:
+                        if not operation.called:
+                            asynchronous = True
+
+                        def finish_queue(outcome: Any) -> Any:
+                            nonlocal primary_error
+                            if isinstance(outcome, TwistedFailure):
+                                error = outcome.value
+                                if primary_error is None:
+                                    primary_error = error
+                                if isinstance(error, Exception):
+                                    try:
+                                        logger.error(
+                                            "Failed to close backend component"
+                                        )
+                                    except BaseException:
+                                        pass
+                            elif self._queue is queue:
+                                self._queue = None
+                                self._queue_name = None
+                            return continue_after_scheduler()
+
+                        try:
+                            operation.addBoth(finish_queue)
+                        except BaseException:
+                            try:
+                                operation.addBoth(finish_queue)
+                            except BaseException:
+                                pass
+                        return operation
+                    queue_error = immediate_error
                     if queue_error is not None:
                         if primary_error is None:
                             primary_error = queue_error
-                        if queue_ordinary_error:
+                        if isinstance(queue_error, Exception):
                             try:
                                 logger.error("Failed to close backend component")
                             except BaseException:
                                 pass
+                    elif succeeded and self._queue is queue:
+                        self._queue = None
+                        self._queue_name = None
 
                 # If the scheduler did not own this dupefilter, the mixin does.
                 dupefilter = self._dupefilter
-                if dupefilter is not None and dupefilter is not scheduler_dupefilter:
+                if (
+                    dupefilter is not None
+                    and dupefilter is not scheduler_dupefilter
+                    and not dupefilter_async_attempted
+                ):
+                    lifecycle = _backend_dupefilter_lifecycle(dupefilter)
+                    authoritative_close = getattr(
+                        dupefilter,
+                        "_close_authoritative_async",
+                        None,
+                    )
+                    if (
+                        reactor_is_running()
+                        and lifecycle is not None
+                        and callable(authoritative_close)
+                    ):
+                        try:
+                            operation, bounded_close = authoritative_close(
+                                "spider-mixin-close",
+                                timeout=DEFAULT_REACTOR_IO_TIMEOUT_S,
+                            )
+                        except BaseException as exc:
+                            # Adapter construction is extension code too. Keep its
+                            # control-flow/ordinary error as the first close error,
+                            # then let the remaining siblings run and preserve the
+                            # dupefilter reference for a retry.
+                            dupefilter_async_attempted = True
+                            if primary_error is None:
+                                primary_error = exc
+                            if isinstance(exc, Exception):
+                                try:
+                                    logger.error("Failed to close backend component")
+                                except BaseException:
+                                    pass
+                            return continue_after_scheduler()
+                        else:
+                            # The composite owns the authoritative operation and
+                            # exposes its own bounded result. This nested view is not
+                            # returned to a caller, so consume its independent
+                            # failure branch to avoid an unhandled Deferred.
+                            if (
+                                isinstance(bounded_close, Deferred)
+                                and bounded_close is not operation
+                            ):
+                                bounded_close.addErrback(lambda _failure: None)
+                            # Publish asynchronous ownership only after adapter
+                            # setup succeeds. A synchronous BaseException from the
+                            # adapter follows the ordinary close path above instead
+                            # of stranding ``_close_in_progress``.
+                            dupefilter_async_attempted = True
+                            asynchronous = True
+
+                            def finish_async_dupefilter_close(result: Any) -> Any:
+                                nonlocal primary_error
+                                if isinstance(result, TwistedFailure):
+                                    error = result.value
+                                    if primary_error is None:
+                                        primary_error = error
+                                    if isinstance(error, Exception):
+                                        try:
+                                            logger.error(
+                                                "Failed to close backend component"
+                                            )
+                                        except BaseException:
+                                            pass
+                                elif self._dupefilter is dupefilter:
+                                    self._dupefilter = None
+                                return continue_after_scheduler()
+
+                            try:
+                                result = operation.addBoth(
+                                    finish_async_dupefilter_close
+                                )
+                            except BaseException:
+                                try:
+                                    result = operation.addBoth(
+                                        finish_async_dupefilter_close
+                                    )
+                                except BaseException as exc:
+                                    failed: Deferred[Any] = Deferred()
+                                    failed.errback(exc)
+                                    return failed
+                            return cast(Deferred[Any], result)
+
                     dupefilter_error: BaseException | None = None
                     dupefilter_ordinary_error = False
                     try:
@@ -1733,30 +2541,60 @@ class BackendSpiderMixin(Spider):
                 # A queue's snapshot lease is a separate acquire and is released
                 # only after that queue has crossed its durability/cleanup barrier.
                 snapshot_lease = self._snapshot_connection_lease
-                if snapshot_lease is not None and self._queue is None:
-                    snapshot_error: BaseException | None = None
-                    snapshot_ordinary_error = False
-                    try:
-                        snapshot_lease.release()
-                    except Exception as exc:
-                        snapshot_error = exc
-                        snapshot_ordinary_error = True
-                    except BaseException as exc:  # noqa: BLE001
-                        snapshot_error = exc
-                    else:
-                        if self._snapshot_connection_lease is snapshot_lease:
-                            self._snapshot_connection_lease = None
-                            self._snapshot_connection_manager = None
-                    if snapshot_error is not None:
+                if (
+                    snapshot_lease is not None
+                    and self._queue is None
+                    and not snapshot_release_attempted
+                ):
+                    snapshot_release_attempted = True
+                    operation, immediate_error, succeeded = (
+                        self._start_release_operation(snapshot_lease)
+                    )
+                    if operation is not None:
+                        if not operation.called:
+                            asynchronous = True
+
+                        def finish_snapshot_release(outcome: Any) -> Any:
+                            nonlocal primary_error
+                            if isinstance(outcome, TwistedFailure):
+                                error = outcome.value
+                                if primary_error is None:
+                                    primary_error = error
+                                if isinstance(error, Exception):
+                                    try:
+                                        logger.error(
+                                            "Failed to release snapshot connection lease"
+                                        )
+                                    except BaseException:
+                                        pass
+                            elif self._snapshot_connection_lease is snapshot_lease:
+                                self._snapshot_connection_lease = None
+                                self._snapshot_connection_manager = None
+                            return continue_after_scheduler()
+
+                        try:
+                            operation.addBoth(finish_snapshot_release)
+                        except BaseException:
+                            try:
+                                operation.addBoth(finish_snapshot_release)
+                            except BaseException:
+                                pass
+                        return operation
+                    if immediate_error is not None:
                         if primary_error is None:
-                            primary_error = snapshot_error
-                        if snapshot_ordinary_error:
+                            primary_error = immediate_error
+                        if isinstance(immediate_error, Exception):
                             try:
                                 logger.error(
                                     "Failed to release snapshot connection lease"
                                 )
                             except BaseException:
                                 pass
+                    elif (
+                        succeeded and self._snapshot_connection_lease is snapshot_lease
+                    ):
+                        self._snapshot_connection_lease = None
+                        self._snapshot_connection_manager = None
 
                 # A queue-backend override has its own exact acquire. Release it
                 # only after the queue and its separate snapshot lease succeed;
@@ -1766,34 +2604,90 @@ class BackendSpiderMixin(Spider):
                     queue_lease is not None
                     and self._queue is None
                     and self._snapshot_connection_lease is None
+                    and not queue_release_attempted
                 ):
-                    queue_manager_error: BaseException | None = None
-                    queue_manager_ordinary_error = False
-                    try:
-                        queue_lease.release()
-                    except Exception as exc:
-                        queue_manager_error = exc
-                        queue_manager_ordinary_error = True
-                    except BaseException as exc:  # noqa: BLE001
-                        queue_manager_error = exc
-                    else:
-                        if self._queue_connection_lease is queue_lease:
-                            self._queue_connection_lease = None
-                            self._queue_connection_manager = None
-                    if queue_manager_error is not None:
+                    queue_release_attempted = True
+                    operation, immediate_error, succeeded = (
+                        self._start_release_operation(queue_lease)
+                    )
+                    if operation is not None:
+                        if not operation.called:
+                            asynchronous = True
+
+                        def finish_queue_release(outcome: Any) -> Any:
+                            nonlocal primary_error
+                            if isinstance(outcome, TwistedFailure):
+                                error = outcome.value
+                                if primary_error is None:
+                                    primary_error = error
+                                if isinstance(error, Exception):
+                                    try:
+                                        logger.error(
+                                            "Failed to release queue connection lease"
+                                        )
+                                    except BaseException:
+                                        pass
+                            elif self._queue_connection_lease is queue_lease:
+                                self._queue_connection_lease = None
+                                self._queue_connection_manager = None
+                            return continue_after_scheduler()
+
+                        try:
+                            operation.addBoth(finish_queue_release)
+                        except BaseException:
+                            try:
+                                operation.addBoth(finish_queue_release)
+                            except BaseException:
+                                pass
+                        return operation
+                    if immediate_error is not None:
                         if primary_error is None:
-                            primary_error = queue_manager_error
-                        if queue_manager_ordinary_error:
+                            primary_error = immediate_error
+                        if isinstance(immediate_error, Exception):
                             try:
                                 logger.error("Failed to release queue connection lease")
                             except BaseException:
                                 pass
+                    elif succeeded and self._queue_connection_lease is queue_lease:
+                        self._queue_connection_lease = None
+                        self._queue_connection_manager = None
 
-                orphan_error = self._cleanup_orphan_candidates("spider-mixin-close")
-                if orphan_error is not None:
-                    if primary_error is None:
-                        primary_error = orphan_error
-                    if isinstance(orphan_error, Exception):
+                nonlocal orphan_attempted
+                if not orphan_attempted:
+                    orphan_attempted = True
+                    orphan_cleanup = self._cleanup_orphan_candidates(
+                        "spider-mixin-close"
+                    )
+                    if isinstance(orphan_cleanup, Deferred):
+                        if not orphan_cleanup.called:
+                            asynchronous = True
+
+                        def finish_orphan_cleanup(outcome: Any) -> Any:
+                            nonlocal primary_error
+                            if isinstance(outcome, TwistedFailure):
+                                error = outcome.value
+                                if primary_error is None:
+                                    primary_error = error
+                                if isinstance(error, Exception):
+                                    try:
+                                        logger.error(
+                                            "Failed to close backend candidate"
+                                        )
+                                    except BaseException:
+                                        pass
+                            return continue_after_scheduler()
+
+                        try:
+                            orphan_cleanup.addBoth(finish_orphan_cleanup)
+                        except BaseException:
+                            try:
+                                orphan_cleanup.addBoth(finish_orphan_cleanup)
+                            except BaseException:
+                                pass
+                        return orphan_cleanup
+                    if orphan_cleanup is not None and primary_error is None:
+                        primary_error = orphan_cleanup
+                    if isinstance(orphan_cleanup, Exception):
                         try:
                             logger.error("Failed to close backend candidate")
                         except BaseException:
@@ -1802,7 +2696,15 @@ class BackendSpiderMixin(Spider):
                 # Never release the shared manager while any required provider
                 # still has ownership. This is the retry fence for async scheduler
                 # failures and for every synchronous component failure.
-                manager = self._connection_manager
+                current_manager = self._connection_manager
+                manager = (
+                    closing_manager if closing_manager is not None else current_manager
+                )
+                manager_lease = (
+                    closing_manager_lease
+                    if closing_manager is not None
+                    else self._connection_manager_lease
+                )
                 required_cleanup_complete = (
                     self._connected_signals is None
                     and not self._signal_leases
@@ -1815,34 +2717,104 @@ class BackendSpiderMixin(Spider):
                     and not self._orphan_leases
                     and not self._orphan_managers
                 )
-                if manager is not None and required_cleanup_complete:
-                    manager_error: BaseException | None = None
-                    manager_ordinary_error = False
-                    try:
-                        if self._connection_manager_lease is not None:
-                            self._connection_manager_lease.release()
-                        else:
-                            manager.close()
-                    except Exception as exc:
-                        manager_error = exc
-                        manager_ordinary_error = True
-                    except BaseException as exc:  # noqa: BLE001
-                        manager_error = exc
+                if (
+                    manager is not None
+                    and required_cleanup_complete
+                    and not parent_release_attempted
+                ):
+                    parent_release_attempted = True
+                    if manager_lease is not None:
+                        operation, immediate_error, succeeded = (
+                            self._start_release_operation(manager_lease)
+                        )
                     else:
-                        if self._connection_manager is manager:
-                            self._connection_manager = None
-                            self._connection_manager_lease = None
-                            self._consumer_queue_name = None
-                    if manager_error is not None:
+                        operation, immediate_error, succeeded = (
+                            self._start_manager_operation(manager)
+                        )
+                    if operation is not None:
+                        if not operation.called:
+                            asynchronous = True
+
+                        def finish_parent_release(outcome: Any) -> Any:
+                            nonlocal primary_error
+                            if isinstance(outcome, TwistedFailure):
+                                error = outcome.value
+                                if primary_error is None:
+                                    primary_error = error
+                                if self._connection_manager is not manager:
+                                    with self._lifecycle_lock:
+                                        if manager_lease is not None:
+                                            if not any(
+                                                existing is manager_lease
+                                                for existing in self._orphan_leases
+                                            ):
+                                                self._orphan_leases.append(
+                                                    manager_lease
+                                                )
+                                        elif not any(
+                                            existing is manager
+                                            for existing in self._orphan_managers
+                                        ):
+                                            self._orphan_managers.append(manager)
+                                        if (
+                                            self._connection_manager_lease
+                                            is manager_lease
+                                        ):
+                                            self._connection_manager_lease = None
+                                if isinstance(error, Exception):
+                                    try:
+                                        logger.error(
+                                            "Failed to close backend connection manager"
+                                        )
+                                    except BaseException:
+                                        pass
+                            elif self._connection_manager is manager:
+                                self._connection_manager = None
+                                self._connection_manager_lease = None
+                                self._consumer_queue_name = None
+                            elif self._connection_manager_lease is manager_lease:
+                                self._connection_manager_lease = None
+                            return continue_after_scheduler()
+
+                        try:
+                            operation.addBoth(finish_parent_release)
+                        except BaseException:
+                            try:
+                                operation.addBoth(finish_parent_release)
+                            except BaseException:
+                                pass
+                        return operation
+                    if immediate_error is not None:
                         if primary_error is None:
-                            primary_error = manager_error
-                        if manager_ordinary_error:
+                            primary_error = immediate_error
+                        if self._connection_manager is not manager:
+                            with self._lifecycle_lock:
+                                if manager_lease is not None:
+                                    if not any(
+                                        existing is manager_lease
+                                        for existing in self._orphan_leases
+                                    ):
+                                        self._orphan_leases.append(manager_lease)
+                                elif not any(
+                                    existing is manager
+                                    for existing in self._orphan_managers
+                                ):
+                                    self._orphan_managers.append(manager)
+                                if self._connection_manager_lease is manager_lease:
+                                    self._connection_manager_lease = None
+                        if isinstance(immediate_error, Exception):
                             try:
                                 logger.error(
                                     "Failed to close backend connection manager"
                                 )
                             except BaseException:
                                 pass
+                    elif succeeded and self._connection_manager is manager:
+                        self._connection_manager = None
+                        self._connection_manager_lease = None
+                        self._consumer_queue_name = None
+                    elif self._connection_manager_lease is manager_lease:
+                        self._connection_manager_lease = None
 
                 if primary_error is not None:
                     raise primary_error
@@ -1921,6 +2893,7 @@ class BackendSpiderMixin(Spider):
                         return result
 
                     def scheduler_settled(result: Any) -> Any:
+                        """Finish sibling teardown before completing the composite."""
                         nonlocal primary_error
                         if isinstance(result, TwistedFailure):
                             scheduler_error = result.value
@@ -1934,22 +2907,63 @@ class BackendSpiderMixin(Spider):
                         else:
                             if self._scheduler is scheduler:
                                 self._scheduler = None
+                            if self._queue is scheduler_queue:
+                                self._queue = None
+                                self._queue_name = None
                             if (
                                 scheduler_dupefilter is not None
                                 and self._dupefilter is scheduler_dupefilter
                             ):
                                 self._dupefilter = None
+
+                        def finish_siblings(_ignored: Any = None) -> Any:
+                            final_error = primary_error
+                            if final_error is not None:
+                                final_failure = TwistedFailure(  # type: ignore[no-untyped-call]
+                                    final_error
+                                )
+                                settle_composite(final_failure)
+                                return final_failure
+                            settle_composite(None)
+                            # Preserve the scheduler's original result for its
+                            # own Deferred branch; the composite is the sibling
+                            # completion barrier exposed by the mixin.
+                            return result
+
+                        def fail_siblings(failure: Any) -> Any:
+                            nonlocal primary_error
+                            error = (
+                                failure.value
+                                if isinstance(failure, TwistedFailure)
+                                else failure
+                            )
+                            if primary_error is None:
+                                primary_error = error
+                            return finish_siblings()
+
                         try:
-                            continue_after_scheduler()
+                            continuation = continue_after_scheduler()
                         except BaseException as exc:
                             if primary_error is None:
                                 primary_error = exc
-                        final: Any = primary_error
-                        if final is not None:
-                            settle_composite(TwistedFailure(final))  # type: ignore[no-untyped-call]
-                            return TwistedFailure(final)  # type: ignore[no-untyped-call]
-                        settle_composite(None)
-                        return None
+                            return finish_siblings()
+                        if isinstance(continuation, Deferred):
+                            try:
+                                return continuation.addCallbacks(
+                                    finish_siblings,
+                                    fail_siblings,
+                                )
+                            except BaseException as exc:
+                                try:
+                                    return continuation.addCallbacks(
+                                        finish_siblings,
+                                        fail_siblings,
+                                    )
+                                except BaseException:
+                                    if not composite.called:
+                                        composite.errback(exc)
+                                    return continuation
+                        return finish_siblings()
 
                     if authoritative is scheduler_result:
                         # This Deferred is itself the caller-facing result; preserve
@@ -1957,21 +2971,29 @@ class BackendSpiderMixin(Spider):
                         # distinct worker Deferred, the explicit fork below can
                         # consume a late failure independently of its public view.
                         def settle_public_success(result: Any) -> Any:
-                            scheduler_settled(result)
-                            if primary_error is not None:
-                                return TwistedFailure(  # type: ignore[no-untyped-call]
-                                    primary_error
-                                )
-                            return result
+                            return scheduler_settled(result)
 
                         def settle_public_failure(failure: Any) -> Any:
-                            settled = scheduler_settled(failure)
-                            return failure if settled is None else settled
+                            return scheduler_settled(failure)
 
-                        authoritative.addCallbacks(
-                            settle_public_success,
-                            settle_public_failure,
-                        )
+                        try:
+                            authoritative.addCallbacks(
+                                settle_public_success,
+                                settle_public_failure,
+                            )
+                        except BaseException:
+                            try:
+                                authoritative.addCallbacks(
+                                    settle_public_success,
+                                    settle_public_failure,
+                                )
+                            except BaseException:
+                                if not composite.called:
+                                    composite.errback(
+                                        RuntimeError(
+                                            "scheduler close callback attachment failed"
+                                        )
+                                    )
                     else:
                         # Do not infer ownership from ``addBoth``'s return identity:
                         # Twisted may return the source Deferred, leaving a late
@@ -1980,35 +3002,55 @@ class BackendSpiderMixin(Spider):
                         authority_observer: Deferred[Any] = Deferred()
                         authority_observer.addErrback(lambda _failure: None)
 
-                        def observe_authority_success(result: Any) -> Any:
-                            scheduler_settled(result)
+                        def mirror_authority(value: Any) -> Any:
+                            if isinstance(value, TwistedFailure):
+                                if not authority_observer.called:
+                                    authority_observer.errback(value)
+                                # This observer branch is deliberately consumed;
+                                # the composite owns the public result.
+                                return None
                             if not authority_observer.called:
-                                authority_observer.callback(result)
-                            return result
+                                authority_observer.callback(value)
+                            return value
+
+                        def observe_authority_success(result: Any) -> Any:
+                            settled = scheduler_settled(result)
+                            if isinstance(settled, Deferred):
+                                return settled.addBoth(mirror_authority)
+                            return mirror_authority(settled)
 
                         def observe_authority_failure(failure: Any) -> Any:
                             try:
-                                scheduler_settled(failure)
+                                settled = scheduler_settled(failure)
                             except BaseException as exc:
-                                mirrored = TwistedFailure(exc)  # type: ignore[no-untyped-call]
-                                if not authority_observer.called:
-                                    authority_observer.errback(mirrored)
-                                return None
-                            if not authority_observer.called:
-                                authority_observer.errback(failure)
+                                settled = TwistedFailure(exc)  # type: ignore[no-untyped-call]
+                            if isinstance(settled, Deferred):
+                                return settled.addBoth(mirror_authority)
+                            mirror_authority(settled)
                             # The source failure is consumed by this explicit
                             # observer; the public bounded view already settled on
                             # its timeout and must not receive a second error.
                             return None
 
-                        authoritative.addCallbacks(
-                            observe_authority_success,
-                            observe_authority_failure,
-                        )
-                    if (
-                        authoritative is not scheduler_result
-                        and public_result is not scheduler_result
-                    ):
+                        try:
+                            authoritative.addCallbacks(
+                                observe_authority_success,
+                                observe_authority_failure,
+                            )
+                        except BaseException:
+                            try:
+                                authoritative.addCallbacks(
+                                    observe_authority_success,
+                                    observe_authority_failure,
+                                )
+                            except BaseException as exc:
+                                if not composite.called:
+                                    composite.errback(exc)
+                    if public_result is not scheduler_result:
+                        # The composite owns the public failure while the
+                        # scheduler's bounded/authoritative branch is only an
+                        # internal trigger. Consume that separate branch after
+                        # its outcome has been mirrored into ``composite``.
                         scheduler_result.addErrback(lambda _failure: None)
                     if public_result is not composite:
                         composite.addErrback(lambda _failure: None)
@@ -2016,13 +3058,48 @@ class BackendSpiderMixin(Spider):
                 else:
                     if self._scheduler is scheduler:
                         self._scheduler = None
+                    if self._queue is scheduler_queue:
+                        self._queue = None
+                        self._queue_name = None
                     if (
                         scheduler_dupefilter is not None
                         and self._dupefilter is scheduler_dupefilter
                     ):
                         self._dupefilter = None
 
-            return continue_after_scheduler()
+            result = continue_after_scheduler()
+            if isinstance(result, Deferred):
+                asynchronous = True
+
+                def settle_direct_close(value: Any) -> Any:
+                    reset_close_state()
+                    return value
+
+                try:
+                    authoritative_result = result.addBoth(settle_direct_close)
+                except BaseException as exc:
+                    try:
+                        authoritative_result = result.addBoth(settle_direct_close)
+                    except BaseException:
+                        authoritative_result = Deferred()
+                        authoritative_result.errback(exc)
+                public_result = (
+                    bounded_deferred(
+                        authoritative_result,
+                        timeout=DEFAULT_REACTOR_IO_TIMEOUT_S,
+                        operation="spider backend close",
+                    )
+                    if reactor_is_running()
+                    else authoritative_result
+                )
+                if public_result is not authoritative_result:
+                    # The bounded Deferred is the caller-facing failure surface;
+                    # consume the late authoritative branch after it has mirrored
+                    # its outcome so a timeout/failure cannot become unhandled.
+                    authoritative_result.addErrback(lambda _failure: None)
+                self._close_deferred = public_result
+                return public_result
+            return result
         finally:
             if not asynchronous:
                 reset_close_state()

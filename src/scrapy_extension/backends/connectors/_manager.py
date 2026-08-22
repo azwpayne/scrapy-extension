@@ -20,7 +20,7 @@ from functools import wraps
 from json import JSONEncoder
 from pathlib import PurePath
 from types import ModuleType
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, Protocol, cast
 from uuid import UUID
 
 from pydantic import SecretBytes, SecretStr, ValidationError
@@ -563,6 +563,16 @@ class _RetirementFinalizerToken:
         return False
 
 
+class _BreakerPolicySettings(Protocol):
+    """Minimal settings face consumed by ``apply_scrapy_breaker_policy``.
+
+    Scrapy's ``Settings`` satisfies this structurally; resolving an explicit
+    breaker policy needs only the keyed ``get`` lookup.
+    """
+
+    def get(self, name: str, default: object = None) -> object: ...
+
+
 class ConnectionManagerLease:
     """Acquire-specific, idempotently releasable manager ownership.
 
@@ -884,20 +894,27 @@ class ConnectionManager:
             cls._pending_release_retry_threads.add(thread_id)
             leases = tuple(cls._pending_release_leases)
             managers = tuple(cls._pending_release_managers)
+        retry_failed = False
         try:
             for lease in leases:
                 try:
                     lease.release()
                 except BaseException:
-                    pass
+                    retry_failed = True
             for manager in managers:
                 try:
                     manager.close()
                 except BaseException:
-                    pass
+                    retry_failed = True
         finally:
             with cls._registry_lock:
                 cls._pending_release_retry_threads.discard(thread_id)
+        if retry_failed:
+            # Deferred rollback failures are intentionally non-fatal to the new
+            # acquire, but a static diagnostic keeps the repair backlog visible.
+            _log_diagnostic(
+                logger.warning, "A pending connection-manager release failed."
+            )
 
     @classmethod
     def get_manager(
@@ -1238,12 +1255,18 @@ class ConnectionManager:
             manager._users = 0
             manager._retired = True
             manager._retirement_event.set()
+        teardown_failed = False
         try:
             manager._finalize_retirement()
         except BaseException:
             # Forced registry teardown is best-effort: one broken victim must not
             # strand later victims or invalidate a newly returned manager acquire.
-            pass
+            teardown_failed = True
+        if teardown_failed:
+            # Keep the forced cleanup path observable, but leave the exception
+            # handler before invoking application logging so neither the primary
+            # teardown signal nor its traceback can reach a custom handler.
+            _log_diagnostic(logger.warning, "Error disconnecting evicted backend")
 
     @staticmethod
     def _registry_key(
@@ -1579,7 +1602,7 @@ class ConnectionManager:
 
             if connect_error is None and self._retired:
                 connect_error = BackendConnectionError(
-                    "ConnectionManager was released while connecting",
+                    "Connection manager was released while connecting",
                     backend_type=str(self._backend_type_for_operations()),
                 )
 
@@ -1616,7 +1639,7 @@ class ConnectionManager:
         with self._lock:
             if self._retired:
                 raise BackendConnectionError(
-                    "ConnectionManager was released while connecting",
+                    "Connection manager was released while connecting",
                     backend_type=str(self._backend_type_for_operations()),
                 )
             backend = self._backend
@@ -1757,6 +1780,7 @@ class ConnectionManager:
         failed_attempt = False
         for attempt in range(total_attempts):
             attempt_failed = False
+            release_error: BackendConnectionError | None = None
             try:
                 self._attempt_connection()
             except (ConfigurationError, ValidationError, ImportError):
@@ -1764,7 +1788,7 @@ class ConnectionManager:
                 # network backoff. Preserve their actionable exception and avoid
                 # constructing/sleeping through the remaining retry attempts.
                 raise
-            except Exception:
+            except Exception as error:
                 # Intentional broad catch: any backend connection error should trigger retry.
                 # Backend-specific exceptions (RedisError, PyMongoError, KafkaError, AMQPError)
                 # all inherit from Exception. KeyboardInterrupt/SystemExit inherit from
@@ -1777,9 +1801,24 @@ class ConnectionManager:
                 with self._lock:
                     retired = self._retired
                 if retired:
-                    # A concurrent release won the race. Preserve the active typed
-                    # release error instead of replacing it with retry exhaustion.
-                    raise
+                    # A concurrent release won the race. Preserve a typed release
+                    # result already produced by the manager, but do not let an
+                    # arbitrary driver exception cross this boundary. Store the
+                    # rebuilt result and raise after this handler unwinds; otherwise
+                    # Python retains the rejected plugin exception as __context__.
+                    if isinstance(error, BackendConnectionError):
+                        release_error = cast(
+                            BackendConnectionError,
+                            _rebuild_connect_attempt_error(error),
+                        )
+                    else:
+                        release_error = BackendConnectionError(
+                            "Connection manager was released while connecting",
+                            backend_type=str(self._backend_type_for_operations()),
+                        )
+
+            if release_error is not None:
+                raise release_error
 
             if attempt_failed:
                 # The driver exception is no longer active here.  Keep continuation
@@ -1997,20 +2036,31 @@ class ConnectionManager:
                     backend_type=str(self._backend_type_for_operations()),
                 )
         backend = self._create_backend()
+        connection_error: BaseException | None = None
+        cleanup_failed = False
         try:
             backend.connect()
-        except BaseException:
+        except BaseException as error:
+            connection_error = error
             try:
                 backend.disconnect()
             except BaseException:
                 # Cleanup must never replace the original failed connection signal.
-                pass
+                cleanup_failed = True
             with self._lock:
                 retired_adapter, retired_source = (
                     self._detach_plugin_queue_backend_under_lock()
                 )
             del retired_adapter, retired_source
-            raise
+
+        if connection_error is not None:
+            # Ordinary candidate-cleanup failures are useful operational evidence,
+            # but diagnostics must run after the primary exception context unwinds.
+            # For process-control failures, do not invoke logging at all: the signal
+            # remains the sole observable control-flow outcome.
+            if cleanup_failed and isinstance(connection_error, Exception):
+                _log_diagnostic(logger.warning, "Error disconnecting failed backend")
+            raise connection_error
         with self._lock:
             if not self._retired:
                 self._backend = backend
@@ -2045,8 +2095,22 @@ class ConnectionManager:
         """Release one legacy acquire, preserving the historical API."""
         cls = type(self)
         if self._registry_token is None:
-            # Preserve direct-constructor validation and teardown behavior.
-            cls._registry_key(self.backend_type, self.settings)
+            # Preserve direct-constructor validation, but do not let a mutable or
+            # malformed settings graph prevent teardown of an already-live backend.
+            # The validation result is represented by a flag rather than retaining
+            # the raw exception graph while user/plugin cleanup runs.
+            validation_failed = False
+            validation_control_error: BaseException | None = None
+            try:
+                cls._registry_key(self.backend_type, self.settings)
+            except ConfigurationError:
+                validation_failed = True
+            except BaseException as error:
+                error.__traceback__ = None
+                error.__cause__ = None
+                error.__context__ = None
+                error.__suppress_context__ = True
+                validation_control_error = error
             with cls._registry_lock:
                 if self._active_acquires:
                     return
@@ -2057,6 +2121,13 @@ class ConnectionManager:
             except BaseException:
                 cls._retain_failed_manager(self)
                 raise
+            if validation_control_error is not None:
+                raise validation_control_error
+            if validation_failed:
+                raise ConfigurationError(
+                    "Connection manager configuration is invalid.",
+                    setting_name="configuration",
+                )
             return
 
         should_finalize = False
@@ -2595,7 +2666,7 @@ class ConnectionManager:
         self._breaker_resolved_from_env_fallback = from_env_fallback
         self._breaker_policy_values = (enabled, failure_threshold, reset_timeout)
 
-    def apply_scrapy_breaker_policy(self, settings: Any) -> None:
+    def apply_scrapy_breaker_policy(self, settings: _BreakerPolicySettings) -> None:
         """Apply an explicit Scrapy breaker policy without changing pool identity."""
         policy = resolve_circuit_breaker_policy(settings)
         if not policy:
@@ -2911,7 +2982,11 @@ class ConnectionManager:
         return wrap_storage_backend(backend, breaker)
 
 
-def release_manager_acquire(owner: Any, *, exact: bool = False) -> None:
+def release_manager_acquire(
+    owner: ConnectionManager | ConnectionManagerLease,
+    *,
+    exact: bool = False,
+) -> None:
     """Rollback one factory acquire while preserving the primary failure.
 
     Release can fail before its token is consumed or after retirement has taken
@@ -2919,8 +2994,21 @@ def release_manager_acquire(owner: Any, *, exact: bool = False) -> None:
     is safe and repairs both windows. If both attempts fail, the connection layer
     retains the exact owner for a later registry retry; callers still receive the
     first cleanup error so it cannot replace the factory's primary exception.
+
+    Args:
+        owner: The lease owning the acquire (``exact=True``) or the shared
+            manager to close (the default).
+        exact: Release the lease's own opaque acquire token instead of closing
+            the shared manager.
     """
-    release = owner.release if exact else owner.close
+    # ``exact`` selects the lease's acquire-scoped release face; the manager's
+    # face is ``close()``. Exactly one face exists per concrete owner type, and
+    # the casts keep the historical flag-based dispatch byte-identical.
+    release: Callable[[], None] = (
+        cast("ConnectionManagerLease", owner).release
+        if exact
+        else cast("ConnectionManager", owner).close
+    )
     try:
         release()
     except BaseException as first_error:
