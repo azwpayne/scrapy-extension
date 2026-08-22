@@ -12,6 +12,7 @@ from kafka import TopicPartition
 from kafka.admin import NewTopic
 from kafka.errors import KafkaError, TopicAlreadyExistsError
 from kafka.structs import OffsetAndMetadata
+from pydantic import ValidationError
 
 from scrapy_extension.backends import kafka as kafka_module
 from scrapy_extension.backends.kafka import KafkaBackend
@@ -88,13 +89,23 @@ class TestKafkaBackendConnect:
         admin.close.assert_not_called()
 
     def test_backend_rejects_auto_commit_with_explicit_ack_contract(self):
-        """KafkaBackend requires application-level ack, so auto-commit is unsafe."""
-        config = KafkaSettings(enable_auto_commit=True)
+        """KafkaBackend requires application-level ack, so auto-commit is unsafe.
 
-        with pytest.raises(ConfigurationError, match="enable_auto_commit") as exc_info:
-            KafkaBackend(config)
+        R141-F18 moved the contract to the settings layer (the message is kept
+        identical); the backend constructor guard remains for duck-typed configs
+        and is exercised via the mutated-config paths in
+        ``test_direct_backend_config_redaction.py`` and
+        ``test_kafka_coverage_closure.py``.
+        """
+        with pytest.raises(ConfigurationError) as exc_info:
+            KafkaSettings(enable_auto_commit=True)
 
         assert exc_info.value.setting_name == "enable_auto_commit"
+
+    def test_request_timeout_must_be_positive(self):
+        """A zero Kafka future deadline cannot provide a delivery boundary."""
+        with pytest.raises(ValidationError):
+            KafkaSettings(request_timeout_ms=0)
 
     def test_connect_unsupported_mode(self):
         """Test connect raises ConfigurationError for unsupported mode."""
@@ -836,7 +847,9 @@ class TestKafkaBackendPushPriorityMapping:
             value=b"item",
             partition=0,
         )
-        mock_future.get.assert_called_once_with(timeout=10)
+        mock_future.get.assert_called_once_with(
+            timeout=config.request_timeout_ms / 1000.0
+        )
 
 
 class TestKafkaBackendDisconnect:
@@ -1277,7 +1290,9 @@ class TestKafkaBackendPush:
         producer.send.assert_called_once_with(
             "scrapy-first", value=b"item", partition=0
         )
-        future.get.assert_called_once_with(timeout=10)
+        future.get.assert_called_once_with(
+            timeout=backend.config.request_timeout_ms / 1000.0
+        )
 
     def test_push_success(self, mocker):
         """Test successful push to queue."""
@@ -1299,7 +1314,9 @@ class TestKafkaBackendPush:
         assert call_args[0][0] == "scrapy-testq"
         assert call_args[1]["value"] == b"item_data"
         assert call_args[1]["partition"] == 5
-        mock_future.get.assert_called_once_with(timeout=10)
+        mock_future.get.assert_called_once_with(
+            timeout=config.request_timeout_ms / 1000.0
+        )
 
     def test_push_with_priority_clamped_to_max(self, mocker):
         """Test priority is clamped to max_priority_partitions - 1."""
@@ -1510,6 +1527,23 @@ class TestKafkaBackendPop:
         result = backend.pop("testq", timeout=0.0)
 
         assert result == b"data"
+
+    def test_failed_lazy_consumer_is_closed_and_not_published(self, mocker):
+        """A consumer that fails before poll cannot poison a later retry."""
+        backend = KafkaBackend(KafkaSettings())
+        failed_consumer = mocker.MagicMock()
+        failed_consumer.subscribe.side_effect = KafkaError("subscribe failed")
+        mocker.patch(
+            "scrapy_extension.backends.kafka.KafkaConsumer",
+            return_value=failed_consumer,
+        )
+
+        with pytest.raises(QueueError):
+            backend.pop("testq", timeout=0.0)
+
+        failed_consumer.close.assert_called_once_with()
+        assert backend._consumer is None
+        assert backend._generation_gate.current is None
 
     def test_pop_cluster_mode_uses_cluster_bootstrap_servers(self, mocker):
         """Test pop creates consumer with cluster brokers in cluster mode."""

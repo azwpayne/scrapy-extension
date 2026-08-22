@@ -10,6 +10,7 @@ Each test maps to a documented contract, not a line-hit.
 from __future__ import annotations
 
 from collections import defaultdict
+from threading import Event, Thread
 
 import pytest
 from kafka import TopicPartition
@@ -24,6 +25,7 @@ from scrapy_extension.exceptions import (
     BackendConnectionError,
     ConfigurationError,
     QueueError,
+    QueueOutcomeIndeterminateError,
 )
 from scrapy_extension.settings import KafkaMode, KafkaSettings
 
@@ -168,6 +170,152 @@ def test_disconnect_invalidates_known_topic_cache(mocker) -> None:
     assert backend._known_topics == set()
 
 
+def test_is_connected_requires_an_accepting_generation(mocker) -> None:
+    """Compatibility mirrors alone must not bypass generation admission."""
+    backend = _backend()
+    backend._producer = mocker.MagicMock()
+    backend._admin_client = mocker.MagicMock()
+
+    assert backend.is_connected() is False
+    assert backend._generation_gate.current is None
+
+
+def test_partial_consumer_cleanup_closes_unregistered_candidate_once(mocker) -> None:
+    backend = _backend()
+    candidate = mocker.MagicMock()
+    backend._consumer = candidate
+
+    backend._cleanup_partial_consumer(candidate, None, True)
+
+    assert backend._consumer is None
+    candidate.close.assert_called_once_with()
+    assert backend._generation_gate.current is None
+
+
+def test_retired_consumer_cleanup_is_owned_by_generation_finalizer(mocker) -> None:
+    backend = _backend()
+    producer = mocker.MagicMock()
+    admin = mocker.MagicMock()
+    consumer = mocker.MagicMock()
+    backend._producer = producer
+    backend._admin_client = admin
+    backend._consumer = consumer
+    backend._publish_generation_locked()
+    retired = backend._generation_gate.retire()
+    assert retired is not None
+    retired.value.retired = True
+
+    backend._cleanup_partial_consumer(consumer, retired.value, True)
+
+    # A retired generation owns its consumer; the candidate path must not close it
+    # a second time. The detached finalizer performs the sole close.
+    consumer.close.assert_not_called()
+    assert backend._consumer is None
+    assert backend._generation_gate.drain(retired, consumer.close) is None
+    consumer.close.assert_called_once_with()
+
+
+def test_abort_partial_connect_detaches_retired_maps_without_cross_generation_mutation(
+    mocker,
+) -> None:
+    backend = _backend()
+    producer = mocker.MagicMock()
+    admin = mocker.MagicMock()
+    consumer = mocker.MagicMock()
+    backend._producer = producer
+    backend._admin_client = admin
+    backend._consumer = consumer
+    backend._in_flight[("scrapy-q", 0)].add(3)
+    backend._watermarks[("scrapy-q", 0)] = 3
+    backend._high_water[("scrapy-q", 0)] = 4
+    backend._publish_generation_locked()
+    retired = backend._generation_gate.current
+    assert retired is not None
+    old_in_flight = retired.value.in_flight
+
+    assert backend._abort_partial_connect() is False
+
+    assert retired.value.retired is True
+    assert retired.value.in_flight is old_in_flight
+    assert old_in_flight is not None
+    assert old_in_flight[("scrapy-q", 0)] == {3}
+    assert backend._in_flight is not old_in_flight
+    backend._in_flight[("scrapy-q", 0)].add(9)
+    assert old_in_flight[("scrapy-q", 0)] == {3}
+    assert backend._generation_gate.current is None
+    producer.close.assert_called_once_with()
+    consumer.close.assert_called_once_with()
+    admin.close.assert_called_once_with()
+
+
+def test_push_driver_failure_is_indeterminate_without_generation_leak(mocker) -> None:
+    backend = _backend()
+    producer = mocker.MagicMock()
+    admin = mocker.MagicMock()
+    future = mocker.MagicMock()
+    future.get.side_effect = KafkaError("broker outcome unknown")
+    producer.send.return_value = future
+    backend._producer = producer
+    backend._admin_client = admin
+    backend._known_topics.add("scrapy-q")
+
+    with pytest.raises(QueueError) as exc_info:
+        backend.push("q", b"payload")
+
+    assert exc_info.value.operation == "push"
+    assert isinstance(exc_info.value, QueueOutcomeIndeterminateError)
+    assert "indeterminate" in str(exc_info.value).lower()
+    producer.send.assert_called_once()
+    future.get.assert_called_once()
+    generation = backend._generation_gate.current
+    assert generation is not None and generation.accepting
+    backend.disconnect()
+    producer.close.assert_called_once_with()
+    admin.close.assert_called_once_with()
+
+
+def test_ack_commit_failure_restores_exact_attempt_for_retry(mocker) -> None:
+    backend = _backend()
+    consumer = mocker.MagicMock()
+    consumer.commit.side_effect = [KafkaError("commit lost"), None]
+    backend._consumer = consumer
+    topic_partition = ("scrapy-q", 0)
+    token = _KafkaAckToken(
+        partition=0,
+        offset=1,
+        topic="scrapy-q",
+        consumer_generation=0,
+        assignment_epoch=0,
+        delivery_attempt=1,
+    )
+    backend._in_flight[topic_partition].add(token.offset)
+    backend._watermarks[topic_partition] = 0
+    backend._high_water[topic_partition] = 2
+    backend._active_attempts[(token.topic, token.partition, token.offset)] = 1
+    backend._active_attempts_by_partition[topic_partition] = {1}
+
+    with pytest.raises(QueueError, match="Failed to ack Kafka message"):
+        backend.ack("q", token=token)
+    assert backend._in_flight[topic_partition] == {1}
+    assert backend._active_attempts[(token.topic, token.partition, token.offset)] == 1
+
+    backend.ack("q", token=token)
+
+    assert consumer.commit.call_count == 2
+    assert topic_partition not in backend._in_flight
+    assert topic_partition not in backend._watermarks
+    assert topic_partition not in backend._high_water
+    assert (token.topic, token.partition, token.offset) not in backend._active_attempts
+    backend.disconnect()
+
+
+def test_rebalance_listener_without_identity_is_a_noop() -> None:
+    backend = _backend()
+    backend._rebalance_listener.on_partitions_revoked([])
+    backend._rebalance_listener.on_partitions_assigned([])
+    assert backend._assignment_epoch == 0
+
+
 # ---------------------------------------------------------------------------
 # _ack_token error paths
 # ---------------------------------------------------------------------------
@@ -273,11 +421,14 @@ def test_nack_success_is_terminal_but_seek_failure_is_retryable(mocker) -> None:
 
     with pytest.raises(QueueError, match="nack"):
         backend.nack("q", token=token)
+    assert token.offset in backend._in_flight[(topic, 0)]
     backend.nack("q", token=token)
+    assert token.offset in backend._in_flight[(topic, 0)]
     backend.nack("q", token=token)
     backend.ack("q", token=token)
 
     assert consumer.seek.call_count == 2
+    assert token.offset in backend._in_flight[(topic, 0)]
     consumer.commit.assert_not_called()
 
 
@@ -304,6 +455,184 @@ def test_partition_revocation_fences_old_assignment_token(mocker) -> None:
     consumer.commit.assert_not_called()
     backend.ack("q", token=new_token)
     consumer.commit.assert_called_once()
+
+
+def test_retired_rebalance_listener_cannot_mutate_its_generation(mocker) -> None:
+    backend = _backend()
+    topic = "scrapy-q"
+    tp = TopicPartition(topic, 0)
+    consumer = mocker.MagicMock()
+    consumer.assignment.return_value = {tp}
+    consumer.poll.return_value = {tp: [_record(mocker, topic)]}
+    backend._consumer = consumer
+
+    _, token = backend.pop_with_ack("q")
+    listener = consumer.subscribe.call_args.kwargs["listener"]
+    retired = backend._generation_gate.current
+    assert retired is not None
+    retired_epoch = retired.value.assignment_epoch
+
+    backend.disconnect()
+    listener.on_partitions_revoked([tp])
+    listener.on_partitions_assigned([tp])
+
+    assert retired.value.assignment_epoch == retired_epoch
+    assert backend._generation_gate.current is None
+    assert backend._assignment_epoch == retired_epoch + 1
+    backend.ack("q", token=token)
+    consumer.commit.assert_not_called()
+
+
+def test_old_rebalance_listener_cannot_mutate_or_commit_replacement_generation(
+    mocker,
+) -> None:
+    backend = _backend()
+    topic = "scrapy-q"
+    tp = TopicPartition(topic, 0)
+    old_consumer = mocker.MagicMock()
+    old_consumer.assignment.return_value = {tp}
+    old_consumer.poll.return_value = {tp: [_record(mocker, topic, offset=0)]}
+    backend._consumer = old_consumer
+
+    _, old_token = backend.pop_with_ack("q")
+    old_listener = old_consumer.subscribe.call_args.kwargs["listener"]
+    old_generation = backend._generation_gate.current
+    assert old_generation is not None
+
+    backend.disconnect()
+
+    new_consumer = mocker.MagicMock()
+    new_consumer.assignment.return_value = {tp}
+    new_consumer.poll.return_value = {tp: [_record(mocker, topic, offset=0)]}
+    backend._consumer = new_consumer
+    _, new_token = backend.pop_with_ack("q")
+    new_generation = backend._generation_gate.current
+    assert new_generation is not None
+    new_epoch = new_generation.value.assignment_epoch
+
+    old_listener.on_partitions_revoked([tp])
+    old_listener.on_partitions_assigned([tp])
+
+    assert old_generation.value.assignment_epoch != new_epoch
+    assert new_generation.value.assignment_epoch == new_epoch
+    backend.ack("q", token=old_token)
+    new_consumer.commit.assert_not_called()
+    backend.ack("q", token=new_token)
+    new_consumer.commit.assert_called_once()
+
+
+def test_rebalance_clears_generation_legacy_delivery(mocker) -> None:
+    """A bare ack cannot settle a record from before a rebalance."""
+    backend = _backend()
+    topic = "scrapy-q"
+    tp = TopicPartition(topic, 0)
+    consumer = mocker.MagicMock()
+    consumer.assignment.return_value = {tp}
+    consumer.poll.return_value = {tp: [_record(mocker, topic)]}
+    backend._consumer = consumer
+
+    assert backend.pop("q") == b"payload"
+    listener = consumer.subscribe.call_args.kwargs["listener"]
+    listener.on_partitions_revoked([tp])
+    listener.on_partitions_assigned([tp])
+
+    backend.ack("q")
+
+    consumer.commit.assert_not_called()
+    assert backend._last_record is None
+    generation = backend._generation_gate.current
+    assert generation is not None
+    assert generation.value.legacy_record is None
+
+
+def test_ack_rebalance_callback_fences_active_lease(mocker) -> None:
+    """A rebalance callback during commit cannot make an old ack succeed."""
+    backend = _backend()
+    topic = "scrapy-q"
+    tp = TopicPartition(topic, 0)
+    consumer = mocker.MagicMock()
+    consumer.assignment.return_value = {tp}
+    consumer.poll.return_value = {tp: [_record(mocker, topic)]}
+    backend._consumer = consumer
+
+    _, token = backend.pop_with_ack("q")
+    listener = consumer.subscribe.call_args.kwargs["listener"]
+    consumer.commit.side_effect = lambda *_args, **_kwargs: (
+        listener.on_partitions_revoked([tp])
+    )
+
+    with pytest.raises(QueueError, match="connection changed"):
+        backend.ack("q", token=token)
+
+    generation = backend._generation_gate.current
+    assert generation is not None
+    assert generation.value.assignment_epoch == backend._assignment_epoch
+    assert consumer.commit.call_count == 1
+
+
+def test_ack_reentrant_disconnect_does_not_deadlock_with_teardown(
+    mocker,
+) -> None:
+    """A competing teardown cannot invert connection and delivery locks."""
+    backend = _backend()
+    producer = mocker.MagicMock()
+    admin = mocker.MagicMock()
+    consumer = mocker.MagicMock()
+    topic = "scrapy-q"
+    tp = TopicPartition(topic, 0)
+    consumer.assignment.return_value = {tp}
+    consumer.poll.return_value = {tp: [_record(mocker, topic)]}
+    backend._producer = producer
+    backend._admin_client = admin
+    backend._consumer = consumer
+    _, token = backend.pop_with_ack("q")
+
+    teardown_entered = Event()
+    allow_teardown = Event()
+    competitor_started = Event()
+    original_retire = backend._generation_gate.retire
+
+    def retire():
+        if competitor_started.is_set() and not allow_teardown.is_set():
+            teardown_entered.set()
+            assert allow_teardown.wait(timeout=2.0)
+        return original_retire()
+
+    backend._generation_gate.retire = retire  # type: ignore[method-assign]
+
+    def competing_teardown() -> None:
+        competitor_started.set()
+        backend.disconnect()
+
+    competitor = Thread(target=competing_teardown, daemon=True)
+
+    def commit(*_args: object, **_kwargs: object) -> None:
+        competitor.start()
+        assert teardown_entered.wait(timeout=2.0)
+        # Release the competing teardown only after it has tried disconnect.
+        # Both operations then pass the real gate's retirement fence without a
+        # scheduler-dependent delay.
+        allow_teardown.set()
+        backend.disconnect()
+
+    consumer.commit.side_effect = commit
+    errors: list[BaseException] = []
+
+    def acknowledge() -> None:
+        try:
+            backend.ack("q", token=token)
+        except BaseException as error:
+            errors.append(error)
+
+    acknowledgment = Thread(target=acknowledge, daemon=True)
+    acknowledgment.start()
+    acknowledgment.join(timeout=3.0)
+    competitor.join(timeout=3.0)
+
+    assert not acknowledgment.is_alive()
+    assert not competitor.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], QueueError)
 
 
 def test_subscription_change_fences_prior_topic_token(mocker) -> None:
