@@ -91,7 +91,10 @@ def sanitize_backend_error(
     try:
         replacement = error_type.__new__(error_type)
         BaseException.__init__(replacement, message)
-    except Exception:  # noqa: BLE001 - custom exception allocation is untrusted
+    except BaseException:
+        # A plugin exception type can run arbitrary code from ``__new__``.
+        # Allocation failure must collapse to the static base error rather than
+        # publish that control-flow object or its traceback graph.
         return BackendError(message)
     if isinstance(replacement, BackendError):
         return replacement

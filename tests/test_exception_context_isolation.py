@@ -90,7 +90,7 @@ def _connection_manager() -> MagicMock:
         ),
     ],
 )
-def test_snapshot_parse_fallback_handler_cannot_recover_error_context(
+def test_snapshot_parse_failure_has_no_parser_context_or_diagnostic_leak(
     logger_name: str,
     factory: Callable[[], object],
 ) -> None:
@@ -98,12 +98,15 @@ def test_snapshot_parse_fallback_handler_cannot_recover_error_context(
     strategy = factory()
 
     with _probe_logger(logger_name) as probe:
-        strategy.restore(f'{{"{marker}":'.encode())  # type: ignore[attr-defined]
+        with pytest.raises(QueueError, match="snapshot restore failed") as exc_info:
+            strategy.restore(f'{{"{marker}":'.encode())  # type: ignore[attr-defined]
 
-    _assert_isolated(probe, marker)
+    assert exc_info.value.__context__ is None
+    assert marker not in str(exc_info.value)
+    assert probe.records == []
 
 
-def test_round_robin_malformed_item_diagnostic_redacts_source_and_context() -> None:
+def test_round_robin_malformed_item_failure_redacts_source_and_context() -> None:
     marker = "round47_round_robin_source_marker"
     strategy = RoundRobinQueueStrategy(_connection_manager())
     state = json.dumps(
@@ -115,9 +118,12 @@ def test_round_robin_malformed_item_diagnostic_redacts_source_and_context() -> N
     ).encode()
 
     with _probe_logger("scrapy_extension.queue.strategies.round_robin") as probe:
-        strategy.restore(state)
+        with pytest.raises(QueueError, match="snapshot restore failed") as exc_info:
+            strategy.restore(state)
 
-    _assert_isolated(probe, marker)
+    assert exc_info.value.__context__ is None
+    assert marker not in str(exc_info.value)
+    assert probe.records == []
 
 
 def test_delay_monitor_fallback_handler_cannot_recover_error_context() -> None:

@@ -34,7 +34,12 @@ from scrapy_extension.backends.sqs import (
     SqsBackend,
     _v2_queue_owner,
 )
-from scrapy_extension.exceptions import BackendError, QueueError, StorageError
+from scrapy_extension.exceptions import (
+    BackendConnectionError,
+    BackendError,
+    QueueError,
+    StorageError,
+)
 from scrapy_extension.settings import PulsarSettings, SqsSettings
 
 _MARKER = "round42a-private-marker"
@@ -178,6 +183,87 @@ def test_sqs_token_ack_rebuilds_receipt_and_driver_failure(mocker: Any) -> None:
     _assert_operation_error_is_redacted(error, _MARKER)
 
 
+def test_backend_connection_error_masks_schemeless_userinfo_on_both_surfaces() -> None:
+    """Schemeless ``user:pw@host:port`` transport credentials must be masked in
+    both the exception message and the ``backend_type`` diagnostic (R141-F4):
+    ``urlsplit`` cannot see userinfo without a ``scheme://`` prefix."""
+    endpoint = "user:hunter2@queue.internal:5672"
+    error = BackendConnectionError(
+        f"Failed to connect to {endpoint} for queue q",
+        backend_type=endpoint,
+    )
+
+    assert "hunter2" not in str(error)
+    assert "user:" not in str(error)
+    assert error.backend_type == "backend"
+
+
+def test_backend_connection_error_masks_empty_username_schemeless_userinfo() -> None:
+    """Adversarial V3-1: an empty-username schemeless credential
+    (``:pw@host``) must be masked on both surfaces — ``str(e)`` and
+    ``backend_type`` — not just the populated-username form."""
+    endpoint = ":hunter2@queue.internal:5672"
+    error = BackendConnectionError(
+        f"Failed to connect to {endpoint}.",
+        backend_type=endpoint,
+    )
+
+    assert "hunter2" not in str(error)
+    assert ":hunter2@" not in str(error)
+    assert "hunter2" not in repr(error.__dict__)
+    assert error.backend_type == "backend"
+
+
+def test_backend_connection_error_masks_schemeless_userinfo_in_message_only() -> None:
+    """Adversarial V3-2: a schemeless ``user:pw@host:port`` URI interpolated
+    into the message text with no ``backend_type`` value supplied must still
+    be masked by the message-level fallback."""
+    error = BackendConnectionError(
+        "Failed to connect to user:hunter2@queue.internal:5672 upstream."
+    )
+
+    assert "hunter2" not in str(error)
+    assert "user:hunter2@" not in str(error)
+    assert "queue.internal:5672" not in str(error)
+    assert error.backend_type is None
+
+
+def test_operation_error_masks_bare_auth_scheme_credential_message() -> None:
+    """X5-2 at the public exception boundary: a bare ``basic``/``Bearer``
+    credential token interpolated as the message must not survive any public
+    surface — no scheme, userinfo, or header-line wrapper exists to help the
+    structural fallbacks."""
+    error = BackendConnectionError("basic dXNlcjpwYXNz")
+    assert str(error) == "***REDACTED***"
+    assert error.backend_type is None
+    _assert_operation_error_is_redacted(error, "dXNlcjpwYXNz")
+
+    bearer = QueueError("Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig")
+    assert str(bearer) == "***REDACTED***"
+    assert bearer.queue_name is None
+    _assert_operation_error_is_redacted(bearer, "eyJhbGciOiJIUzI1NiJ9.payload.sig")
+
+
+def test_operation_error_documents_raw_space_password_boundary() -> None:
+    """X1-1 decision (fix round 3), pinned at the public boundary: raw-space
+    passwords are RFC 3986-invalid userinfo and stay outside the heuristic
+    coverage by design (the value channel keeps the same RFC contract); the
+    RFC-valid form stays fully masked."""
+    schemeless = BackendConnectionError(
+        "connect user:hu nter2@host failed",
+        backend_type="user:hu nter2@host",
+    )
+    assert str(schemeless) == "connect user:hu nter2@host failed"
+    assert schemeless.backend_type == "user:hu nter2@host"
+
+    truncated = BackendConnectionError("connect redis://user:hu nter2@host failed")
+    assert str(truncated) == "connect ***REDACTED*** nter2@host failed"
+    assert truncated.backend_type is None
+
+    valid = BackendConnectionError("connect redis://user:hunter2@host failed")
+    assert str(valid) == "connect ***REDACTED*** failed"
+
+
 def test_operation_boundary_leaves_input_validation_and_base_exception_untouched(
     mocker: Any,
 ) -> None:
@@ -294,6 +380,57 @@ class _SensitiveStorageBackend(StorageBackend):
 
     def clear_storage(self, prefix: str | None = None) -> None:
         del prefix
+
+
+def test_breaker_proxies_sanitize_ordinary_third_party_failures() -> None:
+    """Queue, set, and storage proxies never publish a driver message/traceback."""
+    marker = "ordinary-third-party-private-marker"
+
+    def fail(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError(marker)
+
+    queue_backend = _SensitiveQueueBackend(marker)
+    queue_backend.push = fail  # type: ignore[method-assign]
+    with pytest.raises(QueueError) as queue_info:
+        wrap_queue_backend(
+            queue_backend, CircuitBreaker("queue", failure_threshold=1)
+        ).push(marker, marker.encode())
+    assert queue_info.value.operation == "push"
+    _assert_operation_error_is_redacted(queue_info.value, marker)
+
+    set_backend = _SensitiveForwardedSetBackend(marker)
+    set_backend.add = fail  # type: ignore[method-assign]
+    with pytest.raises(BackendConnectionError) as set_info:
+        wrap_set_backend(set_backend, CircuitBreaker("set", failure_threshold=1)).add(
+            marker, marker.encode()
+        )
+    _assert_operation_error_is_redacted(set_info.value, marker)
+
+    storage_backend = _SensitiveStorageBackend(marker)
+    storage_backend.store = fail  # type: ignore[method-assign]
+    with pytest.raises(StorageError) as storage_info:
+        wrap_storage_backend(
+            storage_backend, CircuitBreaker("storage", failure_threshold=1)
+        ).store(marker, marker.encode())
+    assert storage_info.value.operation == "store"
+    _assert_operation_error_is_redacted(storage_info.value, marker)
+
+
+def test_breaker_proxy_preserves_process_control_baseexception() -> None:
+    marker = "proxy-control-private-marker"
+    interruption = KeyboardInterrupt(marker)
+    backend = _SensitiveQueueBackend(marker)
+
+    def interrupt(*_args: Any, **_kwargs: Any) -> Any:
+        raise interruption
+
+    backend.push = interrupt  # type: ignore[method-assign]
+    proxy = wrap_queue_backend(backend, CircuitBreaker("queue"))
+
+    with pytest.raises(KeyboardInterrupt) as exc_info:
+        proxy.push(marker, marker.encode())
+
+    assert exc_info.value is interruption
 
 
 def test_breaker_proxy_preserves_storage_error_class_and_safe_operation() -> None:

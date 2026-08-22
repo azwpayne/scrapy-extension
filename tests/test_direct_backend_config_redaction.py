@@ -307,7 +307,11 @@ def test_kafka_constructor_error_drops_config_from_traceback() -> None:
     from scrapy_extension.backends.kafka import KafkaBackend
     from scrapy_extension.settings import KafkaSettings
 
-    config = KafkaSettings(enable_auto_commit=True)
+    # R141-F18: enable_auto_commit=True is rejected at settings construction,
+    # so reach the constructor guard with a post-construction mutation (the
+    # same shape a duck-typed or mutated config object takes).
+    config = KafkaSettings()
+    config.__dict__["enable_auto_commit"] = True
     config.__dict__["round41b_marker"] = _MARKER
 
     with pytest.raises(ConfigurationError) as exc_info:

@@ -412,11 +412,45 @@ class JSONSerializer:
 # Shared utilities for backends
 
 KEY_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9._:-]+$")
+_SAFE_DIAGNOSTIC_LABEL = re.compile(r"^[A-Za-z][A-Za-z0-9_.]*$")
+_SENSITIVE_DIAGNOSTIC_FRAGMENTS = (
+    "password",
+    "secret",
+    "token",
+    "credential",
+    "authorization",
+    "api_key",
+    "apikey",
+    "header",
+    "cookie",
+    "uri",
+    "url",
+)
+
+
+def _safe_diagnostic_label(value: object, fallback: str) -> str:
+    """Keep static field labels out of validation exception injection paths."""
+    if type(value) is str and _SAFE_DIAGNOSTIC_LABEL.fullmatch(value):
+        return value
+    return fallback
+
+
+def _safe_diagnostic_value(value: object) -> str:
+    """Render validation values without echoing URI/credential-shaped text."""
+    if type(value) is not str:
+        return "<redacted>"
+    lowered = value.lower()
+    if "://" in value or any(
+        fragment in lowered for fragment in _SENSITIVE_DIAGNOSTIC_FRAGMENTS
+    ):
+        return "<redacted>"
+    return repr(value)
 
 
 def _validate_key_name(name: str, field_name: str = "name") -> None:
     """Validate key/queue/set/index names without echoing caller input."""
     invalid = False
+    safe_field_name = _safe_diagnostic_label(field_name, "name")
     try:
         invalid = not name or KEY_NAME_PATTERN.match(name) is None
     finally:
@@ -425,7 +459,7 @@ def _validate_key_name(name: str, field_name: str = "name") -> None:
         name = ""
     if invalid:
         raise ValueError(
-            f"Invalid {field_name}. Only alphanumeric, dots, underscores, "
+            f"Invalid {safe_field_name}. Only alphanumeric, dots, underscores, "
             "hyphens, and colons allowed."
         )
 
@@ -440,7 +474,7 @@ def _validate_ttl(ttl: int | None) -> None:
     if ttl is None:
         return
     if isinstance(ttl, bool) or not isinstance(ttl, int) or ttl <= 0:
-        raise ValueError(f"ttl must be a positive integer or None, got {ttl!r}")
+        raise ValueError("ttl must be a positive integer or None")
 
 
 def _hash_item(item: bytes) -> str:
@@ -467,7 +501,7 @@ def _get_mode_text(mode: object) -> str:
     try:
         return str(mode)
     except (TypeError, ValueError):
-        return getattr(mode, "value", repr(mode))
+        return "<invalid-mode>"
 
 
 class BackendType(str, Enum):
@@ -521,7 +555,8 @@ class BackendType(str, Enum):
                 member; we choose to raise for fail-fast UX.
         """
         valid = ", ".join(repr(m.value) for m in cls)
-        msg = f"{value!r} is not a valid {cls.__name__}. Valid values: {valid}."
+        rendered_value = _safe_diagnostic_value(value)
+        msg = f"{rendered_value} is not a valid {cls.__name__}. Valid values: {valid}."
         raise ValueError(msg)
 
 
@@ -910,6 +945,17 @@ class StorageBackend(ABC):
             remaining TTL (for example Memcached) may also return None for a live
             expiring key; callers must treat None as "no observable live TTL".
         """
+
+    def list_storage_keys(self, prefix: str = "", *, limit: int = 1_000) -> list[str]:
+        """List a bounded, explicitly scoped set of logical storage keys.
+
+        This optional maintenance capability is deliberately separate from
+        ``clear_storage``. Backends that cannot safely enumerate their owned
+        namespace may retain the default ``NotImplementedError``; callers must
+        never emulate listing by clearing or guessing physical keys.
+        """
+        del prefix, limit
+        raise NotImplementedError
 
     @abstractmethod
     def clear_storage(self, prefix: str | None = None) -> None:
