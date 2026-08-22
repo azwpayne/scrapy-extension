@@ -12,7 +12,6 @@ from __future__ import annotations
 __all__ = ["DEFAULT_DELAY_MAX_HELD", "DelayQueueStrategy"]
 
 import base64
-import binascii
 import heapq
 import itertools
 import json
@@ -26,6 +25,7 @@ from typing import TYPE_CHECKING, Any, cast
 from scrapy_extension.monitor.base import Monitor, NullMonitor
 from scrapy_extension.queue.strategies.base import (
     QueueStrategy,
+    QueueStrategyRestoreError,
     _PreparedQueuePush,
     normalize_queue_timeout,
 )
@@ -547,69 +547,30 @@ class DelayQueueStrategy(QueueStrategy):
         ).encode("utf-8")
 
     def restore(self, state: bytes | None) -> None:
-        """Re-populate the holding heap from a prior :meth:`snapshot` (initiative #3).
+        """Restore a complete, validated holding-heap snapshot.
 
-        Past-ready items (``ready_at <= now``) stay in the heap and drain
-        naturally on the next :meth:`pop`. Corrupt or unknown-format state is
-        logged + skipped — restore never crashes the spider.
-
-        Args:
-            state: The bytes blob from a prior :meth:`snapshot`, or ``None``.
+        ``None`` means that no checkpoint was committed.  Every other value is
+        either applied atomically or raises :class:`QueueStrategyRestoreError`;
+        silently dropping one malformed entry would let queue close publish an
+        empty checkpoint over recoverable work.
         """
-        if not state:
+        if state is None:
             return
-        corrupt_snapshot = False
+        restore_failed = False
         try:
             data = json.loads(state.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            corrupt_snapshot = True
-        if corrupt_snapshot:
-            try:
-                logger.warning(
-                    "DelayQueueStrategy restore: corrupt snapshot; starting clean."
-                )
-            except BaseException:
-                pass
-            return
-        if (
-            not isinstance(data, dict)
-            or data.get("strategy") != "delay"
-            or data.get("version") not in (1, 2)
-        ):
-            try:
-                logger.warning(
-                    "DelayQueueStrategy restore: unknown snapshot format; starting clean."
-                )
-            except BaseException:
-                pass
-            return
-        items = data.get("items")
-        if not isinstance(items, list):
-            try:
-                logger.warning(
-                    "DelayQueueStrategy restore: snapshot 'items' not a list; starting clean."
-                )
-            except BaseException:
-                pass
-            return
-        version = int(data["version"])
-        invalid_clock_metadata = False
-        try:
+            if (
+                not isinstance(data, dict)
+                or data.get("strategy") != "delay"
+                or type(data.get("version")) is not int
+                or data.get("version") not in (1, 2)
+                or not isinstance(data.get("items"), list)
+            ):
+                raise ValueError("invalid delay snapshot")
+            version = data["version"]
             now = _require_finite(self._clock(), "clock value")
-        except (TypeError, ValueError):
-            invalid_clock_metadata = True
-        if invalid_clock_metadata:
-            try:
-                logger.warning(
-                    "DelayQueueStrategy restore: invalid clock metadata; starting clean."
-                )
-            except BaseException:
-                pass
-            return
-        downtime = 0.0
-        if version == 2:
-            invalid_v2_clock_metadata = False
-            try:
+            downtime = 0.0
+            if version == 2:
                 snapshot_wall_time = float(data["snapshot_wall_time"])
                 current_wall_time = float(self._wall_clock())
                 if not math.isfinite(snapshot_wall_time) or not math.isfinite(
@@ -617,77 +578,68 @@ class DelayQueueStrategy(QueueStrategy):
                 ):
                     raise ValueError("wall clock is not finite")
                 downtime = max(0.0, current_wall_time - snapshot_wall_time)
-            except (KeyError, TypeError, ValueError):
-                invalid_v2_clock_metadata = True
-            if invalid_v2_clock_metadata:
-                try:
-                    logger.warning(
-                        "DelayQueueStrategy restore: invalid v2 clock metadata; starting clean."
-                    )
-                except BaseException:
-                    pass
-                return
 
-        recovered_entries: list[tuple[float, float, int, bytes, float]] = []
-        for input_order, entry in enumerate(items):
-            if not isinstance(entry, dict):
-                continue
-            malformed_entry = False
-            try:
+            recovered_entries: list[tuple[float, float, int, bytes, float]] = []
+            for input_order, entry in enumerate(data["items"]):
+                if not isinstance(entry, dict):
+                    raise ValueError("invalid delay entry")
                 if version == 2:
-                    remaining = float(entry["remaining"])
-                    if not math.isfinite(remaining):
-                        raise ValueError("remaining delay is not finite")
+                    remaining = _require_finite(entry["remaining"], "remaining delay")
+                    if remaining < 0:
+                        raise ValueError("remaining delay must be >= 0")
                     ready_at = _require_finite(
                         now + max(0.0, remaining - downtime), "ready_at"
                     )
                     original_deadline = remaining
                 else:
-                    # v1 persisted an absolute monotonic value. Its epoch is unknowable
-                    # after reboot or host migration, so make the item due immediately
-                    # instead of risking an arbitrarily long stall. Preserve only its
-                    # relative ordering so earlier legacy deadlines still drain first.
+                    # v1 absolute monotonic deadlines are due immediately after a
+                    # restart; retain their order as a secondary sort key.
                     original_deadline = _require_finite(
                         float(entry["ready_at"]), "ready_at"
                     )
                     ready_at = now
                 item = base64.b64decode(entry["item_b64"], validate=True)
-                priority = float(entry["priority"])
-                _require_finite(priority, "priority")
-            except (KeyError, TypeError, ValueError, binascii.Error):
-                malformed_entry = True
-            if malformed_entry:
-                try:
-                    logger.warning(
-                        "DelayQueueStrategy restore: skipping malformed entry."
-                    )
-                except BaseException:
-                    pass
-                continue
-            recovered_entries.append(
-                (ready_at, original_deadline, input_order, item, priority)
-            )
-        recovered_entries.sort(key=lambda entry: entry[:3])
-        rebuilt = [
-            (ready_at, seq, item, priority)
-            for seq, (
-                ready_at,
-                _original_deadline,
-                _input_order,
-                item,
-                priority,
-            ) in enumerate(recovered_entries)
-        ]
-        heapq.heapify(rebuilt)
+                priority = _require_finite(float(entry["priority"]), "priority")
+                recovered_entries.append(
+                    (ready_at, original_deadline, input_order, item, priority)
+                )
+            recovered_entries.sort(key=lambda entry: entry[:3])
+            rebuilt = [
+                (ready_at, seq, item, priority)
+                for seq, (
+                    ready_at,
+                    _original_deadline,
+                    _input_order,
+                    item,
+                    priority,
+                ) in enumerate(recovered_entries)
+            ]
+            heapq.heapify(rebuilt)
+        except Exception:
+            restore_failed = True
+        if restore_failed:
+            raise QueueStrategyRestoreError()
+
         with self._state_lock:
-            self._holding = rebuilt
-            self._seq = itertools.count(len(rebuilt))
-        recovered = len(recovered_entries)
-        if recovered:
+            # Publish the rebuilt heap and its tie-breaker as one lifecycle
+            # transition.  A process-control exception between these two
+            # assignments must not leave restored entries paired with the old
+            # counter (which can reuse sequence numbers and change equal-time
+            # ordering on the next push).
+            previous_holding = self._holding
+            previous_seq = self._seq
+            try:
+                self._holding = rebuilt
+                self._seq = itertools.count(len(rebuilt))
+            except BaseException:
+                self._holding = previous_holding
+                self._seq = previous_seq
+                raise
+        if recovered_entries:
             try:
                 logger.info(
                     "DelayQueueStrategy restore: recovered %d held delayed item(s) from snapshot.",
-                    recovered,
+                    len(recovered_entries),
                 )
             except BaseException:
                 pass

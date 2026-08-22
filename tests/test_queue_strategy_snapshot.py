@@ -2,7 +2,7 @@
 
 Covers:
 - Delay snapshot serializes the held heap (versioned JSON, seq excluded)
-- Delay restore round-trips, skips corrupt/unknown-format/malformed entries
+- Delay restore round-trips and rejects corrupt/unknown-format/malformed entries
 - Restored past-ready items drain on the next pop
 - ABC defaults (passthrough snapshot -> None, restore no-op)
 - BackendQueue.close() persists BEFORE strategy.close() clears the heap
@@ -27,6 +27,8 @@ from scrapy_extension.queue.snapshot import SnapshotRepository
 from scrapy_extension.queue.strategies.delay import DelayQueueStrategy
 from scrapy_extension.queue.strategies.passthrough import PassthroughQueueStrategy
 from scrapy_extension.queue.strategies.ring_buffer import RingBufferQueueStrategy
+from scrapy_extension.queue.strategies.round_robin import RoundRobinQueueStrategy
+from scrapy_extension.queue.strategies.time_wheel import TimeWheelQueueStrategy
 
 _SNAPSHOT_KEY = "queue:snapshot:v3:0::1:q"
 _SNAPSHOT_TOMBSTONE_KEY = "queue:snapshot-tombstone:v3:0::1:q"
@@ -167,30 +169,33 @@ def test_delay_restore_v1_deadline_is_due_instead_of_cross_boot_stall():
 
 
 def test_delay_restore_none_is_noop():
-    """restore(None) and restore(b'') are silent no-ops."""
+    """Only an absent checkpoint is a silent no-op."""
     strategy = _delay()
     strategy.restore(None)
-    strategy.restore(b"")
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        strategy.restore(b"")
     assert strategy._holding == []
 
 
-def test_delay_restore_corrupt_json_skipped():
-    """restore of non-JSON bytes logs + skips (no crash, heap stays empty)."""
+def test_delay_restore_corrupt_json_rejected():
+    """Corrupt bytes raise a stable failure without changing live state."""
     strategy = _delay()
-    strategy.restore(b"\x00 not json \x00")
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        strategy.restore(b"\x00 not json \x00")
     assert strategy._holding == []
 
 
-def test_delay_restore_unknown_format_skipped():
-    """restore of valid JSON with the wrong strategy/version is skipped."""
+def test_delay_restore_unknown_format_rejected():
+    """A valid but incompatible format cannot silently clear state."""
     strategy = _delay()
     blob = json.dumps({"version": 99, "strategy": "other", "items": []}).encode()
-    strategy.restore(blob)
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        strategy.restore(blob)
     assert strategy._holding == []
 
 
-def test_delay_restore_skips_malformed_entries():
-    """A snapshot with one good + one bad entry recovers the good one only."""
+def test_delay_restore_rejects_malformed_entries():
+    """A snapshot with one bad entry is rejected atomically."""
     strategy = _delay()
     good = {
         "ready_at": 110.0,
@@ -202,10 +207,10 @@ def test_delay_restore_skips_malformed_entries():
         {"version": 1, "strategy": "delay", "items": [good, bad]}
     ).encode()
 
-    strategy.restore(blob)
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        strategy.restore(blob)
 
-    assert len(strategy._holding) == 1
-    assert strategy._holding[0][2] == b"ok"  # item bytes recovered
+    assert strategy._holding == []
 
 
 def test_delay_restore_past_ready_drains_on_pop():
@@ -273,7 +278,7 @@ def _legacy_delay_snapshot() -> bytes:
 
 
 def _stored_snapshot_payload(storage, key: str = _SNAPSHOT_KEY) -> bytes | None:
-    """Reassemble the v6 payload from captured mock store calls."""
+    """Reassemble the v7 payload from captured mock store calls."""
     values = {args.args[0]: args.args[1] for args in storage.store.call_args_list}
     reader = MagicMock()
     reader.retrieve.side_effect = lambda stored_key: values.get(stored_key)
@@ -287,6 +292,43 @@ def _wired_cm(storage=None, queue_backend=None):
     )
     cm.get_queue_backend.return_value = queue_backend or MagicMock(name="QueueBackend")
     return cm
+
+
+def test_legacy_raw_empty_snapshot_migrates_as_clean_state():
+    storage, state = _stateful_storage({_LEGACY_SNAPSHOT_KEY: b""})
+    cm = _wired_cm(storage=storage)
+    strategy = MagicMock(name="LegacySnapshotStrategy")
+    strategy.snapshot.return_value = None
+
+    queue = BackendQueue(cm, "q", queue_strategy=strategy, monitor=MagicMock())
+
+    strategy.restore.assert_not_called()
+    queue.close()
+
+    manifest = json.loads(state[_SNAPSHOT_KEY])
+    assert manifest["version"] == 7
+    assert manifest["state"] == "none"
+    assert _LEGACY_SNAPSHOT_KEY not in state
+
+
+def test_current_empty_bytes_manifest_still_reaches_strategy_restore():
+    storage, state = _stateful_storage({})
+    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
+    repository.commit(_SNAPSHOT_KEY, b"")
+    cm = _wired_cm(storage=storage)
+    strategy = MagicMock(name="CurrentSnapshotStrategy")
+
+    BackendQueue(
+        cm,
+        "q",
+        queue_strategy=strategy,
+        monitor=MagicMock(),
+        snapshot_max_bytes=32,
+        snapshot_chunk_bytes=4,
+    )
+
+    strategy.restore.assert_called_once_with(b"")
+    assert state[_SNAPSHOT_KEY]
 
 
 def test_backends_queue_close_persists_snapshot_before_clearing():
@@ -534,6 +576,27 @@ def test_blocked_pop_does_not_hold_queue_lifecycle_lock():
     assert not close_thread.is_alive()
     assert pop_errors == []
     assert close_errors == []
+
+
+def test_round_robin_restore_corruption_is_a_stable_failure():
+    strategy = RoundRobinQueueStrategy(MagicMock())
+
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        strategy.restore(b"not-json")
+
+    assert strategy.queue_len("q") == 0
+
+
+def test_time_wheel_restore_corruption_is_a_stable_failure():
+    strategy = TimeWheelQueueStrategy(
+        MagicMock(), clock=lambda: 100.0, wall_clock=lambda: 1_000.0
+    )
+
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        strategy.restore(b"not-json")
+
+    assert strategy._overflow == []
+    assert all(not slot for slot in strategy._wheel)
 
 
 def test_backends_queue_init_restores_snapshot():
@@ -809,6 +872,10 @@ def test_backends_queue_empty_close_retires_restored_legacy_snapshot():
         call(_LEGACY_SNAPSHOT_KEY),
         call(queue._empty_snapshot_tombstone_key()),
     ]
+    stored_keys = [item.args[0] for item in storage.store.call_args_list]
+    assert stored_keys.index(queue._empty_snapshot_tombstone_key()) < stored_keys.index(
+        queue._snapshot_key()
+    )
 
 
 @pytest.mark.parametrize(
@@ -841,6 +908,45 @@ def test_backends_queue_keeps_legacy_snapshot_when_v3_checkpoint_store_fails(
     assert state[_LEGACY_SNAPSHOT_KEY] == legacy_state
     assert _SNAPSHOT_KEY not in state
     assert bool(strategy._holding) is (not clear_before_close)
+
+
+def test_empty_transition_fence_survives_current_manifest_commit_failure():
+    """The migration marker is durable before an empty v7 commit is attempted."""
+    storage, state = _stateful_storage({_LEGACY_SNAPSHOT_KEY: _legacy_delay_snapshot()})
+    queue = BackendQueue(
+        connection_manager=_wired_cm(storage=storage),
+        queue_name="q",
+        queue_strategy=_delay(clock_value=100.0),
+        monitor=MagicMock(),
+    )
+    queue.clear()
+    tombstone_key = queue._empty_snapshot_tombstone_key()
+
+    def fail_current_manifest(key: str, value: bytes) -> None:
+        if key == _SNAPSHOT_KEY:
+            raise RuntimeError("current manifest unavailable")
+        state[key] = value
+
+    storage.store.side_effect = fail_current_manifest
+    with pytest.raises(QueueError, match="snapshot commit"):
+        queue.close()
+
+    assert tombstone_key in state
+    assert _LEGACY_SNAPSHOT_KEY in state
+    assert _SNAPSHOT_KEY not in state
+
+    # A restart cannot reveal the legacy value while the intentional empty
+    # transition remains fenced. A later healthy close can finish cleanup.
+    restarted = BackendQueue(
+        connection_manager=_wired_cm(storage=storage),
+        queue_name="q",
+        queue_strategy=_delay(clock_value=100.0),
+        monitor=MagicMock(),
+    )
+    assert restarted._strategy._holding == []
+    storage.store.side_effect = lambda key, value: state.__setitem__(key, value)
+    restarted.close()
+    assert _LEGACY_SNAPSHOT_KEY not in state
 
 
 def test_backends_queue_retries_legacy_cleanup_after_v3_restart():
@@ -904,7 +1010,7 @@ def test_backends_queue_retries_legacy_cleanup_after_v3_restart():
 
 
 def test_empty_checkpoint_tombstone_blocks_legacy_replay_after_retirement_failure():
-    """A failed legacy delete after an empty close cannot resurrect old work."""
+    """A failed legacy delete leaves a durable fence against stale replay."""
     storage, state = _stateful_storage({_LEGACY_SNAPSHOT_KEY: _legacy_delay_snapshot()})
 
     def delete(key: str) -> None:
@@ -926,7 +1032,7 @@ def test_empty_checkpoint_tombstone_blocks_legacy_replay_after_retirement_failur
 
     tombstone_key = first._empty_snapshot_tombstone_key()
     assert SnapshotRepository(storage).read(_SNAPSHOT_KEY).state is None
-    assert tombstone_key not in state
+    assert state[tombstone_key] == b"1"
     assert _LEGACY_SNAPSHOT_KEY in state
 
     second_strategy = _delay(clock_value=100.0)
@@ -996,6 +1102,29 @@ def test_backends_queue_uses_injected_snapshot_manager_only_for_snapshot_io():
     )
     assert _stored_snapshot_payload(snapshot_storage) == expected_snapshot
     snapshot_manager.close.assert_not_called()
+
+
+def test_truncated_current_manifest_fences_close_and_preserves_authority() -> None:
+    truncated = (
+        b'{"schema":"scrapy-extension.queue-strategy-snapshot",'
+        b'"version":7,"generation":"'
+    )
+    storage, state = _stateful_storage({_SNAPSHOT_KEY: truncated})
+    strategy = MagicMock(name="Strategy")
+    strategy.snapshot.return_value = b"replacement"
+    queue = BackendQueue(
+        connection_manager=_wired_cm(storage=storage),
+        queue_name="q",
+        queue_strategy=strategy,
+        monitor=MagicMock(),
+    )
+
+    assert queue._snapshot_persistence_fenced is True
+    with pytest.raises(QueueError, match="fenced"):
+        queue.close()
+    assert state[_SNAPSHOT_KEY] == truncated
+    strategy.snapshot.assert_not_called()
+    strategy.close.assert_not_called()
 
 
 @pytest.mark.parametrize("failure_kind", ["manifest", "chunk"])
@@ -1210,6 +1339,76 @@ def test_backends_queue_init_restore_crash_does_not_break_startup():
         queue_strategy=strategy,
         monitor=MagicMock(),
     )
+
+
+def test_restore_process_control_is_not_swallowed_or_allowed_to_clear_state():
+    """A process-control signal keeps the authoritative checkpoint untouched."""
+    storage, state = _stateful_storage({})
+    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
+    repository.commit(_SNAPSHOT_KEY, b"authoritative")
+    signal = KeyboardInterrupt("restore interrupted")
+    strategy = _delay(clock_value=100.0)
+
+    def restore(_state: bytes) -> None:
+        raise signal
+
+    strategy.restore = restore  # type: ignore[assignment]
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        BackendQueue(
+            connection_manager=_wired_cm(storage=storage),
+            queue_name="q",
+            queue_strategy=strategy,
+            monitor=MagicMock(),
+            snapshot_max_bytes=32,
+            snapshot_chunk_bytes=4,
+        )
+
+    assert raised.value is signal
+    assert state[_SNAPSHOT_KEY]
+    assert (
+        SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
+        .read(_SNAPSHOT_KEY)
+        .state
+        == b"authoritative"
+    )
+
+
+def test_restore_failure_fences_close_and_preserves_checkpoint_across_restart():
+    """A failed strategy restore may not replace the last authoritative state."""
+    source = _delay(clock_value=100.0)
+    source.push("q", b"authoritative", delay=10.0)
+    checkpoint = source.snapshot()
+    assert checkpoint is not None
+    storage, state = _stateful_storage({_SNAPSHOT_KEY: checkpoint})
+    cm = _wired_cm(storage=storage)
+    failed_strategy = _delay(clock_value=100.0)
+
+    def _raise(_state):
+        raise RuntimeError("restore failed")
+
+    failed_strategy.restore = _raise  # type: ignore[assignment]
+    failed = BackendQueue(
+        connection_manager=cm,
+        queue_name="q",
+        queue_strategy=failed_strategy,
+        monitor=MagicMock(),
+    )
+
+    assert failed._snapshot_persistence_fenced is True
+    with pytest.raises(QueueError, match="fenced"):
+        failed.close()
+    assert state[_SNAPSHOT_KEY] == checkpoint
+
+    recovered_strategy = _delay(clock_value=100.0)
+    recovered = BackendQueue(
+        connection_manager=cm,
+        queue_name="q",
+        queue_strategy=recovered_strategy,
+        monitor=MagicMock(),
+    )
+    assert [item[2] for item in recovered_strategy._holding] == [b"authoritative"]
+    recovered.close()
 
 
 # ---------------------------------------------------------------------------

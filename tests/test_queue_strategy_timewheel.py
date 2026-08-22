@@ -26,6 +26,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from scrapy_extension.exceptions import QueueError
 from scrapy_extension.queue.strategies.time_wheel import (
     MAX_WHEEL_SIZE,
     TimeWheelQueueStrategy,
@@ -258,6 +259,78 @@ def test_pop_drains_overflow_when_due():
     clock[0] = 225.0  # past ready
     s.pop("q")
     qb.push.assert_called_once_with("q", b"long", 0.0)
+
+
+def test_drain_merges_wheel_and_overflow_by_ready_time_and_sequence():
+    """Physical placement must not change the logical release ordering."""
+    s, qb, clock = _strategy(wheel_size=10, clock_value=-1.0)
+    s.push("q", b"overflow-first", delay=20.0)  # ready_at=19, overflow
+    clock[0] = 19.0
+    s.push("q", b"wheel-second", delay=1.0)  # ready_at=20, wheel
+    clock[0] = 20.0
+
+    s.pop("q")
+
+    assert [call.args[1] for call in qb.push.call_args_list] == [
+        b"overflow-first",
+        b"wheel-second",
+    ]
+
+
+def test_drain_preserves_insertion_order_for_same_slot_ties():
+    """Equal deadlines in one slot use the process-wide sequence tie-breaker."""
+    s, qb, clock = _strategy(wheel_size=10, clock_value=0.0)
+    s.push("q", b"first", delay=5.0)
+    clock[0] = 1.0
+    s.push("q", b"second", delay=4.0)
+    clock[0] = 5.0
+
+    s.pop("q")
+
+    assert [call.args[1] for call in qb.push.call_args_list] == [
+        b"first",
+        b"second",
+    ]
+
+
+def test_snapshot_restore_preserves_ties_across_wheel_and_overflow():
+    """Restart cannot reorder equal deadlines from different containers."""
+    source, _source_backend, clock = _strategy(wheel_size=10, clock_value=-1.0)
+    source.push("q", b"overflow-first", delay=11.0)  # ready_at=10, overflow
+    clock[0] = 0.0
+    source.push("q", b"wheel-second", delay=10.0)  # ready_at=10, wheel
+    blob = source.snapshot()
+
+    restored, backend, restored_clock = _strategy(wheel_size=10, clock_value=0.0)
+    restored.restore(blob)
+    restored_clock[0] = 10.0
+    restored.pop("q")
+
+    assert [call.args[1] for call in backend.push.call_args_list] == [
+        b"overflow-first",
+        b"wheel-second",
+    ]
+
+
+def test_failed_merged_drain_keeps_failing_item_and_tail_owned():
+    s, qb, clock = _strategy(wheel_size=10, clock_value=-1.0)
+    s.push("q", b"first", delay=20.0)
+    clock[0] = 19.0
+    s.push("q", b"second", delay=1.0)
+    clock[0] = 20.0
+    qb.push.side_effect = [RuntimeError("stop"), None, None]
+
+    with pytest.raises(RuntimeError, match="stop"):
+        s.pop("q")
+
+    assert len(s._overflow) == 1
+    assert [item for _ready_at, item, _priority in s._wheel[0]] == [b"second"]
+    s.pop("q")
+    assert [call.args[1] for call in qb.push.call_args_list] == [
+        b"first",
+        b"first",
+        b"second",
+    ]
 
 
 def test_failed_wheel_drain_keeps_due_item_for_retry():
@@ -837,26 +910,104 @@ def test_restore_expired_items_preserve_original_deadline_order(version):
 def test_restore_none_is_noop():
     s, _, _ = _strategy()
     s.restore(None)
-    s.restore(b"")
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        s.restore(b"")
     assert sum(len(slot) for slot in s._wheel) == 0
     assert len(s._overflow) == 0
 
 
-def test_restore_corrupt_skipped():
+def test_restore_corrupt_rejected():
     s, _, _ = _strategy()
-    s.restore(b"\x00 not json \x00")
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        s.restore(b"\x00 not json \x00")
     assert len(s._overflow) == 0
 
 
-def test_restore_unknown_format_skipped():
+def test_restore_unknown_format_rejected():
     s, _, _ = _strategy()
     blob = json.dumps({"version": 99, "strategy": "other"}).encode()
-    s.restore(blob)
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        s.restore(blob)
     assert len(s._overflow) == 0
+
+
+def test_restore_process_control_leaves_existing_wheel_owned(mocker):
+    """A parser interruption cannot publish a partial wheel replacement."""
+    s, _qb, _clock = _strategy(clock_value=100.0)
+    s.push("q", b"resident", delay=5.0)
+    signal = KeyboardInterrupt("restore interrupted")
+    mocker.patch(
+        "scrapy_extension.queue.strategies.time_wheel.json.loads",
+        side_effect=signal,
+    )
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        s.restore(b"not parsed")
+
+    assert raised.value is signal
+    assert sum(len(slot) for slot in s._wheel) + len(s._overflow) == 1
+    assert [entry[1] for slot in s._wheel for entry in slot] == [b"resident"]
+
+
+def test_restore_publication_interrupt_preserves_existing_wheel():
+    class InterruptingTimeWheel(TimeWheelQueueStrategy):
+        interrupt_overflow = False
+
+        def __setattr__(self, name: str, value: object) -> None:
+            if name == "_overflow" and self.interrupt_overflow:
+                object.__setattr__(self, "interrupt_overflow", False)
+                raise KeyboardInterrupt("overflow publication interrupted")
+            object.__setattr__(self, name, value)
+
+    source, _source_qb, _source_clock = _strategy(wheel_size=4, clock_value=100.0)
+    source.push("q", b"replacement", delay=10.0)
+    state = source.snapshot()
+    assert state is not None
+
+    target_clock = [100.0]
+    target = InterruptingTimeWheel(
+        MagicMock(),
+        wheel_size=4,
+        clock=lambda: target_clock[0],
+        wall_clock=lambda: 1_000.0,
+    )
+    target.push("q", b"resident", delay=1.0)
+    target.interrupt_overflow = True
+
+    with pytest.raises(KeyboardInterrupt, match="overflow publication interrupted"):
+        target.restore(state)
+
+    assert [entry[1] for slot in target._wheel for entry in slot] == [b"resident"]
+    assert target._overflow == []
+
+
+def test_restore_rejects_duplicate_serialized_sequences_atomically():
+    s, _qb, _clock = _strategy(clock_value=100.0)
+    s.push("q", b"resident", delay=5.0)
+    entry = {
+        "remaining": 5.0,
+        "item_b64": base64.b64encode(b"replacement").decode(),
+        "priority": 0.0,
+        "sequence": 7,
+    }
+    state = json.dumps(
+        {
+            "version": 2,
+            "strategy": "time_wheel",
+            "snapshot_wall_time": 1_000.0,
+            "slots_flat": [entry],
+            "overflow": [dict(entry)],
+        }
+    ).encode()
+
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        s.restore(state)
+
+    assert [entry[1] for slot in s._wheel for entry in slot] == [b"resident"]
 
 
 @pytest.mark.parametrize("field", ["slots_flat", "overflow"])
-def test_restore_non_list_collection_is_skipped_without_crashing(field):
+def test_restore_non_list_collection_is_rejected(field):
     s, _, _ = _strategy()
     data = {
         "version": 2,
@@ -867,10 +1018,36 @@ def test_restore_non_list_collection_is_skipped_without_crashing(field):
     }
     data[field] = 42
 
-    s.restore(json.dumps(data).encode())
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        s.restore(json.dumps(data).encode())
 
     assert all(not slot for slot in s._wheel)
     assert s._overflow == []
+
+
+@pytest.mark.parametrize("remaining", [-1.0, float("nan"), float("inf")])
+def test_restore_rejects_invalid_remaining_atomically(remaining: float):
+    s, _, _ = _strategy(clock_value=10.0, wall_clock_value=100.0)
+    s.push("q", b"keep", delay=5.0)
+    data = {
+        "version": 2,
+        "strategy": "time_wheel",
+        "snapshot_wall_time": 100.0,
+        "slots_flat": [
+            {
+                "remaining": remaining,
+                "item_b64": base64.b64encode(b"replacement").decode(),
+                "priority": 0.0,
+            }
+        ],
+        "overflow": [],
+    }
+
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        s.restore(json.dumps(data, allow_nan=True).encode())
+
+    assert sum(len(slot) for slot in s._wheel) + len(s._overflow) == 1
+    assert all(entry[1] == b"keep" for slot in s._wheel for entry in slot)
 
 
 def test_restore_huge_integer_clock_metadata_is_rejected_without_escape():
@@ -884,7 +1061,8 @@ def test_restore_huge_integer_clock_metadata_is_rejected_without_escape():
         "overflow": [],
     }
 
-    s.restore(json.dumps(data).encode())
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        s.restore(json.dumps(data).encode())
 
     assert sum(len(slot) for slot in s._wheel) == 1
 
@@ -923,7 +1101,8 @@ def test_restore_huge_integer_entry_is_skipped_without_escape(
     data[collection] = [entry]
     s, _, _ = _strategy()
 
-    s.restore(json.dumps(data).encode())
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        s.restore(json.dumps(data).encode())
 
     assert all(not slot for slot in s._wheel)
     assert s._overflow == []

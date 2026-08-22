@@ -8,6 +8,7 @@ import threading
 
 import pytest
 
+from scrapy_extension.exceptions import QueueError
 from scrapy_extension.queue.strategies.delay import (
     DEFAULT_DELAY_MAX_HELD,
     DelayQueueStrategy,
@@ -600,74 +601,64 @@ class TestSnapshotRestore:
         assert pushed == [b"first", b"second", b"third"]
 
     def test_restore_none_is_noop(self, mock_connection_manager) -> None:
-        """restore(None) and restore(b'') return without touching the heap."""
+        """Only restore(None) is a no-op; empty bytes are invalid state."""
         strat = DelayQueueStrategy(mock_connection_manager)
         strat.restore(None)
-        strat.restore(b"")
+        with pytest.raises(QueueError, match="snapshot restore failed"):
+            strat.restore(b"")
         assert len(strat._holding) == 0
 
-    def test_restore_corrupt_json_warns_and_starts_clean(
+    def test_restore_corrupt_json_is_rejected(
         self, mock_connection_manager, caplog
     ) -> None:
-        """Non-JSON / non-UTF-8 bytes → warning + clean start (no crash)."""
+        """Non-JSON / non-UTF-8 bytes raise a stable restore failure."""
         strat = DelayQueueStrategy(mock_connection_manager)
-        with caplog.at_level(
-            logging.WARNING, logger="scrapy_extension.queue.strategies.delay"
-        ):
+        with pytest.raises(QueueError, match="snapshot restore failed"):
             strat.restore(b"\xff\xfe not valid json")
-        assert any("corrupt snapshot" in r.message for r in caplog.records)
         assert len(strat._holding) == 0
 
-    def test_restore_unknown_format_warns(
+    def test_restore_unknown_format_is_rejected(
         self, mock_connection_manager, caplog
     ) -> None:
-        """Valid JSON but wrong strategy/version → unknown-format warning."""
+        """Valid JSON but wrong strategy/version raises a stable failure."""
         strat = DelayQueueStrategy(mock_connection_manager)
         bogus = json.dumps({"version": 99, "strategy": "other", "items": []}).encode()
-        with caplog.at_level(
-            logging.WARNING, logger="scrapy_extension.queue.strategies.delay"
-        ):
+        with pytest.raises(QueueError, match="snapshot restore failed"):
             strat.restore(bogus)
-        assert any("unknown snapshot format" in r.message for r in caplog.records)
 
-    def test_restore_items_not_a_list_warns(
+    def test_restore_items_not_a_list_is_rejected(
         self, mock_connection_manager, caplog
     ) -> None:
-        """``items`` present but not a list → warning + clean start."""
+        """``items`` present but not a list raises a stable failure."""
         strat = DelayQueueStrategy(mock_connection_manager)
         bogus = json.dumps(
             {"version": 1, "strategy": "delay", "items": "not-a-list"}
         ).encode()
-        with caplog.at_level(
-            logging.WARNING, logger="scrapy_extension.queue.strategies.delay"
-        ):
+        with pytest.raises(QueueError, match="snapshot restore failed"):
             strat.restore(bogus)
-        assert any("'items' not a list" in r.message for r in caplog.records)
 
-    def test_restore_non_dict_entry_skipped(self, mock_connection_manager) -> None:
-        """A non-dict entry in ``items`` is silently skipped (the ``continue``)."""
+    def test_restore_non_dict_entry_is_rejected(self, mock_connection_manager) -> None:
+        """A non-dict entry cannot be silently discarded."""
         strat = DelayQueueStrategy(mock_connection_manager)
-        items = ["not-a-dict", 42, None]  # all non-dict → all skipped
+        items = ["not-a-dict", 42, None]
         bogus = json.dumps({"version": 1, "strategy": "delay", "items": items}).encode()
-        strat.restore(bogus)
+        with pytest.raises(QueueError, match="snapshot restore failed"):
+            strat.restore(bogus)
         assert len(strat._holding) == 0
 
-    def test_restore_malformed_entry_skipped_with_warning(
+    def test_restore_malformed_entry_is_rejected(
         self, mock_connection_manager, caplog
     ) -> None:
-        """An entry missing required keys / wrong types → warning + skip."""
+        """An entry missing required keys / wrong types fails atomically."""
         strat = DelayQueueStrategy(mock_connection_manager)
         items = [
             {"ready_at": 1.0},  # missing item_b64 + priority
             {"ready_at": "not-a-float", "item_b64": "Yg==", "priority": 1.0},
         ]
         bogus = json.dumps({"version": 1, "strategy": "delay", "items": items}).encode()
-        with caplog.at_level(
-            logging.WARNING, logger="scrapy_extension.queue.strategies.delay"
-        ):
+        with pytest.raises(QueueError, match="snapshot restore failed"):
             strat.restore(bogus)
-        assert any("malformed entry" in r.message for r in caplog.records)
-        assert len(strat._holding) == 0  # both entries malformed → none recovered
+        assert len(strat._holding) == 0
 
     def test_restore_skips_non_finite_priority(
         self, mock_connection_manager, caplog
@@ -692,27 +683,110 @@ class TestSnapshotRestore:
             }
         ).encode()
 
-        with caplog.at_level(
-            logging.WARNING, logger="scrapy_extension.queue.strategies.delay"
-        ):
+        with pytest.raises(QueueError, match="snapshot restore failed"):
             strat.restore(state)
 
         assert strat._holding == []
-        assert any("malformed entry" in r.message for r in caplog.records)
 
-    def test_restore_zero_recovered_no_info_log(
+    @pytest.mark.parametrize("remaining", [-1.0, float("nan"), float("inf")])
+    def test_restore_rejects_invalid_remaining_atomically(
+        self, mock_connection_manager, remaining: float
+    ) -> None:
+        strat = DelayQueueStrategy(
+            mock_connection_manager,
+            clock=lambda: 10.0,
+            wall_clock=lambda: 100.0,
+        )
+        strat.push("q", b"keep", delay=5.0)
+        state = json.dumps(
+            {
+                "version": 2,
+                "strategy": "delay",
+                "snapshot_wall_time": 100.0,
+                "items": [
+                    {
+                        "remaining": remaining,
+                        "item_b64": "eA==",
+                        "priority": 0.0,
+                    }
+                ],
+            },
+            allow_nan=True,
+        ).encode()
+
+        with pytest.raises(QueueError, match="snapshot restore failed"):
+            strat.restore(state)
+
+        assert len(strat._holding) == 1
+        assert strat._holding[0][2] == b"keep"
+
+    def test_restore_process_control_leaves_existing_heap_owned(
+        self, mock_connection_manager, mocker
+    ) -> None:
+        """An interrupted parser cannot publish a partially rebuilt heap."""
+        strat = DelayQueueStrategy(
+            mock_connection_manager,
+            default_delay=10.0,
+            clock=lambda: 100.0,
+            wall_clock=lambda: 1_000.0,
+        )
+        strat.push("q", b"resident")
+        signal = KeyboardInterrupt("restore interrupted")
+        mocker.patch(
+            "scrapy_extension.queue.strategies.delay.json.loads",
+            side_effect=signal,
+        )
+
+        with pytest.raises(KeyboardInterrupt) as raised:
+            strat.restore(b"not parsed")
+
+        assert raised.value is signal
+        assert len(strat._holding) == 1
+        assert strat._holding[0][2] == b"resident"
+
+    def test_restore_publication_interrupt_preserves_existing_heap(
+        self, mock_connection_manager
+    ) -> None:
+        class InterruptingDelay(DelayQueueStrategy):
+            interrupt_sequence = False
+
+            def __setattr__(self, name: str, value: object) -> None:
+                if name == "_seq" and self.interrupt_sequence:
+                    object.__setattr__(self, "interrupt_sequence", False)
+                    raise KeyboardInterrupt("sequence publication interrupted")
+                object.__setattr__(self, name, value)
+
+        source = DelayQueueStrategy(
+            mock_connection_manager,
+            clock=lambda: 100.0,
+            wall_clock=lambda: 1_000.0,
+        )
+        source.push("q", b"replacement", delay=10.0)
+        state = source.snapshot()
+        assert state is not None
+
+        target = InterruptingDelay(
+            mock_connection_manager,
+            clock=lambda: 100.0,
+            wall_clock=lambda: 1_000.0,
+        )
+        target.push("q", b"resident", delay=5.0)
+        target.interrupt_sequence = True
+
+        with pytest.raises(KeyboardInterrupt, match="sequence publication interrupted"):
+            target.restore(state)
+
+        assert [entry[2] for entry in target._holding] == [b"resident"]
+
+    def test_restore_zero_recovered_is_rejected(
         self, mock_connection_manager, caplog
     ) -> None:
-        """When 0 items recover (all entries skipped), the recovery info-log is
-        NOT emitted (covers the ``if recovered`` False branch)."""
+        """A state with no valid entries is rejected rather than published empty."""
         strat = DelayQueueStrategy(mock_connection_manager)
-        items = ["non-dict-entry"]  # skipped → recovered stays 0
+        items = ["non-dict-entry"]
         bogus = json.dumps({"version": 1, "strategy": "delay", "items": items}).encode()
-        with caplog.at_level(
-            logging.INFO, logger="scrapy_extension.queue.strategies.delay"
-        ):
+        with pytest.raises(QueueError, match="snapshot restore failed"):
             strat.restore(bogus)
-        assert not any("recovered" in r.message for r in caplog.records)
 
     def test_push_with_delay_emits_on_delay_depth(
         self, mock_connection_manager, mocker

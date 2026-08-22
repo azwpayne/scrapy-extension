@@ -11,6 +11,7 @@ import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
+from scrapy_extension.exceptions import QueueError
 from scrapy_extension.queue.strategies.factory import (
     QueueStrategyType,
     build_queue_strategy,
@@ -228,7 +229,8 @@ class TestRoundRobinQueueStrategy:
 
         assert strategy.snapshot() is None
         strategy.restore(None)
-        strategy.restore(b"")
+        with pytest.raises(QueueError, match="snapshot restore failed"):
+            strategy.restore(b"")
         assert strategy.queue_len("q") == 0
 
     @pytest.mark.parametrize(
@@ -249,11 +251,31 @@ class TestRoundRobinQueueStrategy:
         strategy = RoundRobinQueueStrategy(object())
         strategy.push("q", b"live", source="live")
 
-        strategy.restore(state)
+        with pytest.raises(QueueError, match="snapshot restore failed"):
+            strategy.restore(state)
 
         assert strategy.pop("q") == b"live"
 
-    def test_restore_skips_malformed_duplicate_and_empty_entries(self) -> None:
+    def test_restore_rejects_duplicate_after_an_empty_source_entry(self) -> None:
+        valid = base64.b64encode(b"valid").decode("ascii")
+        state = json.dumps(
+            {
+                "version": 1,
+                "strategy": "round_robin",
+                "sources": [
+                    {"source": "A", "items": []},
+                    {"source": "A", "items": [valid]},
+                ],
+            }
+        ).encode()
+
+        strategy = RoundRobinQueueStrategy(object())
+        with pytest.raises(QueueError, match="snapshot restore failed"):
+            strategy.restore(state)
+
+        assert strategy.queue_len("q") == 0
+
+    def test_restore_rejects_malformed_duplicate_and_empty_entries(self) -> None:
         valid = base64.b64encode(b"valid").decode("ascii")
         duplicate = base64.b64encode(b"duplicate").decode("ascii")
         state = json.dumps(
@@ -271,9 +293,10 @@ class TestRoundRobinQueueStrategy:
         ).encode()
 
         strategy = RoundRobinQueueStrategy(object())
-        strategy.restore(state)
+        with pytest.raises(QueueError, match="snapshot restore failed"):
+            strategy.restore(state)
 
-        assert strategy.pop("q") == b"valid"
+        assert strategy.pop("q") is None
         assert strategy.pop("q") is None
 
 

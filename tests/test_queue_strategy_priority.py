@@ -92,7 +92,7 @@ def test_pop_with_ack_binds_token_to_physical_bucket_and_issuer():
     manager = MagicMock(name="ConnectionManager")
     manager.backend_type = "rabbitmq"
     manager.get_queue_backend.return_value = backend
-    strategy = PriorityQueueStrategy(manager, levels=3)
+    strategy = PriorityQueueStrategy(manager, levels=3, name_generation="legacy_v1")
 
     data, token = strategy.pop_with_ack("q")
 
@@ -319,6 +319,72 @@ def test_invalid_priority_is_rejected_before_bucket_selection(priority):
     qb.push.assert_not_called()
 
 
+@pytest.mark.parametrize("name_generation", [None, "v1", 7])
+def test_name_generation_must_be_explicitly_supported(name_generation):
+    cm = MagicMock(name="ConnectionManager")
+    cm.backend_type = "redis"
+
+    with pytest.raises(ValueError, match="name_generation"):
+        PriorityQueueStrategy(cm, name_generation=name_generation)
+
+
+def test_physical_name_helper_rejects_unknown_generation_before_backend_lookup():
+    from scrapy_extension.queue.strategies._names import physical_strategy_queue_name
+
+    cm = MagicMock(name="ConnectionManager")
+
+    with pytest.raises(ValueError, match="name_generation"):
+        physical_strategy_queue_name(
+            cm,
+            queue_name="jobs",
+            namespace="priority",
+            discriminator="0",
+            legacy_name="jobs:p0",
+            name_generation="v1",
+        )
+
+    cm.backend_type = "redis"
+    cm.get_queue_backend.assert_not_called()
+
+
+def test_v2_fanout_name_is_distinct_from_literal_passthrough_queue():
+    cm = MagicMock(name="ConnectionManager")
+    cm.backend_type = "redis"
+    cm.get_queue_backend.return_value = MagicMock()
+    strategy = PriorityQueueStrategy(cm, levels=3)
+
+    generated = strategy._bucket_queue("jobs", 0)
+
+    assert generated.startswith("scrapyext-v2-priority-")
+    assert generated != "jobs:p0"
+
+
+def test_legacy_fanout_name_requires_explicit_generation():
+    cm = MagicMock(name="ConnectionManager")
+    cm.backend_type = "redis"
+    cm.get_queue_backend.return_value = MagicMock()
+
+    current = PriorityQueueStrategy(cm, levels=1)
+    legacy = PriorityQueueStrategy(cm, levels=1, name_generation="legacy_v1")
+
+    assert current._bucket_queue("jobs", 0) != legacy._bucket_queue("jobs", 0)
+    assert legacy._bucket_queue("jobs", 0) == "jobs:p0"
+
+
+def test_v2_namespaces_cannot_cross_collide_between_fanout_strategies():
+    from scrapy_extension.queue.strategies.work_stealing import (
+        WorkStealingQueueStrategy,
+    )
+
+    cm = MagicMock(name="ConnectionManager")
+    cm.backend_type = "redis"
+    cm.get_queue_backend.return_value = MagicMock()
+    priority = PriorityQueueStrategy(cm, levels=1)
+    worker = WorkStealingQueueStrategy(cm, worker_id="0")
+
+    assert priority._bucket_queue("jobs", 0) != worker._own_queue("jobs")
+
+
 def test_derived_bucket_names_are_backend_portable_and_collision_resistant():
     """Strategy-created names must not introduce Kafka-invalid ``:`` separators."""
     from scrapy_extension.backends.base import _validate_key_name
@@ -357,7 +423,7 @@ def test_compatible_backend_keeps_published_bucket_name():
     qb = MagicMock(name="QueueBackend")
     cm.get_queue_backend.return_value = qb
     qb.pop.return_value = b"legacy"
-    s = PriorityQueueStrategy(cm, levels=3)
+    s = PriorityQueueStrategy(cm, levels=3, name_generation="legacy_v1")
 
     assert s._bucket_queue("q", 0) == "q:p0"
     assert s.pop("q") == b"legacy"
@@ -370,7 +436,7 @@ def test_pop_with_ack_from_published_bucket_preserves_token():
     qb = MagicMock(name="QueueBackend")
     qb.pop_with_ack.return_value = (b"legacy", "legacy-token")
     cm.get_queue_backend.return_value = qb
-    s = PriorityQueueStrategy(cm, levels=1)
+    s = PriorityQueueStrategy(cm, levels=1, name_generation="legacy_v1")
 
     assert s.pop_with_ack("q") == (b"legacy", "legacy-token")
     qb.pop_with_ack.assert_called_once_with("q:p0", 0.0)
@@ -411,7 +477,7 @@ def test_colon_bearing_queue_name_keeps_published_bucket_name():
     cm = MagicMock(name="ConnectionManager")
     cm.backend_type = "redis"
     cm.get_queue_backend.return_value = MagicMock()
-    s = PriorityQueueStrategy(cm, levels=3)
+    s = PriorityQueueStrategy(cm, levels=3, name_generation="legacy_v1")
 
     assert s._bucket_queue("jobs:a", 1) == "jobs:a:p1"
 
@@ -422,6 +488,22 @@ def test_pop_returns_none_when_all_levels_empty_no_timeout():
     qb.pop.return_value = None
     assert s.pop("q") is None
     assert qb.pop.call_count == 3  # scanned all 3 levels non-blocking
+
+
+def test_pop_timeout_rescans_all_levels_before_returning_empty():
+    """A lower bucket arriving during the p0 wait is not silently missed."""
+    s, qb = _strategy(levels=2)
+    qb.pop.side_effect = [None, None, None, None, None]
+
+    assert s.pop("q", timeout=2.5) is None
+    assert qb.pop.call_count == 5
+    assert [call.args[1] for call in qb.pop.call_args_list] == [
+        0.0,
+        0.0,
+        2.5,
+        0.0,
+        0.0,
+    ]
 
 
 def test_pop_blocking_fallback_on_level_zero_when_timeout():
@@ -462,7 +544,7 @@ def test_queue_len_and_clear_use_one_published_bucket_on_compatible_backend():
     qb = MagicMock(name="QueueBackend")
     qb.queue_len.return_value = 5
     cm.get_queue_backend.return_value = qb
-    s = PriorityQueueStrategy(cm, levels=1)
+    s = PriorityQueueStrategy(cm, levels=1, name_generation="legacy_v1")
 
     assert s.queue_len("q") == 5
     s.clear("q")

@@ -35,7 +35,6 @@ __all__ = [
 ]
 
 import base64
-import binascii
 import json
 import logging
 import threading
@@ -45,6 +44,7 @@ from typing import TYPE_CHECKING, Literal
 from scrapy_extension.exceptions import QueueError
 from scrapy_extension.queue.strategies.base import (
     QueueStrategy,
+    QueueStrategyRestoreError,
     normalize_queue_timeout,
 )
 
@@ -175,9 +175,31 @@ class RingBufferQueueStrategy(QueueStrategy):
                         operation="push",
                     )
                 if self._full_policy == "drop_oldest":
-                    self._buffer.popleft()
-                    self._dropped += 1
-                    self._buffer.append(item)
+                    # Stage the complete replacement off to the side.  Mutating
+                    # the live deque first (popleft, counter increment, append)
+                    # can lose the resident item when append raises MemoryError
+                    # or a process-control signal arrives between those steps.
+                    # Neither allocation nor append below touches live state; the
+                    # two plain attribute assignments publish one replacement.
+                    replacement = type(self._buffer)(self._buffer)
+                    replacement.popleft()
+                    replacement.append(item)
+                    dropped = self._dropped + 1
+                    previous_buffer = self._buffer
+                    previous_dropped = self._dropped
+                    try:
+                        # Publish both pieces of state as one logical transition.
+                        # The assignments are normally infallible, but keeping a
+                        # rollback boundary here also handles deterministic fault
+                        # injection and an asynchronous process-control exception
+                        # between the two assignments without exposing a mixed
+                        # buffer/counter state.
+                        self._buffer = replacement
+                        self._dropped = dropped
+                    except BaseException:
+                        self._buffer = previous_buffer
+                        self._dropped = previous_dropped
+                        raise
                     return
                 # block — wait for a pop to free a slot. Loop re-checks capacity
                 # and closed state against spurious wakeups and concurrent pushes.
@@ -263,90 +285,52 @@ class RingBufferQueueStrategy(QueueStrategy):
             ).encode("utf-8")
 
     def restore(self, state: bytes | None) -> None:
-        """Re-populate the buffer from a prior :meth:`snapshot`.
-
-        Items are re-appended in insertion order. If the snapshot's item count
-        exceeds this strategy's capacity, the OLDEST items are truncated (logged).
-        Corrupt or unknown-format state is logged + skipped.
-
-        Args:
-            state: The bytes blob from a prior :meth:`snapshot`, or ``None``.
-        """
-        if not state:
+        """Restore a complete, validated buffer snapshot atomically."""
+        if state is None:
             return
-        corrupt_snapshot = False
+        restore_failed = False
         try:
             data = json.loads(state.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            corrupt_snapshot = True
-        if corrupt_snapshot:
-            try:
-                logger.warning(
-                    "RingBufferQueueStrategy restore: corrupt snapshot; starting clean."
-                )
-            except BaseException:
-                pass
-            return
-        if (
-            not isinstance(data, dict)
-            or data.get("strategy") != "ring_buffer"
-            or data.get("version") != 1
-        ):
-            try:
-                logger.warning(
-                    "RingBufferQueueStrategy restore: unknown snapshot format; starting clean."
-                )
-            except BaseException:
-                pass
-            return
-        raw_items = data.get("items")
-        if not isinstance(raw_items, list):
-            try:
-                logger.warning(
-                    "RingBufferQueueStrategy restore: snapshot 'items' not a list; starting clean."
-                )
-            except BaseException:
-                pass
-            return
-        decoded: list[bytes] = []
-        for entry in raw_items:
-            malformed_item = False
-            try:
-                decoded.append(base64.b64decode(entry, validate=True))
-            except (binascii.Error, TypeError, ValueError):
-                malformed_item = True
-            if malformed_item:
-                try:
-                    logger.warning(
-                        "RingBufferQueueStrategy restore: skipping malformed item."
-                    )
-                except BaseException:
-                    pass
-                continue
-        # Truncate oldest if the snapshot carries more than capacity.
-        if len(decoded) > self._capacity:
-            dropped = len(decoded) - self._capacity
-            try:
-                logger.warning(
-                    "RingBufferQueueStrategy restore: snapshot had %d items, capacity=%d; "
-                    "truncating the OLDEST %d item(s).",
-                    len(decoded),
-                    self._capacity,
-                    dropped,
-                )
-            except BaseException:
-                pass
-            decoded = decoded[dropped:]
-        with self._not_full:
-            self._buffer.clear()
-            self._buffer.extend(decoded)
-            # Best-effort: preserve dropped counter from snapshot if present.
+            if (
+                not isinstance(data, dict)
+                or data.get("strategy") != "ring_buffer"
+                or type(data.get("version")) is not int
+                or data.get("version") != 1
+                or not isinstance(data.get("items"), list)
+            ):
+                raise ValueError("invalid ring buffer snapshot")
+            decoded = [
+                base64.b64decode(entry, validate=True) for entry in data["items"]
+            ]
             snapshot_dropped = data.get("dropped", 0)
-            if isinstance(snapshot_dropped, int):
+            if (
+                isinstance(snapshot_dropped, bool)
+                or not isinstance(snapshot_dropped, int)
+                or snapshot_dropped < 0
+            ):
+                raise ValueError("invalid dropped count")
+            if len(decoded) > self._capacity:
+                decoded = decoded[len(decoded) - self._capacity :]
+        except Exception:
+            restore_failed = True
+        if restore_failed:
+            raise QueueStrategyRestoreError()
+
+        restored_buffer = deque(decoded)
+        with self._not_full:
+            previous_buffer = self._buffer
+            previous_dropped = self._dropped
+            try:
+                # Do not clear and refill the live deque in place: an
+                # interruption between those mutations would destroy the only
+                # still-owned buffer. Publish the replacement and its counter
+                # together, rolling both back if publication is interrupted.
+                self._buffer = restored_buffer
                 self._dropped = snapshot_dropped
-            # Replacing a previously full buffer may have created free slots. The
-            # notification must happen while holding the condition lock so waiting
-            # pushers cannot miss the state transition.
+            except BaseException:
+                self._buffer = previous_buffer
+                self._dropped = previous_dropped
+                raise
             self._not_full.notify_all()
             if decoded:
                 try:

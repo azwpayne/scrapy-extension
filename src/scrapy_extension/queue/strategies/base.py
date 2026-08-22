@@ -8,7 +8,11 @@ without changing the backend interface or the request-serialization layer.
 
 from __future__ import annotations
 
-__all__ = ["QueueStrategy", "normalize_queue_timeout"]
+__all__ = [
+    "QueueStrategy",
+    "QueueStrategyRestoreError",
+    "normalize_queue_timeout",
+]
 
 import math
 import threading
@@ -195,6 +199,21 @@ class _PreparedQueuePush:
             return False
 
         return cls(backend_route=False, _commit=commit)
+
+
+class QueueStrategyRestoreError(QueueError):
+    """A persisted strategy snapshot was rejected before live state changed.
+
+    The message and operation are intentionally stable and contain no snapshot
+    bytes, keys, or parser details.  Callers use this failure to fence the
+    authoritative checkpoint instead of publishing a clean replacement.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Queue strategy snapshot restore failed.",
+            operation="restore",
+        )
 
 
 class QueueStrategy(ABC):
@@ -509,8 +528,10 @@ class QueueStrategy(ABC):
 
         Default no-op. Called once on startup by
         :class:`~scrapy_extension.queue.queue.BackendQueue`. A ``None`` state
-        (no prior snapshot) is a no-op. Corrupt / unknown-format state MUST be
-        logged + skipped — restore never crashes the spider.
+        (no prior snapshot) is a no-op. Snapshot-capable strategies must either
+        apply the complete state or raise a stable
+        :class:`QueueStrategyRestoreError`; they must not silently skip rejected
+        state.
 
         Args:
             state: The bytes blob from a prior :meth:`snapshot`, or ``None``.

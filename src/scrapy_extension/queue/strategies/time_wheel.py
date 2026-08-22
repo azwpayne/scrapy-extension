@@ -34,7 +34,6 @@ __all__ = [
 ]
 
 import base64
-import binascii
 import heapq
 import itertools
 import json
@@ -48,6 +47,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from scrapy_extension.queue.strategies.base import (
     QueueStrategy,
+    QueueStrategyRestoreError,
     _PreparedQueuePush,
     normalize_queue_timeout,
 )
@@ -155,6 +155,11 @@ class TimeWheelQueueStrategy(QueueStrategy):
         self._wheel: list[deque[tuple[float, bytes, float]]] = [
             deque() for _ in range(wheel_size)
         ]
+        # Wheel entries retain the same process-wide sequence space as overflow
+        # entries.  Keeping sequence numbers beside the legacy three-field wheel
+        # tuples preserves the in-process compatibility shape while allowing one
+        # stable (ready_at, sequence) drain order across both structures.
+        self._wheel_sequences: list[deque[int]] = [deque() for _ in range(wheel_size)]
         self._slot_min_deadlines: list[float | None] = [None] * wheel_size
         self._overflow: list[tuple[float, int, bytes, float]] = []
         self._seq = itertools.count()
@@ -190,10 +195,28 @@ class TimeWheelQueueStrategy(QueueStrategy):
     def _append_wheel_entry(self, slot: int, entry: tuple[float, bytes, float]) -> None:
         """Append one entry and update its slot's derived minimum in O(1)."""
         ready_at = entry[0]
-        self._wheel[slot].append(entry)
-        current_minimum = self._slot_min_deadlines[slot]
-        if current_minimum is None or ready_at < current_minimum:
-            self._slot_min_deadlines[slot] = ready_at
+        entries = self._wheel[slot]
+        sequences = self._wheel_sequences[slot]
+        entry_length = len(entries)
+        sequence_length = len(sequences)
+        previous_minimum = self._slot_min_deadlines[slot]
+        try:
+            entries.append(entry)
+            sequences.append(next(self._seq))
+            current_minimum = previous_minimum
+            if current_minimum is None or ready_at < current_minimum:
+                current_minimum = ready_at
+            self._slot_min_deadlines[slot] = current_minimum
+        except BaseException:
+            # Keep the parallel wheel and sequence deques, plus their derived
+            # minimum, in lockstep even when a process-control signal lands
+            # between the individual container mutations.
+            while len(entries) > entry_length:
+                entries.pop()
+            while len(sequences) > sequence_length:
+                sequences.pop()
+            self._slot_min_deadlines[slot] = previous_minimum
+            raise
 
     def _recompute_slot_min_deadline(self, slot: int) -> None:
         """Rebuild the derived minimum after a slot has been drained."""
@@ -356,6 +379,9 @@ class TimeWheelQueueStrategy(QueueStrategy):
             ),
         )
 
+    def _wheel_release_at(self, ready_at: float) -> float:
+        return math.ceil(ready_at * self._ticks_per_second) / self._ticks_per_second
+
     def _next_release_at(self) -> float | None:
         """Return the next release after scanning only slot minima + overflow head."""
         with self._state_lock:
@@ -363,10 +389,7 @@ class TimeWheelQueueStrategy(QueueStrategy):
             for ready_at in self._slot_min_deadlines:
                 if ready_at is None:
                     continue
-                release_at = (
-                    math.ceil(ready_at * self._ticks_per_second)
-                    / self._ticks_per_second
-                )
+                release_at = self._wheel_release_at(ready_at)
                 if next_release is None or release_at < next_release:
                     next_release = release_at
             return next_release
@@ -401,63 +424,105 @@ class TimeWheelQueueStrategy(QueueStrategy):
                 return empty
 
     def _drain_ready(self, queue_name: str) -> None:
-        """Move all due held items (wheel + overflow) into the live queue.
+        """Move every releasable wheel/overflow entry in stable deadline order.
 
-        Drains every wheel slot between ``_last_tick+1`` and ``now_tick``,
-        capped to one full rotation (so a long idle doesn't loop more than
-        ``wheel_size`` times). Then drains overflow items whose ``ready_at``
-        has passed.
-
-        Args:
-            queue_name: The queue name to drain into.
+        The physical wheel is only an indexing structure. Once an entry's wheel
+        release tick (or overflow deadline) is due, all candidates are merged and
+        ordered by their original ``(ready_at, sequence)`` pair.  Each candidate
+        remains in its source container until the live backend push returns, so a
+        normal failure or ``BaseException`` leaves that item and the untouched
+        tail owned for retry.
         """
         with self._state_lock:
             qb = self._connection_manager.get_queue_backend()
             now = self._clock_now()
             now_tick = self._tick_at(now)
-            # Cap the drain span to one full rotation — every slot is covered once.
+            # (ready_at, sequence, source, slot, item, priority)
+            candidates: list[tuple[float, int, str, int, bytes, float]] = []
+            # Preserve the wheel's tick-gated release contract (a sub-tick item
+            # waits for the next tick), while scanning a full rotation after a
+            # long idle so no due slot is stranded.  Ordering itself is global
+            # and no longer depends on the physical slot number.
             span = max(0, min(now_tick - self._last_tick, self._wheel_size))
-            for i in range(span):
-                tick = self._last_tick + 1 + i
-                slot = tick % self._wheel_size
+            slots_to_scan = {
+                (self._last_tick + 1 + offset) % self._wheel_size
+                for offset in range(span)
+            }
+            for slot in slots_to_scan:
                 dq = self._wheel[slot]
-                if not dq:
-                    continue
-                # Release only items whose ready_at has passed; KEEP future items in the
-                # slot (re-checked on the next drain). After a long idle (> one rotation)
-                # the catch-up drain covers every slot — without this check a future item
-                # sharing a slot position with a past tick is released before its delay
-                # elapses. In normal operation (span < wheel_size) the filter is a no-op:
-                # a slot is only reached when its tick is in the drain window, at which
-                # point ready_at <= now.
-                # Keep every entry in the slot until its backend push returns. Future
-                # entries remain in place, so interruption never needs compensating
-                # cleanup and the deque always contains only valid business entries.
-                # Successfully published due entries alone are removed. A signal after
-                # backend acceptance but before deletion may replay that one ambiguous
-                # entry, which is the safe at-least-once side of the remote commit
-                # boundary. The common all-due path deletes index zero in O(1); only the
-                # rare mixed future/due catch-up path pays indexed-deque deletion cost.
-                entry_index = 0
-                entries_to_scan = len(dq)
-                try:
-                    for _ in range(entries_to_scan):
-                        ready_at_h, item, priority = dq[entry_index]
-                        if ready_at_h > now:
-                            entry_index += 1
-                            continue
+                sequences = self._wheel_sequences[slot]
+                for index in range(len(dq)):
+                    ready_at, item, priority = dq[index]
+                    if ready_at <= now:
+                        candidates.append(
+                            (
+                                ready_at,
+                                sequences[index],
+                                "wheel",
+                                slot,
+                                item,
+                                priority,
+                            )
+                        )
+            for ready_at, sequence, item, priority in self._overflow:
+                if ready_at <= now:
+                    candidates.append(
+                        (ready_at, sequence, "overflow", -1, item, priority)
+                    )
+            candidates.sort(key=lambda candidate: (candidate[0], candidate[1]))
+
+            for ready_at, sequence, source, slot, item, priority in candidates:
+                if source == "wheel":
+                    dq = self._wheel[slot]
+                    sequences = self._wheel_sequences[slot]
+                    try:
+                        entry_index = sequences.index(sequence)
+                    except ValueError:
+                        # A prior candidate can only remove its own entry; this
+                        # guard keeps a defensive custom container from replaying
+                        # an already-settled candidate.
+                        continue
+                    entry_count = len(dq)
+                    sequence_count = len(sequences)
+                    try:
                         qb.push(queue_name, item, priority)
                         del dq[entry_index]
-                finally:
-                    # This slot may now contain only a future tail, or a failed
-                    # due entry plus its tail. Recompute only the slot just scanned.
-                    self._recompute_slot_min_deadline(slot)
-            # Drain due overflow. The lock spans backend push through heap removal:
-            # another pop must not publish the same uncommitted heap head.
-            while self._overflow and self._overflow[0][0] <= now:
-                _, _, item, priority = self._overflow[0]
-                qb.push(queue_name, item, priority)
-                heapq.heappop(self._overflow)
+                        del sequences[entry_index]
+                    except BaseException:
+                        # The backend push is the transfer boundary.  If local
+                        # bookkeeping is interrupted after that boundary, roll
+                        # back the local mutation so a retry still owns exactly
+                        # the same item and sequence pair.  (An ambiguous backend
+                        # push remains conservatively retryable, as before.)
+                        if len(dq) < entry_count:
+                            dq.insert(entry_index, (ready_at, item, priority))
+                        if len(sequences) < sequence_count:
+                            sequences.insert(entry_index, sequence)
+                        raise
+                    finally:
+                        self._recompute_slot_min_deadline(slot)
+                else:
+                    # Heap ordering is the same (ready_at, sequence) order as the
+                    # merged list, so every remaining overflow candidate is its
+                    # root when reached.  Leave it in place until push succeeds.
+                    # A defensively malformed heap must not strand a ready
+                    # non-root candidate until a later drain: settle it in
+                    # merged order by removing the exact tuple instead of
+                    # trusting root-ness (sequence is unique per entry).
+                    candidate = (ready_at, sequence, item, priority)
+                    if self._overflow and self._overflow[0] == candidate:
+                        qb.push(queue_name, item, priority)
+                        heapq.heappop(self._overflow)
+                        continue
+                    try:
+                        entry_index = self._overflow.index(candidate)
+                    except ValueError:
+                        # A prior candidate can only remove its own entry; this
+                        # guard keeps a replayed candidate from double-push.
+                        continue
+                    qb.push(queue_name, item, priority)
+                    del self._overflow[entry_index]
+                    heapq.heapify(self._overflow)
             self._last_tick = now_tick
 
     # ------------------------------------------------------------------ len/clear
@@ -475,19 +540,49 @@ class TimeWheelQueueStrategy(QueueStrategy):
         self.bind(queue_name)
         with self._state_lock:
             self._connection_manager.get_queue_backend().clear_queue(queue_name)
-            for slot in self._wheel:
-                slot.clear()
-            self._slot_min_deadlines = [None] * self._wheel_size
-            self._overflow.clear()
+            previous_state = (
+                self._wheel,
+                self._wheel_sequences,
+                self._slot_min_deadlines,
+                self._overflow,
+            )
+            try:
+                self._wheel = [deque() for _ in range(self._wheel_size)]
+                self._wheel_sequences = [deque() for _ in range(self._wheel_size)]
+                self._slot_min_deadlines = [None] * self._wheel_size
+                self._overflow = []
+            except BaseException:
+                (
+                    self._wheel,
+                    self._wheel_sequences,
+                    self._slot_min_deadlines,
+                    self._overflow,
+                ) = previous_state
+                raise
 
     def close(self) -> None:
         """Warn about any held items being discarded at shutdown."""
         with self._state_lock:
             held = sum(len(slot) for slot in self._wheel) + len(self._overflow)
-            for slot in self._wheel:
-                slot.clear()
-            self._slot_min_deadlines = [None] * self._wheel_size
-            self._overflow.clear()
+            previous_state = (
+                self._wheel,
+                self._wheel_sequences,
+                self._slot_min_deadlines,
+                self._overflow,
+            )
+            try:
+                self._wheel = [deque() for _ in range(self._wheel_size)]
+                self._wheel_sequences = [deque() for _ in range(self._wheel_size)]
+                self._slot_min_deadlines = [None] * self._wheel_size
+                self._overflow = []
+            except BaseException:
+                (
+                    self._wheel,
+                    self._wheel_sequences,
+                    self._slot_min_deadlines,
+                    self._overflow,
+                ) = previous_state
+                raise
 
         if held > 0:
             try:
@@ -530,17 +625,26 @@ class TimeWheelQueueStrategy(QueueStrategy):
                     "remaining": max(0.0, ready_at - snapshot_now),
                     "item_b64": base64.b64encode(item).decode("ascii"),
                     "priority": priority,
+                    # Keep the process-wide tie-breaker so a restart cannot
+                    # reorder equal-deadline entries that happened to occupy
+                    # different physical containers.
+                    "sequence": sequence,
                 }
-                for slot in self._wheel
-                for ready_at, item, priority in slot
+                for slot, sequences in zip(
+                    self._wheel, self._wheel_sequences, strict=True
+                )
+                for (ready_at, item, priority), sequence in zip(
+                    slot, sequences, strict=True
+                )
             ]
             overflow = [
                 {
                     "remaining": max(0.0, ready_at - snapshot_now),
                     "item_b64": base64.b64encode(item).decode("ascii"),
                     "priority": priority,
+                    "sequence": sequence,
                 }
-                for ready_at, _seq, item, priority in sorted(self._overflow)
+                for ready_at, sequence, item, priority in sorted(self._overflow)
             ]
             return json.dumps(
                 {
@@ -554,71 +658,26 @@ class TimeWheelQueueStrategy(QueueStrategy):
             ).encode("utf-8")
 
     def restore(self, state: bytes | None) -> None:
-        """Re-populate the wheel + overflow from a prior :meth:`snapshot`.
-
-        Version 2 remaining delays are rebased onto the current monotonic clock
-        after subtracting wall-clock downtime. Version 1 absolute monotonic
-        deadlines are unrecoverable across processes, so those items become due
-        immediately. Corrupt or unknown-format state is logged and skipped.
-
-        Args:
-            state: The bytes blob from a prior :meth:`snapshot`, or ``None``.
-        """
-        if not state:
+        """Restore a complete, validated wheel snapshot atomically."""
+        if state is None:
             return
-        corrupt_snapshot = False
+        restore_failed = False
         try:
             data = json.loads(state.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            corrupt_snapshot = True
-        if corrupt_snapshot:
-            try:
-                logger.warning(
-                    "TimeWheelQueueStrategy restore: corrupt snapshot; starting clean."
-                )
-            except BaseException:
-                pass
-            return
-        if (
-            not isinstance(data, dict)
-            or data.get("strategy") != "time_wheel"
-            or data.get("version") not in (1, 2)
-        ):
-            try:
-                logger.warning(
-                    "TimeWheelQueueStrategy restore: unknown snapshot format; starting clean."
-                )
-            except BaseException:
-                pass
-            return
-        slots_flat = data.get("slots_flat")
-        overflow_entries = data.get("overflow")
-        if not isinstance(slots_flat, list) or not isinstance(overflow_entries, list):
-            try:
-                logger.warning(
-                    "TimeWheelQueueStrategy restore: snapshot collections must be lists; "
-                    "starting clean."
-                )
-            except BaseException:
-                pass
-            return
-        try:
-            version = int(data["version"])
-        except (OverflowError, TypeError, ValueError):
-            try:
-                logger.warning(
-                    "TimeWheelQueueStrategy restore: invalid snapshot version; "
-                    "starting clean."
-                )
-            except BaseException:
-                pass
-            return
-        with self._state_lock:
-            now = self._clock_now()
-            downtime = 0.0
-            if version == 2:
-                invalid_v2_clock_metadata = False
-                try:
+            if (
+                not isinstance(data, dict)
+                or data.get("strategy") != "time_wheel"
+                or type(data.get("version")) is not int
+                or data.get("version") not in (1, 2)
+                or not isinstance(data.get("slots_flat"), list)
+                or not isinstance(data.get("overflow"), list)
+            ):
+                raise ValueError("invalid time wheel snapshot")
+            version = data["version"]
+            with self._state_lock:
+                now = self._clock_now()
+                downtime = 0.0
+                if version == 2:
                     snapshot_wall_time = float(data["snapshot_wall_time"])
                     current_wall_time = float(self._wall_clock())
                     if not math.isfinite(snapshot_wall_time) or not math.isfinite(
@@ -626,139 +685,138 @@ class TimeWheelQueueStrategy(QueueStrategy):
                     ):
                         raise ValueError("wall clock is not finite")
                     downtime = max(0.0, current_wall_time - snapshot_wall_time)
-                except (KeyError, OverflowError, TypeError, ValueError):
-                    invalid_v2_clock_metadata = True
-                if invalid_v2_clock_metadata:
-                    try:
-                        logger.warning(
-                            "TimeWheelQueueStrategy restore: invalid v2 clock metadata; "
-                            "starting clean."
-                        )
-                    except BaseException:
-                        pass
-                    return
 
-            def restored_timing(entry: dict[str, Any]) -> tuple[float, float]:
-                if version == 1:
-                    # v1's absolute monotonic epoch cannot be recovered safely.
-                    old_ready_at = float(entry.get("ready_at", now))
-                    if not math.isfinite(old_ready_at):
-                        raise ValueError("legacy ready time is not finite")
-                    return now, old_ready_at
-                remaining = float(entry["remaining"])
-                if not math.isfinite(remaining):
-                    raise ValueError("remaining delay is not finite")
-                ready_at = now + max(0.0, remaining - downtime)
-                if not math.isfinite(ready_at):
-                    raise ValueError("restored ready time is not finite")
-                return ready_at, remaining
+                def restored_timing(entry: dict[str, Any]) -> tuple[float, float]:
+                    if not isinstance(entry, dict):
+                        raise ValueError("invalid timing entry")
+                    if version == 1:
+                        old_ready_at = float(entry.get("ready_at", now))
+                        if not math.isfinite(old_ready_at):
+                            raise ValueError("legacy ready time is not finite")
+                        return now, old_ready_at
+                    remaining = _finite_number(entry["remaining"], "remaining")
+                    if remaining < 0:
+                        raise ValueError("remaining delay must be >= 0")
+                    ready_at = now + max(0.0, remaining - downtime)
+                    if not math.isfinite(ready_at):
+                        raise ValueError("restored ready time is not finite")
+                    return ready_at, remaining
 
-            staged: list[tuple[float, float, int, bytes, float]] = []
-            input_order = 0
-            # Re-place wheel items by their rebased ready time: recompute the slot for
-            # future entries and stage due entries in overflow for the next pop.
-            for entry in slots_flat:
-                entry_order = input_order
-                input_order += 1
-                malformed_wheel_entry = False
-                try:
-                    item = base64.b64decode(entry["item_b64"], validate=True)
-                    priority = float(entry["priority"])
-                    if not math.isfinite(priority):
-                        raise ValueError("priority is not finite")
-                    ready_at, original_deadline = restored_timing(entry)
-                except (
-                    KeyError,
-                    OverflowError,
-                    TypeError,
-                    ValueError,
-                    binascii.Error,
-                ):
-                    malformed_wheel_entry = True
-                if malformed_wheel_entry:
-                    try:
-                        logger.warning(
-                            "TimeWheelQueueStrategy restore: skipping malformed wheel entry."
-                        )
-                    except BaseException:
-                        pass
-                    continue
-                staged.append(
-                    (ready_at, original_deadline, entry_order, item, priority)
-                )
-            for entry in overflow_entries:
-                entry_order = input_order
-                input_order += 1
-                malformed_overflow_entry = False
-                try:
+                staged: list[tuple[float, float, int, int | None, bytes, float]] = []
+                serialized_sequences: set[int] = set()
+                all_entries = [
+                    *data["slots_flat"],
+                    *data["overflow"],
+                ]
+                for entry_order, entry in enumerate(all_entries):
                     ready_at, original_deadline = restored_timing(entry)
                     item = base64.b64decode(entry["item_b64"], validate=True)
                     priority = float(entry["priority"])
                     if not math.isfinite(priority):
                         raise ValueError("priority is not finite")
-                except (
-                    KeyError,
-                    OverflowError,
-                    TypeError,
-                    ValueError,
-                    binascii.Error,
-                ):
-                    malformed_overflow_entry = True
-                if malformed_overflow_entry:
-                    try:
-                        logger.warning(
-                            "TimeWheelQueueStrategy restore: skipping malformed overflow entry."
+                    raw_sequence = entry.get("sequence")
+                    sequence: int | None = None
+                    if raw_sequence is not None:
+                        if (
+                            isinstance(raw_sequence, bool)
+                            or not isinstance(raw_sequence, int)
+                            or raw_sequence < 0
+                            or raw_sequence in serialized_sequences
+                        ):
+                            raise ValueError("sequence is invalid")
+                        sequence = raw_sequence
+                        serialized_sequences.add(raw_sequence)
+                    staged.append(
+                        (
+                            ready_at,
+                            original_deadline,
+                            entry_order,
+                            sequence,
+                            item,
+                            priority,
                         )
-                    except BaseException:
-                        pass
-                    continue
-                staged.append(
-                    (ready_at, original_deadline, entry_order, item, priority)
-                )
-
-            recovered_wheel: list[deque[tuple[float, bytes, float]]] = [
-                deque() for _ in range(self._wheel_size)
-            ]
-            recovered_slot_min_deadlines: list[float | None] = [None] * self._wheel_size
-            recovered_overflow: list[tuple[float, int, bytes, float]] = []
-            recovered_seq = itertools.count()
-            # Expired deadlines collapse to ``now``. Retain their original deadline
-            # as a secondary key, then the stable snapshot order as a final tie-break,
-            # so downtime cannot reverse already-established delivery order.
-            staged.sort(
-                key=lambda staged_entry: (
-                    staged_entry[0],
-                    staged_entry[1],
-                    staged_entry[2],
-                )
-            )
-            for ready_at, _original_deadline, _order, item, priority in staged:
-                use_wheel = ready_at > now and ready_at - now <= self._wheel_duration
-                if use_wheel:
-                    slot = self._slot_at(ready_at)
-                    recovered_wheel[slot].append((ready_at, item, priority))
-                    slot_minimum = recovered_slot_min_deadlines[slot]
-                    if slot_minimum is None or ready_at < slot_minimum:
-                        recovered_slot_min_deadlines[slot] = ready_at
-                else:
-                    heapq.heappush(
-                        recovered_overflow,
-                        (ready_at, next(recovered_seq), item, priority),
                     )
-            # A valid persisted snapshot is authoritative startup state. Swap the
-            # fully decoded replacement in one lock-held commit so restore is
-            # idempotent and readers never observe a partially rebuilt wheel.
-            self._wheel = recovered_wheel
-            self._slot_min_deadlines = recovered_slot_min_deadlines
-            self._overflow = recovered_overflow
-            self._seq = recovered_seq
-            self._last_tick = self._tick_at(now)
-            recovered = len(staged)
-        if recovered:
+
+                recovered_wheel: list[deque[tuple[float, bytes, float]]] = [
+                    deque() for _ in range(self._wheel_size)
+                ]
+                recovered_wheel_sequences: list[deque[int]] = [
+                    deque() for _ in range(self._wheel_size)
+                ]
+                recovered_slot_min_deadlines: list[float | None] = [
+                    None
+                ] * self._wheel_size
+                recovered_overflow: list[tuple[float, int, bytes, float]] = []
+                recovered_seq = itertools.count()
+                staged.sort(
+                    key=lambda staged_entry: (
+                        (staged_entry[0], 0, staged_entry[3], staged_entry[2])
+                        if staged_entry[3] is not None
+                        else (staged_entry[0], 1, staged_entry[1], staged_entry[2])
+                    )
+                )
+                for (
+                    ready_at,
+                    _original_deadline,
+                    _order,
+                    _sequence,
+                    item,
+                    priority,
+                ) in staged:
+                    use_wheel = (
+                        ready_at > now and ready_at - now <= self._wheel_duration
+                    )
+                    if use_wheel:
+                        slot = self._slot_at(ready_at)
+                        recovered_wheel[slot].append((ready_at, item, priority))
+                        recovered_wheel_sequences[slot].append(next(recovered_seq))
+                        slot_minimum = recovered_slot_min_deadlines[slot]
+                        if slot_minimum is None or ready_at < slot_minimum:
+                            recovered_slot_min_deadlines[slot] = ready_at
+                    else:
+                        heapq.heappush(
+                            recovered_overflow,
+                            (ready_at, next(recovered_seq), item, priority),
+                        )
+                # Publish every derived container as one state transition.  A
+                # control-flow interruption between assignments must restore the
+                # old wheel rather than exposing mismatched entry/sequence
+                # deques or a new wheel with an old tie-breaker counter.
+                previous_state = (
+                    self._wheel,
+                    self._wheel_sequences,
+                    self._slot_min_deadlines,
+                    self._overflow,
+                    self._seq,
+                    self._last_tick,
+                )
+                try:
+                    self._wheel = recovered_wheel
+                    self._wheel_sequences = recovered_wheel_sequences
+                    self._slot_min_deadlines = recovered_slot_min_deadlines
+                    self._overflow = recovered_overflow
+                    self._seq = recovered_seq
+                    self._last_tick = self._tick_at(now)
+                except BaseException:
+                    (
+                        self._wheel,
+                        self._wheel_sequences,
+                        self._slot_min_deadlines,
+                        self._overflow,
+                        self._seq,
+                        self._last_tick,
+                    ) = previous_state
+                    raise
+        except Exception:
+            restore_failed = True
+        if restore_failed:
+            raise QueueStrategyRestoreError()
+
+        if staged:
             try:
                 logger.info(
                     "TimeWheelQueueStrategy restore: recovered %d held item(s) from snapshot.",
-                    recovered,
+                    len(staged),
                 )
             except BaseException:
                 pass

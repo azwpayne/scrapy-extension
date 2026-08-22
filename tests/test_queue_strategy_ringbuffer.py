@@ -24,6 +24,7 @@ from unittest.mock import MagicMock
 import pytest
 from scrapy.http import Request
 
+import scrapy_extension.queue.strategies.ring_buffer as ring_buffer_module
 from scrapy_extension.exceptions import QueueError
 from scrapy_extension.queue.queue import BackendQueue
 from scrapy_extension.queue.strategies.ring_buffer import RingBufferQueueStrategy
@@ -110,6 +111,96 @@ def test_push_full_drop_oldest_overwrites_and_counts():
     # Oldest (a) is gone; b and c remain in FIFO order.
     assert s.pop("q") == b"b"
     assert s.pop("q") == b"c"
+
+
+@pytest.mark.parametrize("failure", [MemoryError(), KeyboardInterrupt()])
+def test_drop_oldest_replacement_failure_keeps_resident_item(
+    failure: BaseException,
+) -> None:
+    """A failed replacement must not publish a half-mutated live buffer."""
+    s, _ = _strategy(capacity=1, full_policy="drop_oldest")
+    s.push("q", b"resident")
+
+    class FailingDeque(ring_buffer_module.deque):
+        def append(self, value: bytes) -> None:
+            super().append(value)
+            raise failure
+
+    s._buffer = FailingDeque(s._buffer)
+    with pytest.raises(type(failure)) as raised:
+        s.push("q", b"replacement")
+
+    assert raised.value is failure
+    assert list(s._buffer) == [b"resident"]
+    assert s._dropped == 0
+
+
+@pytest.mark.parametrize("stage", ["copy", "popleft"])
+def test_drop_oldest_stages_fail_before_live_publication(stage: str) -> None:
+    """Copy construction and staging removal cannot affect the live deque."""
+    s, _ = _strategy(capacity=1, full_policy="drop_oldest")
+    s.push("q", b"resident")
+
+    if stage == "copy":
+
+        class FailingDeque(ring_buffer_module.deque):
+            fail = False
+
+            def __new__(cls, *args):
+                if cls.fail:
+                    raise MemoryError("copy")
+                return super().__new__(cls)
+
+        s._buffer = FailingDeque(s._buffer)
+        FailingDeque.fail = True
+    else:
+
+        class FailingDeque(ring_buffer_module.deque):
+            fail = False
+
+            def popleft(self) -> bytes:
+                if self.fail:
+                    raise RuntimeError("popleft")
+                return super().popleft()
+
+        s._buffer = FailingDeque(s._buffer)
+        FailingDeque.fail = True
+
+    with pytest.raises((MemoryError, RuntimeError)):
+        s.push("q", b"replacement")
+
+    assert list(s._buffer) == [b"resident"]
+    assert s._dropped == 0
+
+
+@pytest.mark.parametrize("attribute", ["_buffer", "_dropped"])
+def test_drop_oldest_publication_failure_rolls_back_both_state_fields(
+    attribute: str,
+) -> None:
+    """An exception between the two publication assignments is recoverable."""
+
+    class FailingPublicationRing(RingBufferQueueStrategy):
+        armed = False
+        failure_attribute = ""
+
+        def __setattr__(self, name: str, value: object) -> None:
+            if name == self.failure_attribute and self.armed:
+                object.__setattr__(self, "armed", False)
+                raise MemoryError(name)
+            object.__setattr__(self, name, value)
+
+    cm = MagicMock()
+    cm.get_queue_backend.return_value = MagicMock()
+    s = FailingPublicationRing(cm, capacity=1, full_policy="drop_oldest")
+    s.push("q", b"resident")
+    s.failure_attribute = attribute
+    s.armed = True
+
+    with pytest.raises(MemoryError, match=attribute):
+        s.push("q", b"replacement")
+
+    assert list(s._buffer) == [b"resident"]
+    assert s._dropped == 0
 
 
 def test_push_full_block_waits_for_pop():
@@ -205,13 +296,15 @@ def test_restore_round_trip_rebuilds_buffer():
 def test_restore_none_is_noop():
     s, _ = _strategy()
     s.restore(None)
-    s.restore(b"")
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        s.restore(b"")
     assert s.queue_len("q") == 0
 
 
-def test_restore_corrupt_skipped():
+def test_restore_corrupt_rejected():
     s, _ = _strategy()
-    s.restore(b"\x00 not json \x00")
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        s.restore(b"\x00 not json \x00")
     assert s.queue_len("q") == 0
 
 
@@ -228,16 +321,79 @@ def test_restore_skips_non_base64_item():
         }
     ).encode()
 
-    s.restore(blob)
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        s.restore(blob)
 
     assert s.queue_len("q") == 0
 
 
-def test_restore_unknown_format_skipped():
+def test_restore_unknown_format_rejected():
     s, _ = _strategy()
     blob = json.dumps({"version": 99, "strategy": "other"}).encode()
-    s.restore(blob)
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        s.restore(blob)
     assert s.queue_len("q") == 0
+
+
+def test_restore_process_control_leaves_existing_buffer_untouched(mocker):
+    """A parser interruption cannot publish a replacement buffer."""
+    s, _ = _strategy(capacity=2)
+    s.push("q", b"resident")
+    signal = KeyboardInterrupt("restore interrupted")
+    mocker.patch(
+        "scrapy_extension.queue.strategies.ring_buffer.json.loads",
+        side_effect=signal,
+    )
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        s.restore(b"not parsed")
+
+    assert raised.value is signal
+    assert s.pop("q") == b"resident"
+
+
+def test_restore_publication_interrupt_preserves_existing_buffer():
+    class InterruptingRingBuffer(RingBufferQueueStrategy):
+        interrupt_counter = False
+
+        def __setattr__(self, name: str, value: object) -> None:
+            if name == "_dropped" and self.interrupt_counter:
+                object.__setattr__(self, "interrupt_counter", False)
+                raise KeyboardInterrupt("counter publication interrupted")
+            object.__setattr__(self, name, value)
+
+    source = RingBufferQueueStrategy(MagicMock(), capacity=2)
+    source.push("q", b"replacement")
+    state = source.snapshot()
+    assert state is not None
+
+    target = InterruptingRingBuffer(MagicMock(), capacity=2)
+    target.push("q", b"resident")
+    target.interrupt_counter = True
+
+    with pytest.raises(KeyboardInterrupt, match="counter publication interrupted"):
+        target.restore(state)
+
+    assert target.pop("q") == b"resident"
+
+
+@pytest.mark.parametrize("dropped", [True, False, 1.5, -1])
+def test_restore_rejects_invalid_dropped_counter(dropped: object) -> None:
+    s, _ = _strategy()
+    s.push("q", b"keep")
+    blob = json.dumps(
+        {
+            "version": 1,
+            "strategy": "ring_buffer",
+            "items": [base64.b64encode(b"replacement").decode()],
+            "dropped": dropped,
+        }
+    ).encode()
+
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        s.restore(blob)
+
+    assert s.pop("q") == b"keep"
 
 
 def test_restore_truncates_oldest_when_over_capacity():

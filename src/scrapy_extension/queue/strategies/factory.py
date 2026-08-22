@@ -78,6 +78,7 @@ def build_queue_strategy(
     steal_timeout: float = 0.05,
     capacity: int = 1024,
     full_policy: str = "reject",
+    name_generation: str = "v2",
 ) -> QueueStrategy:
     """Build the queue strategy for ``strategy_type``.
 
@@ -99,6 +100,9 @@ def build_queue_strategy(
         capacity: Slot count for ``ring_buffer`` (default 1024).
         full_policy: Overflow policy for ``ring_buffer`` — ``reject`` (default),
             ``drop_oldest``, or ``block``.
+        name_generation: Physical-name generation for fan-out strategies. ``v2``
+            is the injective default; ``legacy_v1`` is an explicit quiescent
+            backlog-drain mode for old colon-delimited names.
 
     Returns:
         A concrete QueueStrategy instance.
@@ -121,7 +125,11 @@ def build_queue_strategy(
     if strategy_type is QueueStrategyType.THROTTLE:
         return ThrottleQueueStrategy(connection_manager, min_interval=min_interval)
     if strategy_type is QueueStrategyType.PRIORITY:
-        return PriorityQueueStrategy(connection_manager, levels=priority_levels)
+        return PriorityQueueStrategy(
+            connection_manager,
+            levels=priority_levels,
+            name_generation=name_generation,
+        )
     if strategy_type is QueueStrategyType.TIME_WHEEL:
         return TimeWheelQueueStrategy(
             connection_manager,
@@ -135,6 +143,7 @@ def build_queue_strategy(
             worker_id=worker_id,
             peer_ids=peer_ids,
             steal_timeout=steal_timeout,
+            name_generation=name_generation,
         )
     if strategy_type is QueueStrategyType.RING_BUFFER:
         return RingBufferQueueStrategy(

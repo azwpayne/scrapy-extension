@@ -12,6 +12,7 @@ __all__ = [
     "PassthroughQueueStrategy",
     "PriorityQueueStrategy",
     "QueueStrategy",
+    "QueueStrategyRestoreError",
     "RingBufferQueueStrategy",
     "RoundRobinQueueStrategy",
     "ThrottleQueueStrategy",
@@ -19,7 +20,10 @@ __all__ = [
     "WorkStealingQueueStrategy",
 ]
 
-from scrapy_extension.queue.strategies.base import QueueStrategy
+from scrapy_extension.queue.strategies.base import (
+    QueueStrategy,
+    QueueStrategyRestoreError,
+)
 from scrapy_extension.queue.strategies.delay import DelayQueueStrategy
 from scrapy_extension.queue.strategies.passthrough import PassthroughQueueStrategy
 from scrapy_extension.queue.strategies.priority import PriorityQueueStrategy

@@ -14,6 +14,7 @@ import scrapy_extension.queue.strategies.delay as delay_module
 import scrapy_extension.queue.strategies.ring_buffer as ring_buffer_module
 import scrapy_extension.queue.strategies.round_robin as round_robin_module
 import scrapy_extension.queue.strategies.time_wheel as time_wheel_module
+from scrapy_extension.exceptions import QueueError
 from scrapy_extension.queue.strategies.delay import DelayQueueStrategy
 from scrapy_extension.queue.strategies.ring_buffer import RingBufferQueueStrategy
 from scrapy_extension.queue.strategies.round_robin import RoundRobinQueueStrategy
@@ -36,7 +37,8 @@ def test_ring_buffer_restore_fallback_diagnostic_preserves_live_state(
         ring_buffer_module.logger, "warning", side_effect=diagnostic_error
     )
 
-    strategy.restore(b"\xff")
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        strategy.restore(b"\xff")
 
     assert strategy.pop("q") == b"live"
 
@@ -68,7 +70,8 @@ def test_delay_restore_fallback_diagnostic_preserves_live_state(
     strategy.push("q", b"live", delay=10.0)
     mocker.patch.object(delay_module.logger, "warning", side_effect=diagnostic_error)
 
-    strategy.restore(b"\xff")
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        strategy.restore(b"\xff")
 
     assert [entry[2] for entry in strategy._holding] == [b"live"]
 
@@ -106,7 +109,8 @@ def test_round_robin_restore_fallback_diagnostic_preserves_live_state(
         round_robin_module.logger, "warning", side_effect=diagnostic_error
     )
 
-    strategy.restore(b"\xff")
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        strategy.restore(b"\xff")
 
     assert strategy.pop("q") == b"live"
 
@@ -143,7 +147,8 @@ def test_time_wheel_restore_fallback_diagnostic_preserves_live_state(
         time_wheel_module.logger, "warning", side_effect=diagnostic_error
     )
 
-    strategy.restore(b"\xff")
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        strategy.restore(b"\xff")
 
     assert sum(len(slot) for slot in strategy._wheel) + len(strategy._overflow) == 1
 

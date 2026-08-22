@@ -15,6 +15,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from scrapy_extension.exceptions import QueueError
 from scrapy_extension.queue.strategies.ring_buffer import RingBufferQueueStrategy
 from scrapy_extension.queue.strategies.time_wheel import TimeWheelQueueStrategy
 
@@ -98,7 +99,7 @@ def test_timewheel_snapshot_only_overflow_serializes():
 
 
 # ---------------------------------------------------------------------------
-# TimeWheel — restore: malformed slot/overflow entries skipped, recovered log
+# TimeWheel — restore: malformed slot/overflow entries fail closed, recovered log
 # ---------------------------------------------------------------------------
 
 
@@ -113,11 +114,8 @@ def test_timewheel_restore_malformed_slot_entry_skipped(caplog):
             "overflow": [],
         }
     ).encode()
-    with caplog.at_level(
-        logging.WARNING, logger="scrapy_extension.queue.strategies.time_wheel"
-    ):
+    with pytest.raises(QueueError, match="snapshot restore failed"):
         s.restore(blob)
-    assert any("skipping malformed wheel entry" in r.message for r in caplog.records)
 
 
 def test_timewheel_restore_malformed_overflow_entry_skipped():
@@ -130,7 +128,8 @@ def test_timewheel_restore_malformed_overflow_entry_skipped():
             "overflow": [{"ready_at": "x", "item_b64": "!!!"}],  # malformed
         }
     ).encode()
-    s.restore(blob)
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        s.restore(blob)
     assert len(s._overflow) == 0
 
 
@@ -162,9 +161,8 @@ def test_timewheel_restore_skips_non_list_slots(caplog):
             "overflow": [],
         }
     ).encode()
-    s.restore(blob)
-    # slots_flat is iterated as chars of the string — each char fails base64
-    # decode → skipped. Overflow stays empty.
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        s.restore(blob)
     assert len(s._overflow) == 0
 
 
@@ -190,7 +188,7 @@ def test_ringbuffer_snapshot_when_buffer_empty_but_dropped():
     assert data["items"] == []
 
 
-def test_ringbuffer_snapshot_items_not_list_skipped():
+def test_ringbuffer_snapshot_items_not_list_rejected():
     cm = MagicMock()
     cm.get_queue_backend.return_value = MagicMock()
     s = RingBufferQueueStrategy(cm, capacity=5)
@@ -203,7 +201,8 @@ def test_ringbuffer_snapshot_items_not_list_skipped():
             "dropped": 0,
         }
     ).encode()
-    s.restore(blob)
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        s.restore(blob)
     assert s.queue_len("q") == 0
 
 

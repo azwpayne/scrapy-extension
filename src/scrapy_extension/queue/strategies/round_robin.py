@@ -11,7 +11,6 @@ from __future__ import annotations
 __all__ = ["RoundRobinQueueStrategy"]
 
 import base64
-import binascii
 import json
 import logging
 import threading
@@ -19,6 +18,7 @@ from collections import OrderedDict, deque
 
 from scrapy_extension.queue.strategies.base import (
     QueueStrategy,
+    QueueStrategyRestoreError,
     normalize_queue_timeout,
 )
 
@@ -117,11 +117,25 @@ class RoundRobinQueueStrategy(QueueStrategy):
                 if not dq:
                     del self._sources[source]
                     continue
-                item = dq.popleft()
-                if dq:
-                    self._sources.move_to_end(source)
-                else:
-                    del self._sources[source]
+                # Stage the head before publishing the destructive pop.  The
+                # deque and ordered-dict updates are separate Python mutations;
+                # roll them back if a process-control signal interrupts between
+                # them so a retry cannot lose or rotate the head item.
+                item = dq[0]
+                before_length = len(dq)
+                try:
+                    dq.popleft()
+                    if dq:
+                        self._sources.move_to_end(source)
+                    else:
+                        del self._sources[source]
+                except BaseException:
+                    if len(dq) < before_length:
+                        dq.appendleft(item)
+                    if source not in self._sources:
+                        self._sources[source] = dq
+                    self._sources.move_to_end(source, last=False)
+                    raise
                 return item
             return None
 
@@ -171,94 +185,42 @@ class RoundRobinQueueStrategy(QueueStrategy):
         ).encode("utf-8")
 
     def restore(self, state: bytes | None) -> None:
-        """Restore pending items and fairness cursor from a versioned snapshot.
-
-        The serialized source order starts with the next source to serve. Parsing
-        happens into a temporary ordered dict so malformed snapshots cannot leave
-        partially restored live state.
-        """
-        if not state:
+        """Restore a complete, validated source map atomically."""
+        if state is None:
             return
-        corrupt_snapshot = False
+        restore_failed = False
         try:
             data = json.loads(state.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            corrupt_snapshot = True
-        if corrupt_snapshot:
-            try:
-                logger.warning(
-                    "RoundRobinQueueStrategy restore: corrupt snapshot; starting clean."
-                )
-            except BaseException:
-                pass
-            return
-        if (
-            not isinstance(data, dict)
-            or data.get("strategy") != "round_robin"
-            or data.get("version") != 1
-        ):
-            try:
-                logger.warning(
-                    "RoundRobinQueueStrategy restore: unknown snapshot format; starting clean."
-                )
-            except BaseException:
-                pass
-            return
-        raw_sources = data.get("sources")
-        if not isinstance(raw_sources, list):
-            try:
-                logger.warning(
-                    "RoundRobinQueueStrategy restore: snapshot 'sources' not a list; "
-                    "starting clean."
-                )
-            except BaseException:
-                pass
-            return
+            if (
+                not isinstance(data, dict)
+                or data.get("strategy") != "round_robin"
+                or type(data.get("version")) is not int
+                or data.get("version") != 1
+                or not isinstance(data.get("sources"), list)
+            ):
+                raise ValueError("invalid round robin snapshot")
 
-        recovered: OrderedDict[str, deque[bytes]] = OrderedDict()
-        for entry in raw_sources:
-            if not isinstance(entry, dict):
-                try:
-                    logger.warning(
-                        "RoundRobinQueueStrategy restore: skipping malformed source entry."
-                    )
-                except BaseException:
-                    pass
-                continue
-            source = entry.get("source")
-            raw_items = entry.get("items")
-            if not isinstance(source, str) or not isinstance(raw_items, list):
-                try:
-                    logger.warning(
-                        "RoundRobinQueueStrategy restore: skipping malformed source entry."
-                    )
-                except BaseException:
-                    pass
-                continue
-            if source in recovered:
-                try:
-                    logger.warning(
-                        "RoundRobinQueueStrategy restore: skipping duplicate source."
-                    )
-                except BaseException:
-                    pass
-                continue
-            items: deque[bytes] = deque()
-            for raw_item in raw_items:
-                malformed_item = False
-                try:
-                    items.append(base64.b64decode(raw_item, validate=True))
-                except (binascii.Error, TypeError, ValueError):
-                    malformed_item = True
-                if malformed_item:
-                    try:
-                        logger.warning(
-                            "RoundRobinQueueStrategy restore: skipping malformed item."
-                        )
-                    except BaseException:
-                        pass
-            if items:
-                recovered[source] = items
+            recovered: OrderedDict[str, deque[bytes]] = OrderedDict()
+            seen_sources: set[str] = set()
+            for entry in data["sources"]:
+                if not isinstance(entry, dict):
+                    raise ValueError("invalid round robin source")
+                source = entry.get("source")
+                raw_items = entry.get("items")
+                if not isinstance(source, str) or not isinstance(raw_items, list):
+                    raise ValueError("invalid round robin source")
+                if source in seen_sources:
+                    raise ValueError("duplicate round robin source")
+                seen_sources.add(source)
+                items = deque(
+                    base64.b64decode(raw_item, validate=True) for raw_item in raw_items
+                )
+                if items:
+                    recovered[source] = items
+        except Exception:
+            restore_failed = True
+        if restore_failed:
+            raise QueueStrategyRestoreError()
 
         recovered_count = sum(len(items) for items in recovered.values())
         recovered_sources = len(recovered)
