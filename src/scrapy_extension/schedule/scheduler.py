@@ -8,12 +8,10 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
 import threading
 import uuid
 from collections.abc import AsyncIterable, Callable, Iterable, Mapping, MutableMapping
-from dataclasses import dataclass, replace
-from inspect import getattr_static, isawaitable, signature
+from inspect import getattr_static, isawaitable
 from typing import TYPE_CHECKING, Any, cast
 
 from pydispatch.errors import DispatcherKeyError
@@ -47,25 +45,20 @@ from scrapy_extension.queue.queue import BACKEND_ACK_TOKEN_META_KEY, BackendQueu
 from scrapy_extension.queue.snapshot import (
     DEFAULT_SNAPSHOT_CHUNK_BYTES,
     DEFAULT_SNAPSHOT_MAX_BYTES,
-    MAX_SNAPSHOT_CHUNK_BYTES,
-    MAX_SNAPSHOT_CHUNKS,
 )
 from scrapy_extension.queue.strategies.base import _QueueAckToken
 from scrapy_extension.utils._config import (
     get_bool_setting,
-    parse_float_setting,
     parse_int_setting,
 )
 from scrapy_extension.utils.identity import (
     DEFAULT_PROJECT_NAME,
     DEFAULT_QUEUE_KEY_TEMPLATE,
-    project_name_from_settings,
     project_name_from_spider,
     resolve_identity_template,
 )
 from scrapy_extension.utils.reactor import (
     DEFAULT_REACTOR_IO_TIMEOUT_S,
-    MAX_REACTOR_IO_TIMEOUT_S,
     bounded_deferred,
     defer_to_thread_ordered,
     reactor_is_running,
@@ -84,679 +77,63 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+from scrapy_extension.schedule._dupefilter_compat import (
+    _MISSING_STATIC_ATTRIBUTE as _MISSING_STATIC_ATTRIBUTE,
+)
+from scrapy_extension.schedule._dupefilter_compat import (
+    _atomic_dupefilter_methods as _atomic_dupefilter_methods,
+)
+from scrapy_extension.schedule._dupefilter_compat import (
+    _call_dupefilter_open as _call_dupefilter_open,
+)
+from scrapy_extension.schedule._dupefilter_compat import (
+    _static_declaration_rank as _static_declaration_rank,
+)
+from scrapy_extension.schedule._lifecycle import (
+    _chain_lifecycle_result as _chain_lifecycle_result,
+)
+from scrapy_extension.schedule._lifecycle import (
+    _DeferredLifecycleResult as _DeferredLifecycleResult,
+)
+from scrapy_extension.schedule._lifecycle import (
+    _lifecycle_operation as _lifecycle_operation,
+)
+from scrapy_extension.schedule._lifecycle import (
+    _LifecycleContinuation as _LifecycleContinuation,
+)
+from scrapy_extension.schedule._lifecycle import (
+    _ResponseSignalReceiver as _ResponseSignalReceiver,
+)
+from scrapy_extension.schedule._lifecycle import (
+    _SchedulerAttemptToken as _SchedulerAttemptToken,
+)
+from scrapy_extension.schedule._lifecycle import (
+    _SignalLease as _SignalLease,
+)
+from scrapy_extension.schedule._lifecycle import (
+    _SignalReceiver as _SignalReceiver,
+)
+from scrapy_extension.schedule._lifecycle import (
+    _SpiderErrorSignalReceiver as _SpiderErrorSignalReceiver,
+)
+from scrapy_extension.schedule._queue_config import (
+    _QueueComponentConfig as _QueueComponentConfig,
+)
+
+logger = logging.getLogger(__name__)
+
+
 _LIFECYCLE_NEW = "new"
+
 _LIFECYCLE_OPENING = "opening"
+
 _LIFECYCLE_OPEN = "open"
+
 _LIFECYCLE_CLOSING = "closing"
+
 _LIFECYCLE_CLOSED = "closed"
-_MISSING_STATIC_ATTRIBUTE = object()
+
 _EnqueueDiagnostic = tuple[str, str, str | None]
-
-
-@dataclass(frozen=True)
-class _DeferredLifecycleResult:
-    """Authoritative lifecycle completion plus its caller-facing timeout view."""
-
-    operation: Deferred[Any]
-    bounded: Deferred[Any]
-
-
-_LifecycleContinuation = _DeferredLifecycleResult | Deferred[Any] | None
-
-
-def _lifecycle_operation(result: _LifecycleContinuation) -> Deferred[Any] | None:
-    """Return the authoritative Deferred hidden by one lifecycle result."""
-    if isinstance(result, _DeferredLifecycleResult):
-        if result.bounded is not result.operation:
-            # The outer lifecycle owns the public timeout view. Consume the
-            # nested view we flatten so a late nested failure cannot be reported
-            # as an unhandled Deferred after the outer view has settled.
-            result.bounded.addErrback(lambda _failure: None)
-        return result.operation
-    if isinstance(result, Deferred):
-        return result
-    return None
-
-
-def _chain_lifecycle_result(
-    source: Deferred[Any],
-    continuation: Callable[[Any], _LifecycleContinuation],
-    *,
-    preserve_failure: Any | Callable[[], Any | None] | None = None,
-) -> Deferred[Any]:
-    """Flatten one lifecycle continuation without leaking its result wrapper.
-
-    Twisted chains a Deferred returned from a callback, but it treats the
-    package's ``(_operation, _bounded)`` pair as an ordinary value. Returning
-    that value from a close callback therefore publishes completion too early.
-    This helper also creates a separate destination Deferred: a close
-    continuation may be attached to its own opening Deferred without forming a
-    self-chain when that opening Deferred is also the lifecycle source.
-    """
-    chained: Deferred[Any] = Deferred()
-
-    def settle_success(value: Any) -> Any:
-        chained.callback(value)
-        return value
-
-    def settle_failure(failure: Any) -> None:
-        chained.errback(failure)
-        return None
-
-    def flatten(value: Any) -> None:
-        source_failure = value if isinstance(value, TwistedFailure) else None
-        failure = preserve_failure() if callable(preserve_failure) else preserve_failure
-        if failure is None:
-            failure = source_failure
-        try:
-            result = continuation(value)
-        except BaseException as exc:
-            settle_failure(
-                failure if failure is not None else TwistedFailure(exc)  # type: ignore[no-untyped-call]
-            )
-            return None
-        operation = _lifecycle_operation(result)
-        if operation is None:
-            if failure is not None:
-                settle_failure(failure)
-            else:
-                settle_success(result)
-            return None
-
-        def operation_success(result_value: Any) -> Any:
-            if isinstance(result_value, TwistedFailure):
-                settle_failure(failure if failure is not None else result_value)
-            elif failure is not None:
-                settle_failure(failure)
-            else:
-                settle_success(result_value)
-            return result_value
-
-        def operation_failure(operation_failure_value: Any) -> None:
-            settle_failure(failure if failure is not None else operation_failure_value)
-            # The destination observed the operation's failure; consume this
-            # branch so a public timeout cannot leave a second unhandled Failure.
-            return None
-
-        operation.addCallbacks(operation_success, operation_failure)
-        return None
-
-    # Close teardown must also run when an opening stage fails (including a
-    # cancellation requested by close); the continuation decides which failure,
-    # if any, remains authoritative. Returning None consumes the source branch;
-    # ``chained`` retains the public result independently.
-    source.addBoth(flatten)
-    return chained
-
-
-class _SchedulerAttemptToken:
-    """Frame-scoped lifecycle ownership reclaimable after its call unwinds."""
-
-    __slots__ = ("pending", "thread_id")
-
-    def __init__(self) -> None:
-        self.thread_id = threading.get_ident()
-        # A Deferred lifecycle callback outlives the call frame. Keep the close
-        # reservation authoritative until that callback settles it; otherwise a
-        # concurrent close could reclaim the same resources while the hook is
-        # still running.
-        self.pending = False
-
-    @property
-    def active(self) -> bool:
-        """Whether the owning close attempt still holds this token."""
-        if self.pending:
-            return True
-        try:
-            frame = sys._current_frames().get(self.thread_id)  # noqa: SLF001
-        except Exception:  # noqa: BLE001 - stale ownership must be reclaimable
-            return False
-        while frame is not None:
-            try:
-                if frame.f_locals.get("owner_token") is self:
-                    return True
-            except Exception:  # noqa: BLE001 - fail toward bounded reclamation
-                return False
-            frame = frame.f_back
-        return False
-
-
-class _SignalReceiver:
-    """Invocation-unique, weak-referenceable signal receiver proxy."""
-
-    __slots__ = ("__weakref__", "handler")
-
-    def __init__(self, handler: Callable[..., Any]) -> None:
-        self.handler = handler
-
-
-class _ResponseSignalReceiver(_SignalReceiver):
-    def __call__(self, response: Any, request: Any, spider: Any) -> Any:
-        return self.handler(response, request, spider)
-
-
-class _SpiderErrorSignalReceiver(_SignalReceiver):
-    def __call__(self, failure: Any, response: Any, spider: Any) -> Any:
-        return self.handler(failure, response, spider)
-
-
-@dataclass(frozen=True, slots=True)
-class _SignalLease:
-    """One exact Scrapy/PyDispatcher registration owned by the scheduler."""
-
-    manager: Any
-    signal: Any
-    receiver: _SignalReceiver
-
-
-@dataclass(frozen=True, slots=True)
-class _QueueComponentConfig:
-    """Validated immutable values passed to the queue and strategy seams."""
-
-    strategy_value: Any
-    ring_buffer_full_policy: str
-    queue_key_template: str | None = None
-    queue_key: str | None = None
-    project_name: str | None = None
-    allow_cross_spider: bool = False
-    strategy_type: Any | None = None
-    default_delay: float | None = None
-    min_interval: float | None = None
-    delay_max_held: int | None = None
-    priority_levels: int | None = None
-    wheel_size: int | None = None
-    ticks_per_second: float | None = None
-    steal_timeout: float | None = None
-    capacity: int | None = None
-    worker_id: str | None = None
-    peer_ids: tuple[str, ...] = ()
-    backpressure_pause_at: int | None = None
-    backpressure_resume_at: int | None = None
-    queue_depth_sample_every: int | None = None
-    queue_max_item_bytes: int | None = None
-    monitor_backpressure_threshold: int | None = None
-    monitor_pop_rate_window_s: float | None = None
-    queue_snapshot_owner: str | None = None
-    queue_snapshot_max_bytes: int | None = None
-    queue_snapshot_chunk_bytes: int | None = None
-    reactor_io_timeout: float | None = None
-
-    @classmethod
-    def from_early_settings(
-        cls,
-        settings: Settings,
-    ) -> _QueueComponentConfig:
-        """Capture the strategy selector and validate the ring-buffer policy."""
-        from scrapy_extension.queue.strategies.factory import QueueStrategyType
-
-        strategy_value = settings.get(
-            "SCRAPY_QUEUE_STRATEGY",
-            QueueStrategyType.PASSTHROUGH.value,
-        )
-        ring_buffer_full_policy = settings.get(
-            "SCRAPY_QUEUE_RING_BUFFER_FULL_POLICY",
-            "reject",
-        )
-        if ring_buffer_full_policy not in ("reject", "drop_oldest", "block"):
-            raise ConfigurationError(
-                "SCRAPY_QUEUE_RING_BUFFER_FULL_POLICY must be one of "
-                "'reject', 'drop_oldest', or 'block'.",
-                setting_name="SCRAPY_QUEUE_RING_BUFFER_FULL_POLICY",
-                setting_value=ring_buffer_full_policy,
-            )
-        if (
-            strategy_value == QueueStrategyType.RING_BUFFER.value
-            and ring_buffer_full_policy == "block"
-        ):
-            raise ConfigurationError(
-                "SCRAPY_QUEUE_RING_BUFFER_FULL_POLICY='block' is unsafe with "
-                "BackendScheduler: enqueue_request runs on Scrapy's reactor thread, "
-                "so a full ring buffer would block the same thread that must drain it. "
-                "Use 'reject' or 'drop_oldest'.",
-                setting_name="SCRAPY_QUEUE_RING_BUFFER_FULL_POLICY",
-                setting_value=ring_buffer_full_policy,
-            )
-        return cls(
-            strategy_value=strategy_value,
-            ring_buffer_full_policy=ring_buffer_full_policy,
-        )
-
-    def with_queue_key(
-        self,
-        settings: Settings,
-        *,
-        spider_name: str | None,
-        project_name: str | None = None,
-        queue_key_override: str | None = None,
-    ) -> _QueueComponentConfig:
-        """Validate and resolve the queue key at the original factory checkpoint.
-
-        ``queue_key_override`` is used by composite owners such as
-        :class:`BackendSpiderMixin`. It keeps validation and identity-placeholder
-        handling in this one factory while allowing explicit legacy key overrides.
-        """
-        queue_key = (
-            settings.get("SCRAPY_QUEUE_KEY", DEFAULT_QUEUE_KEY_TEMPLATE)
-            if queue_key_override is None
-            else queue_key_override
-        )
-        if not isinstance(queue_key, str):
-            raise ConfigurationError(
-                f"SCRAPY_QUEUE_KEY must be a string, got {queue_key!r}.",
-                setting_name="SCRAPY_QUEUE_KEY",
-                setting_value=queue_key,
-            )
-        if spider_name is not None:
-            try:
-                _validate_key_name(spider_name, "spider.name")
-            except ValueError as exc:
-                raise ConfigurationError(
-                    str(exc),
-                    setting_name="spider.name",
-                    setting_value=spider_name,
-                ) from exc
-        resolved_project_name = project_name or project_name_from_settings(settings)
-        resolved_queue_key = resolve_identity_template(
-            queue_key,
-            spider_name=spider_name,
-            project_name=resolved_project_name,
-        )
-        try:
-            _validate_key_name(
-                resolved_queue_key.replace("{spider}", "spider").replace(
-                    "{project}", "project"
-                ),
-                "SCRAPY_QUEUE_KEY",
-            )
-        except ValueError as exc:
-            raise ConfigurationError(
-                str(exc),
-                setting_name="SCRAPY_QUEUE_KEY",
-                setting_value=queue_key,
-            ) from exc
-        return replace(
-            self,
-            queue_key_template=queue_key,
-            queue_key=resolved_queue_key,
-            project_name=resolved_project_name,
-            allow_cross_spider=get_bool_setting(
-                settings,
-                "SCRAPY_QUEUE_ALLOW_CROSS_SPIDER",
-            ),
-        )
-
-    def with_strategy_settings(self, settings: Settings) -> _QueueComponentConfig:
-        """Parse strategy construction settings after the ack-concurrency gate."""
-        from scrapy_extension.queue.strategies.factory import QueueStrategyType
-        from scrapy_extension.queue.strategies.priority import MAX_PRIORITY_LEVELS
-        from scrapy_extension.queue.strategies.throttle import (
-            THROTTLE_MAX_MIN_INTERVAL_S,
-        )
-        from scrapy_extension.queue.strategies.time_wheel import MAX_WHEEL_SIZE
-
-        try:
-            strategy_type = QueueStrategyType(self.strategy_value)
-        except ValueError as exc:
-            valid = ", ".join(repr(member.value) for member in QueueStrategyType)
-            raise ConfigurationError(
-                f"Invalid SCRAPY_QUEUE_STRATEGY {self.strategy_value!r}. Valid: {valid}.",
-                setting_name="SCRAPY_QUEUE_STRATEGY",
-                setting_value=str(self.strategy_value),
-            ) from exc
-        default_delay = parse_float_setting(
-            settings.get("SCRAPY_QUEUE_DELAY_DEFAULT", 0.0),
-            "SCRAPY_QUEUE_DELAY_DEFAULT",
-            minimum=0.0,
-        )
-        min_interval = parse_float_setting(
-            settings.get("SCRAPY_QUEUE_THROTTLE_MIN_INTERVAL", 0.0),
-            "SCRAPY_QUEUE_THROTTLE_MIN_INTERVAL",
-            minimum=0.0,
-            maximum=THROTTLE_MAX_MIN_INTERVAL_S,
-        )
-        delay_max_held_raw = settings.get("SCRAPY_QUEUE_DELAY_MAX_HELD")
-        delay_max_held = (
-            parse_int_setting(delay_max_held_raw, "SCRAPY_QUEUE_DELAY_MAX_HELD")
-            if delay_max_held_raw is not None
-            else None
-        )
-        priority_levels = parse_int_setting(
-            settings.get("SCRAPY_QUEUE_PRIORITY_LEVELS", 3),
-            "SCRAPY_QUEUE_PRIORITY_LEVELS",
-            minimum=1,
-            maximum=MAX_PRIORITY_LEVELS,
-        )
-        wheel_size = parse_int_setting(
-            settings.get("SCRAPY_QUEUE_TIME_WHEEL_SIZE", 60),
-            "SCRAPY_QUEUE_TIME_WHEEL_SIZE",
-            minimum=1,
-            maximum=MAX_WHEEL_SIZE,
-        )
-        ticks_per_second = parse_float_setting(
-            settings.get("SCRAPY_QUEUE_TIME_WHEEL_TICKS_PER_SECOND", 1.0),
-            "SCRAPY_QUEUE_TIME_WHEEL_TICKS_PER_SECOND",
-            minimum=0.0,
-            minimum_exclusive=True,
-        )
-        steal_timeout = parse_float_setting(
-            settings.get("SCRAPY_QUEUE_STEAL_TIMEOUT", 0.05),
-            "SCRAPY_QUEUE_STEAL_TIMEOUT",
-            minimum=0.0,
-        )
-        capacity = parse_int_setting(
-            settings.get("SCRAPY_QUEUE_RING_BUFFER_CAPACITY", 1024),
-            "SCRAPY_QUEUE_RING_BUFFER_CAPACITY",
-            minimum=1,
-        )
-        worker_id_raw = settings.get("SCRAPY_QUEUE_WORKER_ID")
-        if worker_id_raw is None:
-            worker_id = None
-        elif not isinstance(worker_id_raw, str) or not worker_id_raw.strip():
-            raise ConfigurationError(
-                "SCRAPY_QUEUE_WORKER_ID must be a non-empty string or unset.",
-                setting_name="SCRAPY_QUEUE_WORKER_ID",
-                setting_value=worker_id_raw,
-            )
-        else:
-            worker_id = worker_id_raw.strip()
-        peer_ids_raw = settings.get("SCRAPY_QUEUE_PEER_IDS")
-        peer_id_values: list[Any] | tuple[Any, ...]
-        if peer_ids_raw is None:
-            peer_id_values = ()
-        elif isinstance(peer_ids_raw, str):
-            peer_id_values = peer_ids_raw.split(",")
-        elif isinstance(peer_ids_raw, (list, tuple)):
-            peer_id_values = peer_ids_raw
-        else:
-            raise ConfigurationError(
-                "SCRAPY_QUEUE_PEER_IDS must be a comma-separated string, list, or tuple.",
-                setting_name="SCRAPY_QUEUE_PEER_IDS",
-                setting_value=peer_ids_raw,
-            )
-        if any(not isinstance(peer_id, str) for peer_id in peer_id_values):
-            raise ConfigurationError(
-                "SCRAPY_QUEUE_PEER_IDS entries must all be strings.",
-                setting_name="SCRAPY_QUEUE_PEER_IDS",
-                setting_value=peer_ids_raw,
-            )
-        peer_ids = tuple(
-            peer_id.strip() for peer_id in peer_id_values if peer_id.strip()
-        )
-        return replace(
-            self,
-            strategy_type=strategy_type,
-            default_delay=default_delay,
-            min_interval=min_interval,
-            delay_max_held=delay_max_held,
-            priority_levels=priority_levels,
-            wheel_size=wheel_size,
-            ticks_per_second=ticks_per_second,
-            steal_timeout=steal_timeout,
-            capacity=capacity,
-            worker_id=worker_id,
-            peer_ids=peer_ids,
-        )
-
-    def with_runtime_settings(self, settings: Settings) -> _QueueComponentConfig:
-        """Parse queue and monitor settings after strategy diagnostics."""
-        pause_raw = settings.get("SCRAPY_BACKPRESSURE_PAUSE_AT")
-        resume_raw = settings.get("SCRAPY_BACKPRESSURE_RESUME_AT")
-        pause_at = (
-            parse_int_setting(
-                pause_raw,
-                "SCRAPY_BACKPRESSURE_PAUSE_AT",
-                minimum=0,
-            )
-            if pause_raw is not None
-            else None
-        )
-        resume_at = (
-            parse_int_setting(
-                resume_raw,
-                "SCRAPY_BACKPRESSURE_RESUME_AT",
-                minimum=0,
-            )
-            if resume_raw is not None
-            else None
-        )
-        if pause_at is not None and resume_at is not None and resume_at > pause_at:
-            raise ConfigurationError(
-                "SCRAPY_BACKPRESSURE_RESUME_AT must be <= "
-                "SCRAPY_BACKPRESSURE_PAUSE_AT.",
-                setting_name="SCRAPY_BACKPRESSURE_RESUME_AT",
-                setting_value=resume_raw,
-            )
-        queue_depth_sample_every = parse_int_setting(
-            settings.get("SCRAPY_QUEUE_DEPTH_SAMPLE_EVERY", 100),
-            "SCRAPY_QUEUE_DEPTH_SAMPLE_EVERY",
-            minimum=1,
-        )
-        queue_max_item_bytes = parse_int_setting(
-            settings.get("SCRAPY_QUEUE_MAX_ITEM_BYTES", 1_048_576),
-            "SCRAPY_QUEUE_MAX_ITEM_BYTES",
-            minimum=1,
-        )
-        monitor_backpressure_threshold = parse_int_setting(
-            settings.get("SCRAPY_MONITOR_BACKPRESSURE_THRESHOLD", 1_000),
-            "SCRAPY_MONITOR_BACKPRESSURE_THRESHOLD",
-            minimum=0,
-        )
-        monitor_pop_rate_window_s = parse_float_setting(
-            settings.get("SCRAPY_MONITOR_POP_RATE_WINDOW_S", 60.0),
-            "SCRAPY_MONITOR_POP_RATE_WINDOW_S",
-            minimum=0.0,
-            minimum_exclusive=True,
-            maximum=86400.0,
-        )
-        queue_snapshot_max_bytes = parse_int_setting(
-            settings.get("SCRAPY_QUEUE_SNAPSHOT_MAX_BYTES", DEFAULT_SNAPSHOT_MAX_BYTES),
-            "SCRAPY_QUEUE_SNAPSHOT_MAX_BYTES",
-            minimum=1,
-        )
-        queue_snapshot_chunk_bytes = parse_int_setting(
-            settings.get(
-                "SCRAPY_QUEUE_SNAPSHOT_CHUNK_BYTES", DEFAULT_SNAPSHOT_CHUNK_BYTES
-            ),
-            "SCRAPY_QUEUE_SNAPSHOT_CHUNK_BYTES",
-            minimum=max(
-                1,
-                (queue_snapshot_max_bytes + MAX_SNAPSHOT_CHUNKS - 1)
-                // MAX_SNAPSHOT_CHUNKS,
-            ),
-            maximum=min(queue_snapshot_max_bytes, MAX_SNAPSHOT_CHUNK_BYTES),
-        )
-        reactor_io_timeout = parse_float_setting(
-            settings.get("SCRAPY_REACTOR_IO_TIMEOUT", DEFAULT_REACTOR_IO_TIMEOUT_S),
-            "SCRAPY_REACTOR_IO_TIMEOUT",
-            minimum=0.0,
-            minimum_exclusive=True,
-            maximum=MAX_REACTOR_IO_TIMEOUT_S,
-        )
-        snapshot_owner_raw = settings.get("SCRAPY_QUEUE_SNAPSHOT_OWNER")
-        queue_snapshot_owner = (
-            snapshot_owner_raw if snapshot_owner_raw is not None else self.worker_id
-        )
-        if queue_snapshot_owner is not None:
-            if not isinstance(queue_snapshot_owner, str):
-                raise ConfigurationError(
-                    "SCRAPY_QUEUE_SNAPSHOT_OWNER must be a non-empty string or unset.",
-                    setting_name="SCRAPY_QUEUE_SNAPSHOT_OWNER",
-                    setting_value=snapshot_owner_raw,
-                )
-            # When SNAPSHOT_OWNER is unset and defaulted from worker_id, attribute a
-            # key-name failure to SCRAPY_QUEUE_WORKER_ID (the setting the operator
-            # configured), not the unset SCRAPY_QUEUE_SNAPSHOT_OWNER. worker_id is
-            # parsed with .strip() only and delay/time_wheel ignore it, so a
-            # key-unsafe value can survive to here.
-            owner_setting = (
-                "SCRAPY_QUEUE_SNAPSHOT_OWNER"
-                if snapshot_owner_raw is not None
-                else "SCRAPY_QUEUE_WORKER_ID"
-            )
-            try:
-                _validate_key_name(queue_snapshot_owner, owner_setting)
-            except ValueError as exc:
-                raise ConfigurationError(
-                    str(exc),
-                    setting_name=owner_setting,
-                    setting_value=queue_snapshot_owner,
-                ) from exc
-        return replace(
-            self,
-            backpressure_pause_at=pause_at,
-            backpressure_resume_at=resume_at,
-            queue_depth_sample_every=queue_depth_sample_every,
-            queue_max_item_bytes=queue_max_item_bytes,
-            monitor_backpressure_threshold=monitor_backpressure_threshold,
-            monitor_pop_rate_window_s=monitor_pop_rate_window_s,
-            queue_snapshot_owner=queue_snapshot_owner,
-            queue_snapshot_max_bytes=queue_snapshot_max_bytes,
-            queue_snapshot_chunk_bytes=queue_snapshot_chunk_bytes,
-            reactor_io_timeout=reactor_io_timeout,
-        )
-
-
-def _call_dupefilter_open(dupefilter: object, spider: Spider) -> Any:
-    """Call a dupefilter's Scrapy-2.17 lifecycle hook compatibly.
-
-    Scrapy's stable ``BaseDupeFilter`` contract is ``open()``; the scheduler's
-    own ``open(spider)`` argument must not be forwarded to generic filters such
-    as ``RFPDupeFilter``.  ``BackendDupeFilter`` predates that contract in this
-    package because it uses the spider to resolve ``{spider}`` keys, so retain
-    its package-specific call.  Required-argument and variadic third-party test
-    doubles remain supported for source compatibility.
-    """
-    from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
-
-    open_hook = getattr(dupefilter, "open")
-    if isinstance(dupefilter, BackendDupeFilter):
-        return open_hook(spider)
-    try:
-        parameters = tuple(signature(open_hook).parameters.values())
-    except (TypeError, ValueError):
-        # Some proxy objects (including older Scrapy extensions) do not expose
-        # a signature. Their historical spider-aware form is the safest fallback.
-        return open_hook(spider)
-    if any(
-        parameter.kind in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD)
-        for parameter in parameters
-    ) or any(
-        parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)
-        and parameter.default is parameter.empty
-        for parameter in parameters
-    ):
-        return open_hook(spider)
-    return open_hook()
-
-
-def _static_declaration_rank(component: object, name: str) -> int | None:
-    """Return how close a class-declared capability is in the concrete MRO.
-
-    Per-instance attributes (including autospec-created ``MagicMock`` methods)
-    and dynamic ``__getattr__`` values are not stable protocol declarations.
-    """
-    if (
-        getattr_static(component, name, _MISSING_STATIC_ATTRIBUTE)
-        is _MISSING_STATIC_ATTRIBUTE
-    ):
-        return None
-    for index, cls in enumerate(type(component).__mro__):
-        if name in vars(cls):
-            return index
-    return None
-
-
-def _atomic_dupefilter_methods(
-    dupefilter: object,
-) -> (
-    tuple[
-        Callable[[Request, object], Any],
-        Callable[[object], None],
-        Callable[[object], None] | None,
-        Callable[[object], None],
-        Callable[[object], None],
-    ]
-    | None
-):
-    """Resolve an explicitly compatible transactional dupefilter extension."""
-    try:
-        instance_attributes = object.__getattribute__(dupefilter, "__dict__")
-    except (AttributeError, TypeError):
-        instance_attributes = {}
-    protocol_names = (
-        "request_seen_with_reservation",
-        "commit_reservation",
-        "rollback_reservation",
-        "rollback_reservation_intent",
-    )
-    if isinstance(instance_attributes, Mapping) and any(
-        name in instance_attributes for name in protocol_names
-    ):
-        # A coherent extension is a class-level protocol. Per-instance shadows
-        # (including autospec mocks) can expose an arbitrary partial combination.
-        return None
-    if (
-        isinstance(instance_attributes, Mapping)
-        and "request_seen" in instance_attributes
-    ):
-        # Scrapy's stable hook is intentionally monkeypatchable per instance. An
-        # inherited extension must not bypass that closer policy override.
-        return None
-    atomic_rank = _static_declaration_rank(
-        dupefilter,
-        "request_seen_with_reservation",
-    )
-    commit_rank = _static_declaration_rank(dupefilter, "commit_reservation")
-    rollback_rank = _static_declaration_rank(dupefilter, "rollback_reservation")
-    intent_rank = _static_declaration_rank(
-        dupefilter,
-        "rollback_reservation_intent",
-    )
-    if (
-        atomic_rank is None
-        or commit_rank is None
-        or rollback_rank is None
-        or intent_rank is None
-    ):
-        return None
-
-    # Existing BackendDupeFilter subclasses may override only Scrapy's stable
-    # request_seen() hook. An inherited newer extension must not bypass that
-    # custom policy unless the subclass also declares the atomic method at least
-    # as close in the MRO.
-    standard_rank = _static_declaration_rank(dupefilter, "request_seen")
-    if standard_rank is not None and standard_rank < atomic_rank:
-        return None
-    canonical_rank = _static_declaration_rank(
-        dupefilter,
-        "_atomic_protocol_request_seen",
-    )
-    if canonical_rank is not None and canonical_rank == standard_rank:
-        canonical_standard = getattr_static(
-            dupefilter,
-            "_atomic_protocol_request_seen",
-        )
-        current_standard = getattr_static(dupefilter, "request_seen")
-        if current_standard is not canonical_standard:
-            return None
-
-    atomic = getattr(dupefilter, "request_seen_with_reservation")
-    commit = getattr(dupefilter, "commit_reservation")
-    volatile_commit: Callable[[object], None] | None = None
-    if _static_declaration_rank(dupefilter, "commit_volatile_reservation") is not None:
-        candidate = getattr(dupefilter, "commit_volatile_reservation")
-        if callable(candidate):
-            volatile_commit = candidate
-    rollback = getattr(dupefilter, "rollback_reservation")
-    rollback_intent = getattr(dupefilter, "rollback_reservation_intent")
-    if (
-        not callable(atomic)
-        or not callable(commit)
-        or not callable(rollback)
-        or not callable(rollback_intent)
-    ):
-        return None
-    return atomic, commit, volatile_commit, rollback, rollback_intent
 
 
 def _push_queue_with_durability(
