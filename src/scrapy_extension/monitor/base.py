@@ -119,6 +119,11 @@ class Monitor:
     - ``on_retry(backend_type, attempt)`` — a connection retry fired.
       Wired (R14-D) from ``ConnectionManager.connect`` before each backoff
       sleep; ``attempt`` is 1-based (1 = first retry).
+    - ``on_buffer_depth(depth)`` — BatchedStorageStrategy outstanding-work
+      gauge: items accepted but not yet persisted (buffered records plus any
+      snapshot currently being written).
+    - ``on_delay_depth(depth)`` — DelayQueueStrategy held-item count (gauge):
+      items currently held in the in-process delay heap.
     """
 
     def on_push(self, queue_name: str, priority: float) -> None:

@@ -243,6 +243,98 @@ def test_stale_disconnect_is_unlocked_and_tolerates_recursive_connect(mocker):
     assert manager._backend is replacement
 
 
+def test_get_queue_async_timeout_close_fences_late_worker(
+    mocker,
+    monkeypatch,
+):
+    import scrapy_extension.spider.spider_mixin as mixin_module
+
+    spider = _mixin_with_manager(mocker)
+    manager = spider._connection_manager
+    construction_workers: list[object] = []
+    operation: Deferred[object] = Deferred()
+    public: Deferred[object] = Deferred()
+
+    def ordered(function, *_args, **_kwargs):
+        construction_workers.append(function)
+        return operation, public
+
+    close_workers: list[tuple[Deferred[object], object]] = []
+
+    def defer_wait(function, *_args, **_kwargs):
+        worker: Deferred[object] = Deferred()
+        close_workers.append((worker, function))
+        return worker
+
+    monkeypatch.setattr(mixin_module, "reactor_is_running", lambda: True)
+    monkeypatch.setattr(mixin_module, "defer_to_thread_ordered", ordered)
+    monkeypatch.setattr(mixin_module, "deferToThread", defer_wait)
+    monkeypatch.setattr(mixin_module, "bounded_deferred", lambda source, **_: source)
+
+    result = spider.get_queue_async(timeout=0.01)
+    result.addErrback(lambda _failure: None)
+    public.errback(RuntimeError("construction timeout"))
+    closing = spider.close_backend()
+
+    assert isinstance(closing, Deferred)
+    assert not closing.called
+    assert not manager.close.called
+    assert construction_workers
+
+    with pytest.raises(RuntimeError, match="close is already in progress"):
+        construction_workers[0]()
+    operation.errback(RuntimeError("late construction"))
+    wait_worker, wait_function = close_workers[0]
+    wait_function()
+    wait_worker.callback(None)
+
+    assert closing.called
+    manager.close.assert_called_once_with()
+
+
+def test_mixin_close_fences_inflight_component_construction_without_blocking_reactor(
+    mocker,
+    monkeypatch,
+):
+    import scrapy_extension.spider.spider_mixin as mixin_module
+    from scrapy_extension.spider.spider_mixin import _ComponentConstruction
+
+    spider = _mixin_with_manager(mocker)
+    manager = spider._connection_manager
+    construction = _ComponentConstruction(
+        "queue",
+        spider._component_generation,
+        threading.get_ident() + 1,
+    )
+    spider._component_constructions["queue"] = construction
+    workers: list[tuple[Deferred[object], object]] = []
+
+    def defer_wait(function, *_args, **_kwargs):
+        worker: Deferred[object] = Deferred()
+        workers.append((worker, function))
+        return worker
+
+    monkeypatch.setattr(mixin_module, "reactor_is_running", lambda: True)
+    monkeypatch.setattr(mixin_module, "deferToThread", defer_wait)
+    monkeypatch.setattr(mixin_module, "bounded_deferred", lambda source, **_: source)
+
+    closing = spider.close_backend()
+
+    assert isinstance(closing, Deferred)
+    assert not closing.called
+    assert construction.invalidated
+    spider._component_constructions.pop("queue")
+    construction.done.set()
+    assert not manager.close.called
+
+    worker, function = workers[0]
+    function()
+    worker.callback(None)
+
+    assert closing.called
+    manager.close.assert_called_once_with()
+
+
 def test_mixin_async_close_public_view_waits_for_siblings(mocker, monkeypatch):
     from scrapy_extension.spider import spider_mixin as mixin_module
 
@@ -265,6 +357,103 @@ def test_mixin_async_close_public_view_waits_for_siblings(mocker, monkeypatch):
     assert result.called
     queue.close.assert_called_once_with()
     manager.close.assert_called_once_with()
+
+
+def test_mixin_async_close_waits_for_direct_dupefilter_authority(mocker, monkeypatch):
+    from scrapy_extension.spider import spider_mixin as mixin_module
+
+    spider = _mixin_with_manager(mocker)
+    manager = spider._connection_manager
+    scheduler = mocker.MagicMock()
+    scheduler._reactor_io_timeout = 1.0
+    scheduler_close = Deferred()
+    scheduler.close.return_value = scheduler_close
+    spider._scheduler = scheduler
+
+    dupefilter = BackendDupeFilter(mocker.MagicMock())
+    dupefilter_operation = Deferred()
+    dupefilter_bounded = Deferred()
+    dupefilter._close_authoritative_async = mocker.MagicMock(  # type: ignore[method-assign]
+        return_value=(dupefilter_operation, dupefilter_bounded)
+    )
+    spider._dupefilter = dupefilter
+
+    monkeypatch.setattr(mixin_module, "reactor_is_running", lambda: True)
+    monkeypatch.setattr(mixin_module, "bounded_deferred", lambda source, **_: source)
+
+    result = spider.close_backend()
+    scheduler_close.callback(None)
+
+    assert not result.called
+    manager.close.assert_not_called()
+    assert spider._dupefilter is dupefilter
+
+    dupefilter_operation.callback(None)
+
+    assert result.called
+    manager.close.assert_called_once_with()
+    assert spider._dupefilter is None
+
+
+def test_mixin_async_dupefilter_adapter_baseexception_resets_owner(mocker, monkeypatch):
+    from scrapy_extension.spider import spider_mixin as mixin_module
+
+    spider = _mixin_with_manager(mocker)
+    dupefilter = BackendDupeFilter(mocker.MagicMock())
+    interrupt = KeyboardInterrupt("dupefilter adapter interrupted")
+    dupefilter._close_authoritative_async = mocker.MagicMock(  # type: ignore[method-assign]
+        side_effect=interrupt
+    )
+    spider._dupefilter = dupefilter
+
+    monkeypatch.setattr(mixin_module, "reactor_is_running", lambda: True)
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        spider.close_backend()
+
+    assert raised.value is interrupt
+    assert spider._close_in_progress is False
+    assert spider._close_deferred is None
+    assert spider._dupefilter is dupefilter
+    spider._connection_manager.close.assert_not_called()
+
+
+def test_mixin_async_close_keeps_first_baseexception_precedence(mocker, monkeypatch):
+    from scrapy_extension.spider import spider_mixin as mixin_module
+
+    spider = _mixin_with_manager(mocker)
+    manager = spider._connection_manager
+    scheduler = mocker.MagicMock()
+    scheduler._reactor_io_timeout = 1.0
+    scheduler_close = Deferred()
+    scheduler.close.return_value = scheduler_close
+    scheduler.dupefilter = object()
+    spider._scheduler = scheduler
+
+    dupefilter = BackendDupeFilter(mocker.MagicMock())
+    dupefilter_operation = Deferred()
+    dupefilter_bounded = Deferred()
+    dupefilter._close_authoritative_async = mocker.MagicMock(  # type: ignore[method-assign]
+        return_value=(dupefilter_operation, dupefilter_bounded)
+    )
+    spider._dupefilter = dupefilter
+
+    monkeypatch.setattr(mixin_module, "reactor_is_running", lambda: True)
+    monkeypatch.setattr(mixin_module, "bounded_deferred", lambda source, **_: source)
+
+    result = spider.close_backend()
+    failures: list[BaseException] = []
+    result.addErrback(lambda failure: failures.append(failure.value))
+
+    scheduler_close.errback(RuntimeError("scheduler primary"))
+    dupefilter_operation.errback(KeyboardInterrupt("dupefilter secondary"))
+
+    assert result.called
+    assert failures and isinstance(failures[0], RuntimeError)
+    assert str(failures[0]) == "scheduler primary"
+    # The failed dupefilter remains owned for a retry, so the shared manager is
+    # deliberately fenced rather than released under an uncertain cleanup.
+    manager.close.assert_not_called()
 
 
 def test_mixin_async_close_surfaces_sibling_failure(mocker, monkeypatch):
@@ -408,6 +597,30 @@ def test_mixin_orphan_cleanup_retries_queue_and_scheduler_candidates(mocker):
     queue.close.assert_called_once_with()
     scheduler.close.assert_called_once_with("retry")
     assert spider._orphan_candidates == []
+
+
+def test_mixin_orphan_cleanup_awaits_candidate_deferred_before_lease_release(
+    mocker,
+):
+    spider = _mixin_with_manager(mocker)
+    candidate = MagicMock()
+    close_result: Deferred[None] = Deferred()
+    candidate.close.return_value = close_result
+    lease = MagicMock()
+    candidate._connection_manager_lease = lease
+    spider._orphan_candidates = [("scheduler", candidate)]
+
+    cleanup = spider._cleanup_orphan_candidates("retry")
+
+    assert isinstance(cleanup, Deferred)
+    assert not lease.release.called
+    assert spider._orphan_candidates == [("scheduler", candidate)]
+
+    close_result.callback(None)
+
+    assert cleanup.called
+    assert spider._orphan_candidates == []
+    lease.release.assert_called_once_with()
 
 
 def test_mixin_orphan_cleanup_retains_failed_candidate_and_lease(mocker):

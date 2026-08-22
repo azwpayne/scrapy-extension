@@ -2427,6 +2427,34 @@ class TestBackendQueueMonitorWiring:
         queue.pop()
         assert stats.get_value("queue/pop_count") == 1
 
+    def test_set_monitor_keeps_window_by_default(self, mock_connection_manager):
+        """R141-F10 compat: set_monitor(monitor) alone keeps the
+        construction-time pop-rate window — every existing caller is
+        unaffected by the new optional parameter."""
+        from scrapy_extension.monitor import Monitor
+
+        queue = BackendQueue(
+            connection_manager=mock_connection_manager,
+            queue_name="test_queue",
+            pop_rate_window_s=12.5,
+        )
+        queue.set_monitor(Monitor())
+        assert queue._pop_rate_window_s == 12.5
+
+    def test_set_monitor_can_update_pop_rate_window(self, mock_connection_manager):
+        """R141-F10: set_monitor accepts an optional pop_rate_window_s and
+        updates the gauge window with constructor-identical semantics
+        (plain assignment; validation lives upstream at setting-parse time)."""
+        from scrapy_extension.monitor import Monitor
+
+        queue = BackendQueue(
+            connection_manager=mock_connection_manager,
+            queue_name="test_queue",
+            pop_rate_window_s=60.0,
+        )
+        queue.set_monitor(Monitor(), pop_rate_window_s=300.0)
+        assert queue._pop_rate_window_s == 300.0
+
 
 class TestBackendQueueDepthSampling:
     """U4: queue_len sampling — cut ~25% off pop-path RTT.

@@ -62,6 +62,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _submit_thread(
+    function: Callable[..., Any], *args: Any, **kwargs: Any
+) -> Deferred[Any]:
+    """Return a settled Deferred when thread submission is rejected synchronously."""
+    try:
+        return deferToThread(function, *args, **kwargs)
+    except BaseException as exc:
+        failed: Deferred[Any] = Deferred()
+        failed._reactor_submission_failure = "thread"  # type: ignore[attr-defined]
+        failed.errback(exc)
+        return failed
+
+
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
 
@@ -255,9 +269,13 @@ class BackendPipeline:
         self._opening_operation: Deferred[None] | None = None
         self._opening_failure: TwistedFailure | None = None
         if isinstance(self.storage_strategy, BatchedStorageStrategy):
+            attachment_failure: BaseException | None = None
             try:
                 self.storage_strategy.attach_owner(self)
-            except BaseException:
+            except BaseException as exc:
+                attachment_failure = exc
+            if attachment_failure is not None:
+                release_failed = False
                 if self._owns_connection_manager:
                     try:
                         from scrapy_extension.backends.connectors import (
@@ -272,15 +290,26 @@ class BackendPipeline:
                         else:
                             release_manager_acquire(self.connection_manager)
                     except BaseException:
-                        _emit_diagnostic(
-                            logger.error,
-                            "Failed to release pipeline manager after strategy "
-                            "attachment failure",
-                        )
-                raise
+                        release_failed = True
+                if release_failed:
+                    _emit_diagnostic(
+                        logger.error,
+                        "Failed to release pipeline manager after strategy "
+                        "attachment failure",
+                    )
+                raise attachment_failure
         set_monitor = getattr(self.storage_strategy, "set_monitor", None)
         if callable(set_monitor):
             set_monitor(self._monitor)
+
+    @property
+    def serializer(self) -> JSONSerializer:
+        """Serializer for item encoding.
+
+        Lazy-initialized on first access (same cached instance the store path
+        uses) and read-only.
+        """
+        return self._serializer
 
     @cached_property
     def _serializer(self) -> JSONSerializer:
@@ -321,6 +350,7 @@ class BackendPipeline:
             settings=backend_settings,
         )
         manager_lease = ConnectionManager._adopt_latest_legacy_lease(manager)
+        factory_failure: BaseException | None = None
         try:
             storage_strategy_name = settings.get(
                 "SCRAPY_STORAGE_STRATEGY", "passthrough"
@@ -435,34 +465,44 @@ class BackendPipeline:
                     setting_name="SCRAPY_PIPELINE_KEY_PREFIX",
                     setting_value=key_prefix,
                 ) from exc
-            return cls(
+            # The constructor rolls back a strategy-attachment failure for
+            # direct callers.  The factory remains the owner of its acquire until
+            # construction succeeds, so it must temporarily lend ownership here
+            # and avoid releasing the same lease twice on constructor failure.
+            created = cls(
                 connection_manager=manager,
                 key_prefix=key_prefix,
                 ttl=ttl or None,
                 max_item_bytes=max_item_bytes,
                 storage_strategy=storage_strategy,
                 max_storage_errors=max_storage_errors,
+                owns_connection_manager=False,
                 connection_manager_lease=manager_lease,
                 reactor_io_timeout=reactor_io_timeout,
             )
+            created._owns_connection_manager = True
+            return created
+        except BaseException as exc:
+            # Leave the exception suite before releasing and diagnosing the
+            # acquire.  This prevents a logging handler from receiving the raw
+            # factory exception graph through sys.exc_info().
+            factory_failure = exc
+
+        assert factory_failure is not None
+        release_failed = False
+        try:
+            if manager_lease is not None:
+                release_manager_acquire(manager_lease, exact=True)
+            else:
+                release_manager_acquire(manager)
         except BaseException:
-            # A successful get_manager() is an acquire. No partially-built component
-            # exists to own that reference, so the factory must release it here even
-            # for cancellation-style BaseException subclasses.
-            try:
-                if manager_lease is not None:
-                    release_manager_acquire(manager_lease, exact=True)
-                else:
-                    release_manager_acquire(manager)
-            except BaseException:
-                try:
-                    logger.exception(
-                        "Failed to release ConnectionManager after pipeline factory failure"
-                    )
-                except BaseException:
-                    # Diagnostics must not replace the factory failure being unwound.
-                    pass
-            raise
+            release_failed = True
+        if release_failed:
+            _emit_diagnostic(
+                logger.error,
+                "Failed to release ConnectionManager after pipeline factory failure",
+            )
+        raise factory_failure
 
     @classmethod
     def from_crawler(cls, crawler: Crawler) -> BackendPipeline:
@@ -578,7 +618,7 @@ class BackendPipeline:
             self._opening_owner_thread_id = None
             self._open_close_requested = False
             self._opening_failure = None
-        operation = deferToThread(
+        operation = _submit_thread(
             self._open_spider_sync,
             resolved_spider,
             opening_generation,
@@ -588,8 +628,40 @@ class BackendPipeline:
                 self._opening_operation = operation
         # Attach the ownership fence before the caller-facing timeout adapter. A
         # slow SDK call must not let a timeout callback expose an apparently-open
-        # pipeline while its worker still owns the manager.
-        operation.addBoth(self._finish_async_open)
+        # pipeline while its worker still owns the manager.  A provider/test
+        # Deferred may reject the first attachment; retry once so an accepted
+        # worker is still fenced rather than leaving ``_opening`` latched forever.
+        try:
+            operation.addBoth(self._finish_async_open)
+        except BaseException as exc:
+            try:
+                operation.addBoth(self._finish_async_open)
+            except BaseException:
+                # This is an accepted worker. Keep the opening reservation until
+                # its own Deferred settles; callers receive a settled adapter
+                # error now, while the fallback observer (when available) clears
+                # the lifecycle token later.
+                pass
+            with self._lifecycle_lock:
+                if self._opening_generation == opening_generation and operation.called:
+                    self._opening = False
+                    self._opening_generation = None
+                    self._opening_owner_thread_id = None
+                    self._opening_operation = None
+                    self._store_condition.notify_all()
+            bounded_failure: Deferred[None] = Deferred()
+            try:
+                bounded_failure.errback(exc)
+            except BaseException:
+                pass
+            try:
+                operation.addErrback(lambda _failure: None)
+            except BaseException:
+                try:
+                    operation.addErrback(lambda _failure: None)
+                except BaseException:
+                    pass
+            return bounded_failure
         bounded = bounded_deferred(
             operation,
             timeout=self._reactor_io_timeout,
@@ -598,7 +670,13 @@ class BackendPipeline:
         # No lifecycle owner is attached to a timed-out open view itself. Keep a
         # terminal observer on the dropped worker while _finish_async_open retains
         # its Failure for a close request that is already fencing the operation.
-        operation.addErrback(lambda _failure: None)
+        try:
+            operation.addErrback(lambda _failure: None)
+        except BaseException:
+            try:
+                operation.addErrback(lambda _failure: None)
+            except BaseException:
+                pass
         return bounded
 
     def _finish_async_open(self, result: Any) -> Any:
@@ -798,7 +876,21 @@ class BackendPipeline:
         # releasing the manager while a timed-out worker is still using it.
         public_result: Deferred[None] = Deferred()
 
+        submission_failed = False
+
+        def release_rejected_close() -> None:
+            """Release only a close admission when no worker was accepted."""
+            nonlocal submission_failed
+            submission_failed = True
+            with self._lifecycle_lock:
+                self._closing = False
+                self._close_async_pending = False
+                self._close_owner_thread_id = None
+            self._async_tail = succeed(None)
+
         def start_close(_ignored: Any) -> Deferred[None]:
+            nonlocal submission_failed
+
             def run_reserved_close() -> None:
                 with self._lifecycle_lock:
                     self._close_async_pending = False
@@ -807,11 +899,29 @@ class BackendPipeline:
                     self._close_owner_thread_id = None
                 self._close_spider_sync(resolved_spider)
 
-            operation, bounded = defer_to_thread_ordered(
-                run_reserved_close,
-                timeout=self._reactor_io_timeout,
-                operation="pipeline close",
-            )
+            try:
+                operation, bounded = defer_to_thread_ordered(
+                    run_reserved_close,
+                    timeout=self._reactor_io_timeout,
+                    operation="pipeline close",
+                )
+            except BaseException as exc:
+                # Adapter construction itself can fail before a Deferred exists.
+                # Return a settled public result and leave the close admission
+                # retryable; no worker owns the pipeline on this branch.
+                release_rejected_close()
+                if not public_result.called:
+                    try:
+                        public_result.errback(exc)
+                    except BaseException:
+                        pass
+                return succeed(None)
+            if getattr(operation, "_reactor_submission_failure", None) == "thread":
+                # No worker was accepted, so no close callback can ever clear the
+                # reservation. Release only this attempt's admission; ownership
+                # remains on the pipeline for a retry. Do this in the callback too:
+                # ``_async_tail`` may still be pending when this function runs.
+                release_rejected_close()
 
             def publish_success(value: Any) -> Any:
                 if not public_result.called:
@@ -825,14 +935,55 @@ class BackendPipeline:
                 # failure after publishing the same Failure to the caller.
                 return None
 
-            bounded.addCallbacks(publish_success, publish_failure)
+            try:
+                bounded.addCallbacks(publish_success, publish_failure)
+            except BaseException as exc:
+                # The worker was accepted; do not release ``_closing`` here.
+                # Settle the public result while the operation remains the
+                # lifecycle authority, and retry the observer attachment once.
+                try:
+                    bounded.addCallbacks(publish_success, publish_failure)
+                except BaseException:
+                    if not public_result.called:
+                        try:
+                            public_result.errback(exc)
+                        except BaseException:
+                            pass
             # The authoritative tail still has to be observed after a public
             # timeout/failure; otherwise a late close worker Failure is unhandled.
-            operation.addErrback(lambda _failure: None)
+            try:
+                operation.addErrback(lambda _failure: None)
+            except BaseException:
+                pass
             return operation
 
-        close_operation = self._async_tail.addBoth(start_close)
+        try:
+            close_operation = self._async_tail.addBoth(start_close)
+        except BaseException as exc:
+            # No close worker was admitted. Make this attempt retryable without
+            # disturbing the prior FIFO tail, and settle the caller-facing result.
+            with self._lifecycle_lock:
+                self._closing = False
+                self._close_async_pending = False
+                self._close_owner_thread_id = None
+            if not public_result.called:
+                try:
+                    public_result.errback(exc)
+                except BaseException:
+                    pass
+            self._async_tail = succeed(None)
+            return public_result
         self._async_tail = close_operation
+        if submission_failed:
+            try:
+                close_operation.addErrback(lambda _failure: None)
+            except BaseException:
+                pass
+            with self._lifecycle_lock:
+                self._closing = False
+                self._close_async_pending = False
+                self._close_owner_thread_id = None
+            self._async_tail = succeed(None)
         return public_result
 
     @storage_operation_error_boundary(
@@ -1035,8 +1186,32 @@ class BackendPipeline:
                 # neither inner timeout nor late authoritative failure is lost.
                 return None
 
-            bounded.addCallbacks(publish_success, publish_failure)
-            operation.addErrback(lambda _failure: None)
+            try:
+                bounded.addCallbacks(publish_success, publish_failure)
+            except BaseException as exc:
+                # The worker was accepted by the ordered adapter.  A provider may
+                # reject the first observer attachment (or reject both attempts),
+                # but that cannot turn the FIFO tail into the attachment failure:
+                # the worker still owns the item and must fence close/release.
+                try:
+                    bounded.addCallbacks(publish_success, publish_failure)
+                except BaseException:
+                    if not public_result.called:
+                        try:
+                            public_result.errback(exc)
+                        except BaseException:
+                            pass
+            try:
+                operation.addErrback(lambda _failure: None)
+            except BaseException as exc:
+                try:
+                    operation.addErrback(lambda _failure: None)
+                except BaseException:
+                    if not public_result.called:
+                        try:
+                            public_result.errback(exc)
+                        except BaseException:
+                            pass
             return operation
 
         operation = self._async_tail.addBoth(start)

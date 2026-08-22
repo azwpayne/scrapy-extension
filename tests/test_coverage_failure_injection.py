@@ -118,7 +118,7 @@ def _repository_with_manifest(
     storage.values[chunk_key] = state
     manifest = {
         "schema": "scrapy-extension.queue-strategy-snapshot",
-        "version": 6,
+        "version": 7,
         "generation": _GENERATION,
         "length": actual_length,
         "chunk_bytes": 4,
@@ -175,7 +175,7 @@ def test_snapshot_read_rejects_chunk_conversion_failure(mocker: Any) -> None:
 def test_snapshot_read_rejects_assembled_length_mismatch(mocker: Any) -> None:
     repository, _storage, _chunk_key = _repository_with_manifest()
     manifest = snapshot_module._Manifest(
-        version=6,
+        version=7,
         generation=_GENERATION,
         length=5,
         chunk_bytes=4,
@@ -494,7 +494,8 @@ def test_timewheel_restore_rejects_invalid_timing_metadata() -> None:
             }
         ],
     }
-    strategy.restore(json.dumps(version_two).encode())
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        strategy.restore(json.dumps(version_two).encode())
 
     version_one = {
         "strategy": "time_wheel",
@@ -508,7 +509,8 @@ def test_timewheel_restore_rejects_invalid_timing_metadata() -> None:
         ],
         "overflow": [],
     }
-    strategy.restore(json.dumps(version_one).encode())
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        strategy.restore(json.dumps(version_one).encode())
     assert all(not slot for slot in strategy._wheel)
 
 
@@ -523,7 +525,8 @@ def test_timewheel_restore_rejects_nonfinite_current_wall_clock() -> None:
         "slots_flat": [],
         "overflow": [],
     }
-    strategy.restore(json.dumps(state).encode())
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        strategy.restore(json.dumps(state).encode())
     assert all(not slot for slot in strategy._wheel)
 
 
@@ -553,14 +556,16 @@ def test_timewheel_snapshot_and_restore_reject_wall_and_clock_metadata() -> None
         ],
         "overflow": [{"remaining": 1.0, "item_b64": "!", "priority": 0.0}],
     }
-    restored.restore(json.dumps(state).encode())
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        restored.restore(json.dumps(state).encode())
     assert restored.queue_len("q") == 0
 
 
 def test_delay_restore_rejects_bad_clock_metadata_and_keeps_state_empty() -> None:
     strategy = DelayQueueStrategy(MagicMock(), clock=lambda: math.inf)
     state = json.dumps({"strategy": "delay", "version": 1, "items": []}).encode()
-    strategy.restore(state)
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        strategy.restore(state)
     assert strategy._holding == []
 
 
@@ -589,11 +594,13 @@ def test_delay_prepared_routes_reject_negative_delay_and_bad_wall_clock() -> Non
     invalid_wall = DelayQueueStrategy(
         manager, clock=lambda: 1.0, wall_clock=lambda: math.inf
     )
-    invalid_wall.restore(json.dumps(state).encode())
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        invalid_wall.restore(json.dumps(state).encode())
     assert invalid_wall._holding == []
 
     valid_wall = DelayQueueStrategy(manager, clock=lambda: 1.0, wall_clock=lambda: 2.0)
-    valid_wall.restore(json.dumps(state).encode())
+    with pytest.raises(QueueError, match="snapshot restore failed"):
+        valid_wall.restore(json.dumps(state).encode())
     assert valid_wall._holding == []
 
 

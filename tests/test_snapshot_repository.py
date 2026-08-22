@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import threading
 import traceback
@@ -94,7 +95,7 @@ def test_effect_then_raise_chunk_and_manifest_writes_are_verified(
     def store(key: str, value: bytes) -> None:
         nonlocal failed
         values[key] = value
-        is_chunk = key.startswith("queue:snapshot-chunk:v1:")
+        is_chunk = key.startswith("queue:snapshot-chunk:v2:")
         if not failed and (is_chunk == (failure_kind == "chunk")):
             failed = True
             raise RuntimeError("response lost after write")
@@ -148,11 +149,11 @@ def test_commit_writes_chunks_before_manifest_and_round_trips() -> None:
 
     keys = [call.args[0] for call in storage.store.call_args_list]
     assert keys[-1] == _KEY
-    assert all(key.startswith("queue:snapshot-chunk:v1:") for key in keys[:-1])
+    assert all(key.startswith("queue:snapshot-chunk:v2:") for key in keys[:-1])
     assert len({len(key) for key in keys[:-1]}) == 1
     assert repository.read(_KEY).state == b"abcdefghij"
     manifest = json.loads(values[_KEY])
-    assert manifest["version"] == 6
+    assert manifest["version"] == 7
     assert manifest["state"] == "bytes"
     assert manifest["length"] == 10
     assert manifest["chunks"] == 3
@@ -353,7 +354,7 @@ def test_zero_length_states_are_distinct_authoritative_manifests(
         assert result.state == b""
         assert result.state is not None
     manifest = json.loads(values[_KEY])
-    assert manifest["version"] == 6
+    assert manifest["version"] == 7
     assert manifest["state"] == discriminator
     assert manifest["chunks"] == 0
 
@@ -499,6 +500,18 @@ def test_logical_cap_is_symmetric_and_prewrite() -> None:
         repository.read(_KEY)
 
 
+def test_invalid_snapshot_type_never_replaces_previous_manifest() -> None:
+    storage, values = _storage()
+    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
+    repository.commit(_KEY, b"authoritative")
+    previous_manifest = values[_KEY]
+
+    with pytest.raises(SnapshotRepositoryError, match="invalid type"):
+        repository.commit(_KEY, bytearray(b"mutable"))
+
+    assert values[_KEY] == previous_manifest
+
+
 @pytest.mark.parametrize("version", [4, 5])
 def test_literal_historical_manifest_fixtures_remain_readable(version: int) -> None:
     fixture_path = Path(__file__).parent / "fixtures" / "snapshots" / f"v{version}.json"
@@ -554,12 +567,85 @@ def test_legacy_raw_value_remains_readable() -> None:
     assert result.state == b"legacy-v3-or-v2-payload"
 
 
+def test_manifest_marker_inside_arbitrary_legacy_payload_is_not_a_manifest():
+    payload = b"legacy payload: " + b"scrapy-extension.queue-strategy-snapshot"
+    storage, _ = _storage({_KEY: payload})
+
+    result = SnapshotRepository(storage, max_bytes=128, chunk_bytes=4).read(_KEY)
+
+    assert result.found is True
+    assert result.manifest is False
+    assert result.state == payload
+
+
+def test_truncated_current_manifest_cannot_fall_through_as_legacy_raw() -> None:
+    raw = (
+        b'{"schema":"scrapy-extension.queue-strategy-snapshot",'
+        b'"version":7,"generation":"'
+    )
+    storage, _ = _storage({_KEY: raw})
+    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
+
+    with pytest.raises(SnapshotRepositoryError, match="manifest schema") as exc_info:
+        repository.read(_KEY)
+
+    _assert_static_repository_error(exc_info.value)
+
+
+def test_truncated_repository_manifest_with_schema_key_first_is_fenced() -> None:
+    """A real manifest cut at its first key is not a legacy raw payload."""
+    storage, values = _storage()
+    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
+    repository.commit(_KEY, b"state")
+    values[_KEY] = values[_KEY][:10]
+
+    with pytest.raises(SnapshotRepositoryError, match="manifest schema") as exc_info:
+        repository.read(_KEY)
+
+    _assert_static_repository_error(exc_info.value)
+
+
+def test_truncated_sorted_legacy_manifest_is_also_fenced() -> None:
+    """Old sorted-key manifests remain authoritative while repair is pending."""
+    raw = b'{"chunk_bytes":4,"chunks":2,"generation":"'
+    storage, _ = _storage({_KEY: raw})
+
+    with pytest.raises(SnapshotRepositoryError, match="manifest schema") as exc_info:
+        SnapshotRepository(storage, max_bytes=32, chunk_bytes=4).read(_KEY)
+
+    _assert_static_repository_error(exc_info.value)
+
+
+def test_raw_json_payload_with_marker_text_is_not_a_manifest() -> None:
+    payload = b'{"payload":"scrapy-extension.queue-strategy-snapshot","items":[]'
+    storage, _ = _storage({_KEY: payload})
+
+    result = SnapshotRepository(storage, max_bytes=128, chunk_bytes=4).read(_KEY)
+
+    assert result.manifest is False
+    assert result.state == payload
+
+
+def test_truncated_manifest_with_schema_key_after_other_fields_is_fenced() -> None:
+    """A v7 marker remains authoritative even when ``schema`` is not first."""
+    raw = (
+        b'{"version":7,"schema":"scrapy-extension.queue-strategy-snapshot",'
+        b'"generation":"'
+    )
+    storage, _ = _storage({_KEY: raw})
+
+    with pytest.raises(SnapshotRepositoryError, match="manifest schema") as exc_info:
+        SnapshotRepository(storage, max_bytes=32, chunk_bytes=4).read(_KEY)
+
+    _assert_static_repository_error(exc_info.value)
+
+
 @pytest.mark.parametrize("version", [4, 5])
 @pytest.mark.parametrize(
     ("payload", "expected"),
     [(b"migrated-state", b"migrated-state"), (b"", None)],
 )
-def test_v4_and_v5_manifests_remain_readable_and_next_commit_rewrites_v6(
+def test_v4_and_v5_manifests_remain_readable_and_next_commit_rewrites_v7(
     version: int, payload: bytes, expected: bytes | None
 ) -> None:
     storage, values = _storage()
@@ -567,11 +653,14 @@ def test_v4_and_v5_manifests_remain_readable_and_next_commit_rewrites_v6(
     repository.commit(_KEY, payload)
     manifest = json.loads(values[_KEY])
     generation = manifest["generation"]
-    if version == 4:
-        for index in range(manifest["chunks"]):
-            current_key = repository._chunk_key(_KEY, generation, index)
-            legacy_key = repository._v4_chunk_key(_KEY, generation, index)
-            values[legacy_key] = values.pop(current_key)
+    for index in range(manifest["chunks"]):
+        current_key = repository._chunk_key(_KEY, generation, index)
+        legacy_key = (
+            repository._v4_chunk_key(_KEY, generation, index)
+            if version == 4
+            else repository._legacy_chunk_key(_KEY, generation, index)
+        )
+        values[legacy_key] = values.pop(current_key)
     manifest["version"] = version
     del manifest["state"]
     values[_KEY] = json.dumps(manifest).encode()
@@ -582,8 +671,382 @@ def test_v4_and_v5_manifests_remain_readable_and_next_commit_rewrites_v6(
     assert result.state == expected
     repository.commit(_KEY, result.state)
     rewritten = json.loads(values[_KEY])
-    assert rewritten["version"] == 6
+    assert rewritten["version"] == 7
     assert rewritten["state"] == ("bytes" if expected is not None else "none")
+
+
+@pytest.mark.parametrize("state", [None, b"", b"v6-state"])
+def test_v6_manifest_remains_readable_and_next_commit_rewrites_v7(
+    state: bytes | None,
+) -> None:
+    storage, values = _storage()
+    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
+    repository.commit(_KEY, state)
+    manifest = json.loads(values[_KEY])
+    generation = manifest["generation"]
+    for index in range(manifest["chunks"]):
+        current_key = repository._chunk_key(_KEY, generation, index)
+        legacy_key = repository._legacy_chunk_key(_KEY, generation, index)
+        values[legacy_key] = values.pop(current_key)
+    manifest["version"] = 6
+    values[_KEY] = json.dumps(manifest).encode()
+
+    result = repository.read(_KEY)
+
+    assert result.state == state
+    assert result.generation == generation
+    repository.commit(_KEY, result.state)
+    assert json.loads(values[_KEY])["version"] == 7
+
+
+def test_gc_requires_explicit_writer_quiescence_before_listing() -> None:
+    storage, _values = _storage()
+    storage.list_storage_keys = MagicMock(return_value=[])
+    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
+    repository.commit(_KEY, b"state")
+
+    with pytest.raises(ValueError, match="writer quiescence"):
+        repository.gc(_KEY)
+
+    storage.list_storage_keys.assert_not_called()
+
+
+def test_maintenance_lease_clears_fence_when_interrupted_before_yield(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, _values = _storage()
+    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
+    repository._active_readers = 1
+    monkeypatch.setattr(
+        repository._lease_condition,
+        "wait",
+        MagicMock(side_effect=KeyboardInterrupt),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        with repository._maintenance_lease():
+            raise AssertionError("maintenance must not reach yield")
+
+    assert repository._maintenance_active is False
+    assert repository._maintenance_owner is None
+
+
+def test_maintenance_fence_publication_interrupt_is_released() -> None:
+    class InterruptingRepository(SnapshotRepository):
+        interrupt_owner = False
+
+        def __setattr__(self, name: str, value: object) -> None:
+            if name == "_maintenance_owner" and self.interrupt_owner:
+                object.__setattr__(self, "interrupt_owner", False)
+                raise KeyboardInterrupt("owner publication interrupted")
+            object.__setattr__(self, name, value)
+
+    storage, _values = _storage()
+    repository = InterruptingRepository(storage, max_bytes=32, chunk_bytes=4)
+    repository.interrupt_owner = True
+
+    with pytest.raises(KeyboardInterrupt, match="owner publication interrupted"):
+        with repository._maintenance_lease():
+            raise AssertionError("maintenance must not reach yield")
+
+    assert repository._maintenance_active is False
+    assert repository._maintenance_owner is None
+    repository.commit(_KEY, b"retry-after-fence-interruption")
+    assert repository.read(_KEY).state == b"retry-after-fence-interruption"
+
+
+def test_same_thread_lease_reentry_fails_fast() -> None:
+    storage, values = _storage()
+    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
+    repository.commit(_KEY, b"state")
+
+    with repository._maintenance_lease():
+        with pytest.raises(SnapshotRepositoryError, match="reentry"):
+            repository.read(_KEY)
+        with pytest.raises(SnapshotRepositoryError, match="reentry"):
+            repository.commit(_KEY, b"replacement")
+        with pytest.raises(SnapshotRepositoryError, match="reentry"):
+            repository.gc(_KEY, quiescent=True)
+
+    with repository._reader_lease():
+        with pytest.raises(SnapshotRepositoryError, match="reentry"):
+            repository.gc(_KEY, quiescent=True)
+    with repository._commit_lease():
+        with pytest.raises(SnapshotRepositoryError, match="reentry"):
+            repository.gc(_KEY, quiescent=True)
+
+
+def test_maintenance_lease_releases_after_process_control_inside_body() -> None:
+    """A control-flow interruption after fencing cannot strand the repository."""
+    storage, _ = _storage()
+    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
+    repository.commit(_KEY, b"state")
+
+    with pytest.raises(KeyboardInterrupt):
+        with repository._maintenance_lease():
+            raise KeyboardInterrupt("operator stopped maintenance")
+
+    assert repository._maintenance_active is False
+    assert repository._maintenance_owner is None
+    assert repository.read(_KEY).state == b"state"
+    repository.commit(_KEY, b"replacement")
+    assert repository.read(_KEY).state == b"replacement"
+
+
+def test_read_rejects_missing_v7_chunk_without_falling_back_to_raw() -> None:
+    storage, values = _storage()
+    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
+    repository.commit(_KEY, b"chunked-state")
+    manifest = json.loads(values[_KEY])
+    missing_key = repository._chunk_key(_KEY, manifest["generation"], 1)
+    del values[missing_key]
+
+    with pytest.raises(SnapshotRepositoryError, match="chunk is missing") as exc_info:
+        repository.read(_KEY)
+
+    _assert_static_repository_error(exc_info.value)
+
+
+def test_gc_listing_failure_is_partial_safe_and_does_not_delete() -> None:
+    storage, _values = _storage()
+    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
+    repository.commit(_KEY, b"state")
+    storage.list_storage_keys = MagicMock(side_effect=RuntimeError("listing failed"))
+
+    with pytest.raises(SnapshotRepositoryError, match="key listing failed") as exc_info:
+        repository.gc(_KEY, quiescent=True)
+
+    _assert_static_repository_error(exc_info.value)
+    storage.delete.assert_not_called()
+
+
+def test_gc_iterator_failure_is_partial_safe_and_does_not_delete() -> None:
+    storage, _values = _storage()
+    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
+    repository.commit(_KEY, b"state")
+
+    class FailingIterator:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise RuntimeError("iterator failed")
+
+    storage.list_storage_keys = MagicMock(return_value=FailingIterator())
+
+    with pytest.raises(SnapshotRepositoryError, match="key listing failed") as exc_info:
+        repository.gc(_KEY, quiescent=True)
+
+    _assert_static_repository_error(exc_info.value)
+    storage.delete.assert_not_called()
+
+
+def test_gc_counts_effect_then_raise_delete_after_readback_confirmation() -> None:
+    storage, values = _storage()
+    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
+    repository.commit(_KEY, b"old")
+    old_manifest = json.loads(values[_KEY])
+    old_key = repository._chunk_key(_KEY, old_manifest["generation"], 0)
+    repository.commit(_KEY, b"current")
+    storage.list_storage_keys = MagicMock(return_value=[old_key])
+
+    def delete_then_raise(key: str) -> bool:
+        values.pop(key, None)
+        raise RuntimeError("delete response lost")
+
+    storage.delete.side_effect = delete_then_raise
+
+    assert repository.gc(_KEY, quiescent=True) == 1
+    assert old_key not in values
+
+
+def test_gc_fails_closed_when_delete_readback_is_indeterminate() -> None:
+    storage, values = _storage()
+    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
+    repository.commit(_KEY, b"old")
+    old_manifest = json.loads(values[_KEY])
+    old_key = repository._chunk_key(_KEY, old_manifest["generation"], 0)
+    repository.commit(_KEY, b"current")
+    storage.list_storage_keys = MagicMock(return_value=[old_key])
+    deleted = False
+    original_retrieve = storage.retrieve.side_effect
+
+    def retrieve(key: str):
+        if key == old_key and deleted:
+            raise RuntimeError("readback unavailable")
+        return original_retrieve(key)
+
+    def delete(key: str) -> bool:
+        nonlocal deleted
+        values.pop(key, None)
+        deleted = True
+        return True
+
+    storage.retrieve.side_effect = retrieve
+    storage.delete.side_effect = delete
+
+    with pytest.raises(SnapshotRepositoryError, match="partial") as exc_info:
+        repository.gc(_KEY, quiescent=True)
+
+    assert exc_info.value.confirmed_deletions == 0
+    assert old_key not in values
+    _assert_static_repository_error(exc_info.value)
+
+
+def test_gc_deletes_only_canonical_stale_v7_chunks_for_the_logical_key() -> None:
+    storage, values = _storage()
+    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
+    repository.commit(_KEY, b"old-generation")
+    old_manifest = json.loads(values[_KEY])
+    old_generation = old_manifest["generation"]
+    old_keys = {
+        repository._chunk_key(_KEY, old_generation, index)
+        for index in range(old_manifest["chunks"])
+    }
+    repository.commit(_KEY, b"current")
+    current_manifest = json.loads(values[_KEY])
+    current_generation = current_manifest["generation"]
+    current_keys = {
+        repository._chunk_key(_KEY, current_generation, index)
+        for index in range(current_manifest["chunks"])
+    }
+    prefix = f"queue:snapshot-chunk:v2:{repository._logical_key_digest(_KEY)}:"
+    malformed = f"{prefix}{old_generation}:01"
+    legacy = repository._legacy_chunk_key(_KEY, old_generation, 0)
+    other_key = repository._chunk_key("other-logical-key", old_generation, 0)
+    values[malformed] = b"malformed"
+    values[legacy] = b"legacy"
+    values[other_key] = b"other"
+
+    def list_keys(observed_prefix: str, *, limit: int) -> list[str]:
+        assert observed_prefix == prefix
+        assert limit >= len(values)
+        return [key for key in values if key.startswith(observed_prefix)]
+
+    storage.list_storage_keys = MagicMock(side_effect=list_keys)
+
+    deleted = repository.gc(_KEY, quiescent=True)
+
+    assert deleted == len(old_keys)
+    assert old_keys.isdisjoint(values)
+    assert current_keys <= values.keys()
+    assert malformed in values
+    assert legacy in values
+    assert other_key in values
+
+
+@pytest.mark.parametrize(
+    "listing",
+    [
+        None,
+        "not-a-list",
+        object(),
+        ["key"] * (8192 + 1),
+        itertools.count(),
+    ],
+    ids=["none", "string", "noniterable", "overlong-list", "infinite-iterator"],
+)
+def test_gc_rejects_unbounded_or_noncanonical_listing_responses(
+    listing: object,
+) -> None:
+    storage, _values = _storage()
+    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
+    repository.commit(_KEY, b"state")
+    storage.list_storage_keys = MagicMock(return_value=listing)
+
+    with pytest.raises(SnapshotRepositoryError) as exc_info:
+        repository.gc(_KEY, quiescent=True)
+
+    assert "listing" in str(exc_info.value)
+    _assert_static_repository_error(exc_info.value)
+    storage.delete.assert_not_called()
+
+
+def test_gc_rejects_caller_limits_above_hard_caps() -> None:
+    storage, _values = _storage()
+    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
+    repository.commit(_KEY, b"state")
+
+    with pytest.raises(SnapshotRepositoryError, match="hard cap") as exc_info:
+        repository.gc(_KEY, quiescent=True, max_generations=17)
+
+    _assert_static_repository_error(exc_info.value)
+    storage.delete.assert_not_called()
+    storage.list_storage_keys.assert_not_called()
+
+
+def test_gc_counts_only_confirmed_deletions() -> None:
+    storage, values = _storage()
+    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
+    repository.commit(_KEY, b"old")
+    old_manifest = json.loads(values[_KEY])
+    old_key = repository._chunk_key(_KEY, old_manifest["generation"], 0)
+    repository.commit(_KEY, b"current")
+    storage.list_storage_keys = MagicMock(return_value=[old_key])
+
+    def stale_delete(key: str) -> bool:
+        values.pop(key, None)
+        return False
+
+    storage.delete.side_effect = stale_delete
+
+    assert repository.gc(_KEY, quiescent=True) == 0
+    assert old_key not in values
+
+
+def test_gc_reports_confirmed_partial_deletions() -> None:
+    storage, values = _storage()
+    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
+    repository.commit(_KEY, b"old-generation")
+    old_manifest = json.loads(values[_KEY])
+    old_keys = [
+        repository._chunk_key(_KEY, old_manifest["generation"], index)
+        for index in range(old_manifest["chunks"])
+    ]
+    repository.commit(_KEY, b"current")
+    storage.list_storage_keys = MagicMock(return_value=old_keys)
+    calls = 0
+
+    def fail_after_one(key: str) -> bool:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            values.pop(key, None)
+            return True
+        raise RuntimeError("delete response lost")
+
+    storage.delete.side_effect = fail_after_one
+
+    with pytest.raises(SnapshotRepositoryError, match="partial") as exc_info:
+        repository.gc(_KEY, quiescent=True)
+
+    assert exc_info.value.confirmed_deletions == 1
+    assert len(storage.delete.call_args_list) == 2
+
+
+def test_gc_deduplicates_canonical_candidates() -> None:
+    storage, values = _storage()
+    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
+    repository.commit(_KEY, b"old")
+    old_manifest = json.loads(values[_KEY])
+    old_key = repository._chunk_key(_KEY, old_manifest["generation"], 0)
+    repository.commit(_KEY, b"current")
+    storage.list_storage_keys = MagicMock(return_value=[old_key, old_key])
+
+    assert repository.gc(_KEY, quiescent=True) == 1
+    storage.delete.assert_called_once_with(old_key)
+
+
+def test_gc_fails_closed_when_backend_listing_is_unavailable() -> None:
+    storage, _values = _storage()
+    repository = SnapshotRepository(storage, max_bytes=32, chunk_bytes=4)
+    repository.commit(_KEY, b"state")
+    storage.list_storage_keys = MagicMock(side_effect=NotImplementedError)
+
+    with pytest.raises(SnapshotRepositoryError, match="unavailable"):
+        repository.gc(_KEY, quiescent=True)
+
+    storage.delete.assert_not_called()
 
 
 class _CopyBombBytearray(bytearray):
@@ -766,7 +1229,7 @@ def _logical_key(
     return queue._snapshot_key()
 
 
-def test_chunk_keys_hash_complete_v2_v3_identity_generation_and_index() -> None:
+def test_current_chunk_keys_bound_v2_v3_identity_generation_and_index() -> None:
     repository = SnapshotRepository(MagicMock(), max_bytes=32, chunk_bytes=4)
     generation = "0" * 32
     v2_key = _logical_key("q", owner="o")
@@ -784,8 +1247,8 @@ def test_chunk_keys_hash_complete_v2_v3_identity_generation_and_index() -> None:
     ]
 
     # The old v2 suffix scheme exactly aliases another valid logical key. V3's
-    # queue-length frame avoids that exact equality, but both versions now share
-    # the same dedicated namespace and fixed physical-key size.
+    # queue-length frame avoids that exact equality, while current chunks use a
+    # dedicated, bounded namespace with explicit generation and index fields.
     assert old_v2_suffix_alias == v2_adversarial_key
     assert old_v3_suffix != v3_adversarial_key
 
@@ -796,8 +1259,8 @@ def test_chunk_keys_hash_complete_v2_v3_identity_generation_and_index() -> None:
     }
 
     assert len(keys) == len(identities) * 2
-    assert {len(key.encode("ascii")) for key in keys} == {88}
-    assert all(key.startswith("queue:snapshot-chunk:v1:") for key in keys)
+    assert {len(key.encode("ascii")) for key in keys} == {123}
+    assert all(key.startswith("queue:snapshot-chunk:v2:") for key in keys)
     assert keys.isdisjoint(identities)
 
 

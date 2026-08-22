@@ -264,10 +264,16 @@ class BackendQueue:
         # Set when startup could not read an eligible legacy checkpoint. Until a
         # successful replacement commit, close must keep that legacy state reachable.
         self._defer_legacy_retirement = False
+        # Set only after a safely attributable legacy checkpoint was restored. An
+        # empty transition for a fresh queue needs no migration tombstone; an
+        # empty transition after legacy restore must fence that old value before
+        # any cleanup attempt.
+        self._legacy_snapshot_retirement_pending = False
         # A current-format manifest is the authoritative checkpoint. If its
-        # manifest or chunks cannot be read, a clean-start snapshot is not safe to
-        # publish: it could overwrite the only recoverable copy. The fence remains
-        # set until an operator explicitly authorizes a replacement via
+        # storage cannot be resolved at startup, or its manifest or chunks
+        # cannot be read, a clean-start snapshot is not safe to publish: it
+        # could overwrite the only recoverable copy. The fence remains set
+        # until an operator explicitly authorizes a replacement via
         # ``reset_snapshot``.
         self._snapshot_persistence_fenced = False
         resolved_snapshot_max_bytes = (
@@ -374,9 +380,47 @@ class BackendQueue:
         self._strategy.open()
         self._restore_snapshot()
 
-    def set_monitor(self, monitor: Monitor) -> None:
-        """Replace the queue monitor and forward it to monitor-aware strategies."""
+    @property
+    def spider(self) -> Spider | None:
+        """Optional spider reference for callback/errback resolution during
+        deserialization.
+
+        Matches the class ``Attributes`` contract. ``None`` when the queue was
+        constructed without a spider (settings-driven early setup); envelope
+        fencing and callback/errback resolution then degrade exactly as they
+        do for a spider-less constructor call. Read-only.
+        """
+        return self._spider
+
+    @property
+    def serializer(self) -> JSONSerializer:
+        """Serializer for encoding/decoding requests.
+
+        Lazy-initialized on first access (same cached instance the queue's
+        own push/pop paths use) and read-only.
+        """
+        return self._serializer
+
+    def set_monitor(
+        self, monitor: Monitor, *, pop_rate_window_s: float | None = None
+    ) -> None:
+        """Replace the queue monitor and forward it to monitor-aware strategies.
+
+        Args:
+            monitor: New monitor instance for this queue.
+            pop_rate_window_s: Optional replacement rolling window (seconds)
+                for the ``queue/pop_rate_1m`` gauge. ``None`` (default) keeps
+                the construction-time window so every existing caller is
+                unaffected. Passing a value applies it with the same semantics
+                as the constructor (plain assignment; validation happens
+                upstream at setting-parse time). R141-F10: without this knob,
+                the early-setup NullMonitor -> ScrapyStatsMonitor upgrade left
+                the window frozen at the constructor default, making
+                ``SCRAPY_MONITOR_POP_RATE_WINDOW_S`` dead on that path.
+        """
         self._monitor = monitor
+        if pop_rate_window_s is not None:
+            self._pop_rate_window_s = pop_rate_window_s
         strategy_set_monitor = getattr(self._strategy, "set_monitor", None)
         if callable(strategy_set_monitor):
             strategy_set_monitor(monitor)
@@ -1379,13 +1423,31 @@ class BackendQueue:
                     operation=operation,
                 )
             self._active_operations += 1
+        active_operations = getattr(self._operation_context, "active_operations", 0)
+        self._operation_context.active_operations = active_operations + 1
 
     def _end_operation(self) -> None:
         """Release one operation lease and wake a waiting close."""
+        active_operations = getattr(self._operation_context, "active_operations", 0)
+        if active_operations <= 1:
+            self._operation_context.active_operations = 0
+        else:
+            self._operation_context.active_operations = active_operations - 1
         with self._operation_gate:
             self._active_operations -= 1
             if self._active_operations == 0:
                 self._operation_gate.notify_all()
+
+    def _close_called_from_active_operation(self) -> bool:
+        """Return whether this thread currently owns an operation lease.
+
+        ``close()`` cannot wait for an operation that is executing on this same
+        thread: callbacks invoked by a backend or strategy would otherwise wait
+        forever for their own stack frame to return.  The check is thread-local
+        and deliberately happens before close publishes its lifecycle fence, so
+        rejecting this re-entry leaves both managers and close ownership intact.
+        """
+        return getattr(self._operation_context, "active_operations", 0) > 0
 
     def _consume_post_commit_push(self) -> bool:
         """Consume the current thread's interrupted push commit marker."""
@@ -1683,8 +1745,9 @@ class BackendQueue:
     def reset_snapshot(self) -> None:
         """Explicitly authorize replacing an unreadable snapshot checkpoint.
 
-        Startup keeps a current-format checkpoint authoritative when its manifest
-        or chunks cannot be read. Call this operator-controlled recovery method
+        Startup keeps a current-format checkpoint authoritative when its storage
+        cannot be resolved or its manifest or chunks cannot be read. Call this
+        operator-controlled recovery method
         only after deciding that the in-memory strategy state is the intended
         replacement; the next ordinary ``close`` may then publish it. The method
         does not delete the old manifest before replacement, so a failed commit
@@ -1694,13 +1757,11 @@ class BackendQueue:
             if self._close_complete:
                 raise QueueError(
                     "Cannot reset snapshot persistence after the queue is closed.",
-                    queue_name=self.queue_name,
                     operation="snapshot-reset",
                 )
             if self._close_in_progress:
                 raise QueueError(
                     "Cannot reset snapshot persistence while queue close is in progress.",
-                    queue_name=self.queue_name,
                     operation="snapshot-reset",
                 )
             self._snapshot_persistence_fenced = False
@@ -1710,12 +1771,19 @@ class BackendQueue:
 
         A checkpoint failure leaves strategy state and both managers usable for a
         later close retry. Callers waiting on the same attempt observe a fresh,
-        redacted failure rather than a false success. If startup could not read a
-        current-format checkpoint, normal close is fenced until
+        redacted failure rather than a false success. If startup could not resolve
+        snapshot storage or read a current-format checkpoint, normal close is
+        fenced until
         :meth:`reset_snapshot` explicitly authorizes replacement. ``lossy=True``
         remains the explicit abort path for discarding nonempty state while
         retaining the last authoritative checkpoint.
         """
+        if self._close_called_from_active_operation():
+            raise QueueError(
+                "Queue close cannot be called from an active queue operation.",
+                queue_name=self.queue_name,
+                operation="close",
+            )
         owner_token = _CloseOwnerToken()
         attempt = 0
         failure: BaseException | None = None
@@ -1907,8 +1975,15 @@ class BackendQueue:
             snapshot_identity = ""
             tombstone_key = ""
 
-    def _snapshot_storage(self, *, strict: bool = False) -> Any | None:
-        """Resolve snapshot storage, optionally surfacing retryable failures."""
+    def _snapshot_storage(self) -> Any | None:
+        """Resolve snapshot storage, surfacing retryable resolution failures.
+
+        ``None`` means snapshot storage is unavailable by design (no storage
+        API or a storage-incapable backend) and snapshot I/O is a harmless
+        no-op. Any other resolution failure raises a redacted :class:`QueueError`:
+        the authoritative checkpoint may merely be unreachable, so callers
+        must not treat that outcome like an incapable backend.
+        """
         manager = (
             self._snapshot_connection_manager
             if self._snapshot_connection_manager is not None
@@ -1936,9 +2011,7 @@ class BackendQueue:
                 logger.error("Failed to resolve strategy snapshot storage")
             except BaseException:
                 pass
-            if strict:
-                raise QueueError("Strategy snapshot storage is unavailable.") from None
-            return None
+            raise QueueError("Strategy snapshot storage is unavailable.") from None
         return storage
 
     def _snapshot_repository(self, storage: Any) -> SnapshotRepository:
@@ -1979,7 +2052,7 @@ class BackendQueue:
                     pass
                 raise QueueError("Strategy snapshot creation failed.") from None
 
-            storage = self._snapshot_storage(strict=True)
+            storage = self._snapshot_storage()
             if storage is None:
                 if state is None and not self._defer_legacy_retirement:
                     return
@@ -2017,6 +2090,18 @@ class BackendQueue:
                     ) from None
                 self._defer_legacy_retirement = False
                 return
+
+            # When a restored legacy checkpoint is intentionally transitioned to
+            # empty, publish a separate fence before the new manifest. If the
+            # manifest or legacy delete is interrupted, a later startup must not
+            # resurrect the old raw value. Fresh empty closes do not need this
+            # migration marker.
+            if state is None and self._legacy_snapshot_retirement_pending:
+                tombstone_key = self._empty_snapshot_tombstone_key()
+                if not repository._store(  # noqa: SLF001 - same repository protocol
+                    tombstone_key, _EMPTY_SNAPSHOT_TOMBSTONE_MARKER
+                ):
+                    raise QueueError("Strategy snapshot commit failed.") from None
 
             commit_failed = False
             try:
@@ -2058,8 +2143,25 @@ class BackendQueue:
             tombstone_key = ""
 
     def _restore_snapshot(self) -> None:
-        """Restore a validated v6/v5/v4 manifest or compatible raw value."""
-        storage = self._snapshot_storage()
+        """Restore a validated v7/v6/v5/v4 manifest or compatible raw value."""
+        storage: Any | None = None
+        storage_resolution_failed = False
+        try:
+            storage = self._snapshot_storage()
+        except QueueError:
+            storage_resolution_failed = True
+        if storage_resolution_failed:
+            # A transient storage-resolution failure leaves the authoritative
+            # checkpoint unread, not absent: the backend may recover by close
+            # time, and a clean-start fallback would then overwrite the only
+            # recoverable copy (and retire a legacy checkpoint it never read).
+            # Mirror the current-manifest read-failure fence below instead. The
+            # resolution failure is already logged at error level by
+            # ``_snapshot_storage``; the fence itself surfaces on the next close
+            # attempt. ``NotImplementedError`` (storage-incapable) stays a
+            # harmless no-op: that backend can hold no checkpoint to protect.
+            self._snapshot_persistence_fenced = True
+            return
         if storage is None:
             return
         repository = self._snapshot_repository(storage)
@@ -2125,6 +2227,8 @@ class BackendQueue:
                     legacy_read_failed = False
                     try:
                         result = repository.read(legacy_key)
+                        if result.found:
+                            self._legacy_snapshot_retirement_pending = True
                     except SnapshotRepositoryError:
                         legacy_read_failed = True
                     if legacy_read_failed:
@@ -2138,6 +2242,12 @@ class BackendQueue:
                         return
             if not result.found or result.state is None:
                 return
+            # Historical raw ``b''`` was the clean-state sentinel.  Keep that
+            # migration rule scoped to non-manifest values: a current v7
+            # ``state='bytes'`` manifest with an empty payload remains an actual
+            # bytes checkpoint and must still reach the strategy restore hook.
+            if not result.manifest and result.state == b"":
+                return
             state = result.state
             result = None
             tombstone = None
@@ -2147,8 +2257,14 @@ class BackendQueue:
             except Exception:
                 restore_failed = True
             if restore_failed:
+                # A readable checkpoint that the strategy could not apply remains
+                # authoritative. Starting clean and allowing close to publish that
+                # clean state would silently discard recoverable work. Require the
+                # operator to inspect the replacement state and call reset_snapshot()
+                # before any ordinary close can overwrite it.
+                self._snapshot_persistence_fenced = True
                 try:
-                    logger.error("Strategy snapshot restore failed; starting clean")
+                    logger.error("Strategy snapshot restore failed; persistence fenced")
                 except BaseException:
                     pass
         finally:

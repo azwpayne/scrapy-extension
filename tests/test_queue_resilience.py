@@ -124,6 +124,33 @@ def _cm(
 # ---------------------------------------------------------------------------
 
 
+def test_close_reentry_from_active_operation_is_rejected_without_stranding_queue() -> (
+    None
+):
+    """A strategy callback cannot make close wait on its own push lease."""
+    strategy = MagicMock(name="CallbackStrategy")
+    storage = _storage()
+    queue: BackendQueue
+
+    def callback(*_args: object, **_kwargs: object) -> None:
+        queue.close()
+
+    strategy.push.side_effect = callback
+    strategy.snapshot.return_value = None
+    cm = _cm(storage=storage)
+    queue = BackendQueue(cm, "q", queue_strategy=strategy, monitor=MagicMock())
+
+    with pytest.raises(QueueError, match="active queue operation"):
+        queue.push(Request("https://example.com/reentry"))
+
+    assert queue._accepting_operations is True
+    assert queue._close_in_progress is False
+    assert queue._close_owner_token is None
+
+    queue.close()
+    assert queue._close_complete is True
+
+
 def test_backend_queue_forwards_monitor_to_delay_strategy() -> None:
     """R21-B: BackendQueue forwards its monitor to the delay strategy via
     ``set_monitor`` so ``queue/delay_depth`` actually emits.
@@ -228,9 +255,10 @@ def test_close_preserves_first_baseexception_across_all_phases() -> None:
 
 
 def test_persist_snapshot_skips_when_storage_resolver_raises() -> None:
-    """Lines 670-675: ``get_storage_backend()`` raising a non-``NotImplementedError``
-    must not crash ``close`` — logged and skipped (distinct from the
-    storage-incapable ``NotImplementedError`` path which only logs at info)."""
+    """``get_storage_backend()`` raising a non-``NotImplementedError`` from
+    construction on must not crash ``close`` — the startup resolution failure
+    fences persistence (distinct from the storage-incapable
+    ``NotImplementedError`` path which only logs at info)."""
     strategy = _delay()
     strategy.push("q", b"x", delay=10.0)  # non-empty heap -> snapshot returns bytes
     bq = BackendQueue(
@@ -239,7 +267,11 @@ def test_persist_snapshot_skips_when_storage_resolver_raises() -> None:
         queue_strategy=strategy,
         monitor=MagicMock(),
     )
-    with pytest.raises(QueueError, match="storage is unavailable"):
+    # R141-F1: resolution failed at construction, so close hits the fence
+    # before any snapshot attempt (a close-time-only resolution failure keeps
+    # raising "storage is unavailable" — see the persist-resolver fallback
+    # diagnostic case below).
+    with pytest.raises(QueueError, match="fenced"):
         bq.close()
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from threading import Event, Thread, get_ident
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -54,6 +55,60 @@ class _DelayedDupeFilter:
 
     def log(self, request: object, spider: object) -> None:
         del request, spider
+
+
+def test_scheduler_builds_backend_queue_off_reactor_thread(mocker, monkeypatch) -> None:
+    """Queue snapshot restore must not block Scrapy's reactor thread."""
+    manager = MagicMock(name="ConnectionManager")
+    queue = MagicMock(name="BackendQueue")
+    reactor_thread_id = get_ident()
+    constructor_thread_ids: list[int] = []
+    constructed = Event()
+
+    def construct_queue(*args, **kwargs):
+        del args, kwargs
+        constructor_thread_ids.append(get_ident())
+        constructed.set()
+        return queue
+
+    mocker.patch.object(scheduler_module, "BackendQueue", side_effect=construct_queue)
+    monkeypatch.setattr(scheduler_module, "reactor_is_running", lambda: True)
+    monkeypatch.setattr(
+        scheduler_module,
+        "bounded_deferred",
+        lambda source, **_kwargs: source,
+    )
+    warmup = Deferred()
+    deferred_calls: list[tuple[object, tuple[object, ...]]] = []
+
+    def defer_to_thread(function, *args, **kwargs):
+        del kwargs
+        deferred_calls.append((function, args))
+        if len(deferred_calls) == 1:
+            return warmup
+        operation = Deferred()
+
+        def run() -> None:
+            try:
+                operation.callback(function(*args))
+            except BaseException as exc:
+                operation.errback(exc)
+
+        Thread(target=run, daemon=True).start()
+        return operation
+
+    monkeypatch.setattr(scheduler_module, "deferToThread", defer_to_thread)
+    scheduler = BackendScheduler(manager)
+
+    opening = scheduler.open(_spider())
+    assert opening is warmup
+
+    # This callback represents the reactor resuming after the off-reactor warm-up.
+    # The queue constructor itself must be the second, worker-bound operation.
+    warmup.callback(None)
+    assert constructed.wait(timeout=2.0)
+    assert len(constructor_thread_ids) == 1
+    assert constructor_thread_ids[0] != reactor_thread_id
 
 
 def test_scheduler_waits_for_delayed_cleanup_after_open_failure(mocker) -> None:

@@ -79,6 +79,21 @@ def _open_scheduler(monkeypatch, dupefilter):
     return fake_reactor, workers, queue, manager, scheduler, opening
 
 
+def _settle_workers(
+    workers: list[tuple[Deferred[object], object, tuple, dict]],
+    *,
+    start: int = 0,
+) -> None:
+    """Run every worker, including operations scheduled by earlier callbacks."""
+    index = start
+    while index < len(workers):
+        worker, function, args, kwargs = workers[index]
+        if not worker.called:
+            value = function(*args, **kwargs)
+            worker.callback(value)
+        index += 1
+
+
 def test_lifecycle_chain_observes_nested_failure_and_raises_safely():
     source: Deferred[object] = Deferred()
     nested: Deferred[object] = Deferred()
@@ -188,10 +203,7 @@ def test_generic_dupefilter_timeout_then_failure_updates_close_authority(monkeyp
     opening.addErrback(lambda failure: failures.append(failure.value))
     reactor.calls[0].fire()
     dupefilter_open.errback(RuntimeError("late generic failure"))
-    for worker, function, args, kwargs in workers:
-        function(*args, **kwargs)
-        if not worker.called:
-            worker.callback(None)
+    _settle_workers(workers)
     assert isinstance(failures[0], BackendOperationTimeout)
     assert scheduler._lifecycle_state == "closed"
     manager.close.assert_called_once_with()
@@ -208,22 +220,13 @@ def test_generic_dupefilter_success_publishes_in_time_and_closes_cleanly(monkeyp
     opening.addCallback(values.append)
 
     dupefilter_open.callback(None)
-    for worker, function, args, kwargs in list(workers):
-        function(*args, **kwargs)
-        if not worker.called:
-            worker.callback(None)
+    _settle_workers(workers)
 
     assert values == [None]
     assert scheduler._lifecycle_state == "open"
     closing = scheduler.close("iteration5-success")
     assert isinstance(closing, Deferred)
-    index = 0
-    while index < len(workers):
-        worker, function, args, kwargs = workers[index]
-        if not worker.called:
-            function(*args, **kwargs)
-            worker.callback(None)
-        index += 1
+    _settle_workers(workers)
     assert scheduler._lifecycle_state == "closed"
     queue.close.assert_called_once_with()
     manager.close.assert_called_once_with()
@@ -241,10 +244,7 @@ def test_generic_dupefilter_running_failure_publishes_before_gc(monkeypatch):
     opening.addErrback(lambda failure: failures.append(failure.value) or None)
 
     dupefilter_open.errback(RuntimeError("running generic failure"))
-    for worker, function, args, kwargs in list(workers):
-        function(*args, **kwargs)
-        if not worker.called:
-            worker.callback(None)
+    _settle_workers(workers)
 
     assert len(failures) == 1
     assert str(failures[0]) == "running generic failure"
@@ -293,16 +293,7 @@ def test_close_requested_during_open_fences_late_warmup_success(monkeypatch):
     closing = scheduler.close("close-during-open")
     closing.addErrback(lambda _failure: None)
 
-    worker, function, args, kwargs = workers[0]
-    function(*args, **kwargs)
-    worker.callback(None)
-    index = 1
-    while index < len(workers):
-        worker, function, args, kwargs = workers[index]
-        function(*args, **kwargs)
-        if not worker.called:
-            worker.callback(None)
-        index += 1
+    _settle_workers(workers)
 
     assert scheduler._lifecycle_state == "closed"
     manager.close.assert_called_once_with()
@@ -326,9 +317,7 @@ def test_generic_dupefilter_timeout_keeps_late_success_authoritative(monkeypatch
 
     dupefilter_open.callback(None)
     assert scheduler._lifecycle_state == "opening"
-    worker, function, args, kwargs = workers[0]
-    function(*args, **kwargs)
-    worker.callback(None)
+    _settle_workers(workers)
     assert scheduler._lifecycle_state == "open"
 
 

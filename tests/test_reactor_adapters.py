@@ -49,6 +49,182 @@ class _FakeReactor:
         return call
 
 
+class _SubmissionFailingReactor(_FakeReactor):
+    def callLater(self, _delay: float, callback):
+        del callback
+        raise RuntimeError("timer submission failed")
+
+
+class _AttachFailingDeferred(Deferred):
+    """Reject one observer registration, then behave like a normal Deferred."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_attachment = True
+
+    def addCallbacks(self, callback, errback, *args, **kwargs):
+        if self.fail_attachment:
+            self.fail_attachment = False
+            raise RuntimeError("callback attachment failed")
+        return super().addCallbacks(callback, errback, *args, **kwargs)
+
+
+class _CancelFailingDelayedCall(_FakeDelayedCall):
+    def cancel(self) -> None:
+        raise KeyboardInterrupt("timer cancellation failed")
+
+
+def test_ordered_deferred_callback_attachment_failure_still_settles_public_view(
+    monkeypatch,
+) -> None:
+    worker = _AttachFailingDeferred()
+    fake_reactor = _FakeReactor()
+    monkeypatch.setattr(reactor_module, "_reactor", lambda: fake_reactor)
+    monkeypatch.setattr(
+        reactor_module,
+        "deferToThread",
+        lambda _function, *_args, **_kwargs: worker,
+    )
+
+    operation, bounded = reactor_module.defer_to_thread_ordered(
+        lambda: None,
+        timeout=1.0,
+        operation="callback-attachment",
+    )
+    failures: list[BaseException] = []
+    bounded.addErrback(lambda failure: failures.append(failure.value))
+
+    assert bounded.called
+    assert isinstance(failures[0], RuntimeError)
+    assert not operation.called
+    worker.callback(None)
+    assert operation.called
+
+
+def test_bounded_deferred_callback_attachment_failure_is_settled(monkeypatch) -> None:
+    source = _AttachFailingDeferred()
+    fake_reactor = _FakeReactor()
+    monkeypatch.setattr(reactor_module, "_reactor", lambda: fake_reactor)
+
+    bounded = reactor_module.bounded_deferred(
+        source,
+        timeout=1.0,
+        operation="bounded-attachment",
+    )
+    failures: list[BaseException] = []
+    bounded.addErrback(lambda failure: failures.append(failure.value))
+
+    assert bounded.called
+    assert isinstance(failures[0], RuntimeError)
+    source.callback(None)
+
+
+def test_public_cancellation_does_not_cancel_authoritative_worker(monkeypatch) -> None:
+    worker: Deferred[object] = Deferred()
+    fake_reactor = _FakeReactor()
+    monkeypatch.setattr(reactor_module, "_reactor", lambda: fake_reactor)
+    monkeypatch.setattr(
+        reactor_module,
+        "deferToThread",
+        lambda _function, *_args, **_kwargs: worker,
+    )
+
+    operation, bounded = reactor_module.defer_to_thread_ordered(
+        lambda: None,
+        timeout=1.0,
+        operation="cancel-public",
+    )
+    failures: list[BaseException] = []
+    bounded.addErrback(lambda failure: failures.append(failure.value))
+    bounded.cancel()
+
+    assert bounded.called
+    assert failures
+    assert not operation.called
+    assert fake_reactor.calls[-1].cancelled
+    worker.callback(None)
+    assert operation.called
+
+
+def test_worker_baseexception_and_timer_cancel_failure_are_isolated(
+    monkeypatch,
+) -> None:
+    worker: Deferred[object] = Deferred()
+    fake_reactor = _FakeReactor()
+    fake_reactor.callLater = lambda _delay, callback: _CancelFailingDelayedCall(
+        callback
+    )
+    monkeypatch.setattr(reactor_module, "_reactor", lambda: fake_reactor)
+    monkeypatch.setattr(
+        reactor_module,
+        "deferToThread",
+        lambda _function, *_args, **_kwargs: worker,
+    )
+
+    _operation, bounded = reactor_module.defer_to_thread_ordered(
+        lambda: None,
+        timeout=1.0,
+        operation="baseexception-worker",
+    )
+    failures: list[BaseException] = []
+    bounded.addErrback(lambda failure: failures.append(failure.value))
+    worker.errback(KeyboardInterrupt("worker marker"))
+
+    assert bounded.called
+    assert isinstance(failures[0], KeyboardInterrupt)
+
+
+def test_ordered_deferred_submission_failure_settles_both_views(monkeypatch) -> None:
+    fake_reactor = _FakeReactor()
+    monkeypatch.setattr(reactor_module, "_reactor", lambda: fake_reactor)
+
+    def reject_submission(*_args, **_kwargs):
+        raise RuntimeError("thread submission failed")
+
+    monkeypatch.setattr(reactor_module, "deferToThread", reject_submission)
+    operation, bounded = reactor_module.defer_to_thread_ordered(
+        lambda: None,
+        timeout=1.0,
+        operation="submission",
+    )
+    operation_failures: list[BaseException] = []
+    bounded_failures: list[BaseException] = []
+    operation.addErrback(lambda failure: operation_failures.append(failure.value))
+    bounded.addErrback(lambda failure: bounded_failures.append(failure.value))
+
+    assert operation.called
+    assert bounded.called
+    assert isinstance(operation_failures[0], RuntimeError)
+    assert isinstance(bounded_failures[0], RuntimeError)
+
+
+def test_ordered_deferred_timer_submission_keeps_worker_authoritative(
+    monkeypatch,
+) -> None:
+    worker: Deferred[object] = Deferred()
+    monkeypatch.setattr(reactor_module, "_reactor", lambda: _SubmissionFailingReactor())
+    monkeypatch.setattr(
+        reactor_module,
+        "deferToThread",
+        lambda _function, *_args, **_kwargs: worker,
+    )
+    operation, bounded = reactor_module.defer_to_thread_ordered(
+        lambda: None,
+        timeout=1.0,
+        operation="timer-submission",
+    )
+    failures: list[BaseException] = []
+    bounded.addErrback(lambda failure: failures.append(failure.value))
+
+    # The timer adapter failed after the worker was accepted.  The public view
+    # fails synchronously, while ownership remains tied to the worker result.
+    assert bounded.called
+    assert not operation.called
+    assert isinstance(failures[0], RuntimeError)
+    worker.callback(None)
+    assert operation.called
+
+
 def test_ordered_deferred_success_failure_and_timeout(monkeypatch) -> None:
     fake_reactor = _FakeReactor()
     workers: list[Deferred[object]] = []
@@ -389,6 +565,52 @@ def test_scheduler_open_failure_returns_original_without_cleanup(mocker) -> None
     assert result is original
 
 
+def test_scheduler_close_thread_submission_failure_is_retryable(monkeypatch) -> None:
+    fake_reactor = _FakeReactor()
+    fake_reactor.running = True
+    monkeypatch.setattr(reactor_module, "_reactor", lambda: fake_reactor)
+    monkeypatch.setattr(scheduler_module, "reactor_is_running", lambda: True)
+    queue_worker: Deferred[object] = Deferred()
+    manager_worker: Deferred[object] = Deferred()
+    jobs: list[tuple[object, tuple[object, ...], dict[str, object]]] = []
+    attempts = 0
+
+    def submit(function, *args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("queue close submission failed")
+        jobs.append((function, args, kwargs))
+        return queue_worker if attempts == 2 else manager_worker
+
+    monkeypatch.setattr(scheduler_module, "deferToThread", submit)
+    manager = MagicMock()
+    queue = MagicMock()
+    scheduler = BackendScheduler(manager, reactor_io_timeout=1.0)
+    scheduler._queue = queue
+    scheduler._lifecycle_state = "open"
+
+    first = scheduler.close("submission-failure")
+    assert isinstance(first, Deferred)
+    first.addErrback(lambda _failure: None)
+    assert first.called
+    assert queue.close.call_count == 0
+    assert scheduler._lifecycle_state == "closing"
+
+    second = scheduler.close("retry")
+    assert isinstance(second, Deferred)
+    queue_job, queue_args, queue_kwargs = jobs[0]
+    queue_job(*queue_args, **queue_kwargs)
+    queue_worker.callback(None)
+    manager_job, manager_args, manager_kwargs = jobs[1]
+    manager_job(*manager_args, **manager_kwargs)
+    manager_worker.callback(None)
+
+    assert scheduler._lifecycle_state == "closed"
+    queue.close.assert_called_once_with()
+    manager.close.assert_called_once_with()
+
+
 def test_scheduler_close_offloads_queue_and_retries_after_late_failure(
     monkeypatch,
     mocker,
@@ -594,11 +816,13 @@ def test_scheduler_open_timeout_keeps_late_worker_authoritative(monkeypatch) -> 
     fake_reactor.running = True
     monkeypatch.setattr(reactor_module, "_reactor", lambda: fake_reactor)
     monkeypatch.setattr(scheduler_module, "reactor_is_running", lambda: True)
-    worker: Deferred[object] = Deferred()
+    workers: list[Deferred[object]] = []
     operations: list[object] = []
 
     def fake_thread(function, *_args, **_kwargs):
+        worker: Deferred[object] = Deferred()
         operations.append(function)
+        workers.append(worker)
         return worker
 
     monkeypatch.setattr(scheduler_module, "deferToThread", fake_thread)
@@ -617,7 +841,55 @@ def test_scheduler_open_timeout_keeps_late_worker_authoritative(monkeypatch) -> 
     assert scheduler._lifecycle_state == "opening"
     assert operations
     operations[0]()
-    worker.callback(None)
+    workers[0].callback(None)
+    # The warm-up callback schedules snapshot-capable queue construction as a
+    # second authoritative worker operation; neither stage may publish OPEN early.
+    assert len(operations) == 2
+    assert scheduler._lifecycle_state == "opening"
+    operations[1]()
+    workers[1].callback(queue)
+    assert scheduler._lifecycle_state == "open"
+
+
+def test_scheduler_open_thread_submission_failure_is_retryable(monkeypatch) -> None:
+    fake_reactor = _FakeReactor()
+    fake_reactor.running = True
+    monkeypatch.setattr(reactor_module, "_reactor", lambda: fake_reactor)
+    monkeypatch.setattr(scheduler_module, "reactor_is_running", lambda: True)
+    workers: list[Deferred[object]] = []
+    operations: list[object] = []
+    attempts = 0
+
+    def submit(function, *_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("open submission failed")
+        worker: Deferred[object] = Deferred()
+        operations.append(function)
+        workers.append(worker)
+        return worker
+
+    monkeypatch.setattr(scheduler_module, "deferToThread", submit)
+    queue = MagicMock()
+    monkeypatch.setattr(scheduler_module, "BackendQueue", lambda **_kwargs: queue)
+    manager = MagicMock()
+    scheduler = BackendScheduler(manager, reactor_io_timeout=1.0)
+    spider = SimpleNamespace(name="retry-open", crawler=None)
+
+    first = scheduler.open(spider)
+    assert isinstance(first, Deferred)
+    first.addErrback(lambda _failure: None)
+    assert first.called
+    assert scheduler._lifecycle_state == "new"
+
+    second = scheduler.open(spider)
+    assert isinstance(second, Deferred)
+    operations[0]()
+    workers[0].callback(None)
+    assert len(operations) == 2
+    operations[1]()
+    workers[1].callback(queue)
     assert scheduler._lifecycle_state == "open"
 
 
@@ -672,6 +944,47 @@ def test_scheduler_open_publication_failure_preserves_worker_error(monkeypatch) 
 
     assert failures and str(failures[0]) == "publish failed"
     scheduler._cleanup_after_open_failure.assert_called_once_with("open-failed")
+
+
+def test_pipeline_close_thread_submission_failure_is_retryable(monkeypatch) -> None:
+    fake_reactor = _FakeReactor()
+    fake_reactor.running = True
+    monkeypatch.setattr(reactor_module, "_reactor", lambda: fake_reactor)
+    monkeypatch.setattr(pipeline_module, "reactor_is_running", lambda: True)
+    workers: list[Deferred[object]] = []
+    calls: list[tuple[object, tuple[object, ...], dict[str, object]]] = []
+    attempts = 0
+
+    def submit(function, *args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("close submission failed")
+        calls.append((function, args, kwargs))
+        worker: Deferred[object] = Deferred()
+        workers.append(worker)
+        return worker
+
+    monkeypatch.setattr(reactor_module, "deferToThread", submit)
+    manager = MagicMock()
+    pipeline = BackendPipeline(manager, reactor_io_timeout=1.0)
+
+    first = pipeline.close_spider()
+    assert isinstance(first, Deferred)
+    first.addErrback(lambda _failure: None)
+    assert first.called
+    assert pipeline._closing is False
+    assert pipeline._close_async_pending is False
+
+    second = pipeline.close_spider()
+    assert isinstance(second, Deferred)
+    # The second worker owns the real close and can be driven without sleeping.
+    assert workers and calls
+    function, args, kwargs = calls[0]
+    function(*args, **kwargs)
+    workers[0].callback(None)
+    assert second.called
+    manager.close.assert_called_once_with()
 
 
 def test_pipeline_lifecycle_and_store_use_deferred_adapters(monkeypatch) -> None:

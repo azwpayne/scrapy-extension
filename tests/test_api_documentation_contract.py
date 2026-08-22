@@ -13,10 +13,12 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
+from scrapy_extension.backends.base import JSONSerializer
 from scrapy_extension.backends.connectors import ConnectionManager
 from scrapy_extension.backends.elasticsearch import ElasticSearchBackend
 from scrapy_extension.dupefilter.dupefilter import BackendDupeFilter
 from scrapy_extension.exceptions import ConfigurationError
+from scrapy_extension.monitor.base import Monitor
 from scrapy_extension.pipeline.pipeline import BackendPipeline
 from scrapy_extension.queue.queue import BackendQueue
 from scrapy_extension.schedule.scheduler import BackendScheduler
@@ -334,3 +336,97 @@ def test_active_documentation_local_links_resolve() -> None:
                 continue
             resolved = (document.parent / path_text).resolve()
             assert resolved.exists(), f"Broken link in {document}: {target}"
+
+
+def _documented_attribute_names(cls: type) -> list[str]:
+    """Extract entry names from a class docstring ``Attributes:`` section.
+
+    Parses the dedented docstring so entries are exactly the lines matching
+    ``    name:`` (continuation lines are indented deeper). Continues until the
+    next blank line, matching how both component docstrings are formatted.
+    """
+    docstring = inspect.getdoc(cls)
+    assert docstring is not None, f"{cls.__name__} must have a docstring"
+    section = re.search(
+        r"Attributes:\n(?P<body>.*?)(?:\n\n|\Z)", docstring, flags=re.DOTALL
+    )
+    assert section is not None, f"{cls.__name__} must document Attributes"
+    names = [
+        match.group("name")
+        for match in (
+            re.match(r"^ {4}(?P<name>\w+):", line)
+            for line in section.group("body").splitlines()
+        )
+        if match is not None
+    ]
+    assert names, f"{cls.__name__} Attributes section parsed as empty"
+    return names
+
+
+def test_documented_attributes_are_readable_on_component_instances(
+    mock_connection_manager: Any, mock_spider: Any
+) -> None:
+    """R141-F9: every docstring-declared Attribute must exist on the instance.
+
+    The Stable-tier class docstrings are the public attribute contract — a
+    documented name that raises ``AttributeError`` breaks downstream callers
+    who trusted the docs. Read-only access on a freshly constructed (never
+    started) instance is the contract surface.
+    """
+    queue_with_spider = BackendQueue(
+        connection_manager=mock_connection_manager,
+        queue_name="doc-attribute-contract",
+        spider=mock_spider,
+    )
+    for name in _documented_attribute_names(BackendQueue):
+        getattr(queue_with_spider, name)
+
+    assert queue_with_spider.connection_manager is mock_connection_manager
+    assert queue_with_spider.queue_name == "doc-attribute-contract"
+    assert queue_with_spider.spider is mock_spider
+    assert isinstance(queue_with_spider.serializer, JSONSerializer)
+    assert queue_with_spider.serializer is queue_with_spider.serializer
+
+    queue_without_spider = BackendQueue(
+        connection_manager=mock_connection_manager,
+        queue_name="doc-attribute-contract",
+    )
+    for name in _documented_attribute_names(BackendQueue):
+        getattr(queue_without_spider, name)
+    assert queue_without_spider.spider is None
+
+    pipeline = BackendPipeline(connection_manager=mock_connection_manager)
+    for name in _documented_attribute_names(BackendPipeline):
+        getattr(pipeline, name)
+    assert isinstance(pipeline.serializer, JSONSerializer)
+    assert pipeline.serializer is pipeline.serializer
+
+
+def test_monitor_docstring_hook_inventory_matches_public_hook_methods() -> None:
+    """R141-F23: the ``Monitor`` Hooks list is the de-facto hook contract.
+
+    STABILITY advertises the monitor hook set as additive; the class docstring
+    list is its inventory. Every public ``on_*`` method must appear there (and
+    vice versa) so custom-monitor authors cannot miss a gauge.
+    """
+    docstring = inspect.getdoc(Monitor)
+    assert docstring is not None, "Monitor must have a docstring"
+    section = re.search(
+        r"Hooks \(all no-ops by default\):\n\n(?P<body>.*?)(?:\n\n|\Z)",
+        docstring,
+        flags=re.DOTALL,
+    )
+    assert section is not None, "Monitor docstring must have a Hooks section"
+    documented = set(re.findall(r"``(?P<hook>on_\w+)\(", section.group("body")))
+
+    defined = {
+        name
+        for name in dir(Monitor)
+        if name.startswith("on_") and callable(getattr(Monitor, name, None))
+    }
+    assert documented, "Hooks section parsed as empty"
+    assert documented == defined, (
+        "Monitor docstring hook inventory diverged from the public hook "
+        f"methods: missing_from_docs={sorted(defined - documented)} "
+        f"stale_in_docs={sorted(documented - defined)}"
+    )

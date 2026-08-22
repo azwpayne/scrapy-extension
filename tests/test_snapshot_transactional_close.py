@@ -8,6 +8,7 @@ import threading
 from unittest.mock import MagicMock, call
 
 import pytest
+from twisted.internet.defer import Deferred
 
 from scrapy_extension.exceptions import QueueError
 from scrapy_extension.queue.queue import (
@@ -87,6 +88,68 @@ def _queue_with_storage(strategy: MagicMock, storage: MagicMock) -> BackendQueue
         snapshot_max_bytes=64,
         snapshot_chunk_bytes=4,
     )
+
+
+def test_close_reentry_from_begin_close_reports_same_owner_without_replay() -> None:
+    """A strategy lifecycle callback cannot wait for the close that invoked it."""
+    storage = MagicMock()
+    storage.retrieve.return_value = None
+    strategy = MagicMock()
+    strategy.snapshot.return_value = None
+    queue = _queue_with_storage(strategy, storage)
+
+    def reenter() -> None:
+        queue.close()
+
+    strategy.begin_close.side_effect = reenter
+
+    with pytest.raises(QueueError, match="already in progress"):
+        queue.close()
+
+    assert queue._close_complete is False
+    assert queue._close_owner_token is None
+    strategy.close.assert_not_called()
+
+    strategy.begin_close.side_effect = None
+    queue.close()
+    assert queue._close_complete is True
+    assert strategy.begin_close.call_count == 2
+
+
+def test_close_waits_for_replacement_settlement_before_cleanup() -> None:
+    """A committed replacement keeps close ownership until source ack settles."""
+    storage = MagicMock()
+    storage.retrieve.return_value = None
+    strategy = MagicMock()
+    strategy.snapshot.return_value = None
+    queue = _queue_with_storage(strategy, storage)
+    settlement: Deferred[None] = Deferred()
+    queue._track_replacement_settlement(settlement)
+    begin_close = threading.Event()
+    strategy.begin_close.side_effect = begin_close.set
+    close_done = threading.Event()
+    close_errors: list[BaseException] = []
+
+    def close_queue() -> None:
+        try:
+            queue.close()
+        except BaseException as error:
+            close_errors.append(error)
+        finally:
+            close_done.set()
+
+    thread = threading.Thread(target=close_queue, daemon=True)
+    thread.start()
+    assert begin_close.wait(timeout=2.0)
+    assert not close_done.wait(timeout=0.1)
+    assert strategy.close.call_count == 0
+
+    settlement.callback(None)
+    assert close_done.wait(timeout=2.0)
+    thread.join(timeout=2.0)
+    assert not thread.is_alive()
+    assert close_errors == []
+    strategy.close.assert_called_once_with()
 
 
 def test_checkpoint_failure_is_retryable_and_never_runs_destructive_close() -> None:

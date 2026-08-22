@@ -365,9 +365,10 @@ def test_async_dupefilter_success_bridges_authority_without_close(monkeypatch) -
 
     assert opened_values == [None]
     assert scheduler._lifecycle_state == "open"
+    settled_workers = len(workers)
     closing = scheduler.close("dupefilter-success")
     assert isinstance(closing, Deferred)
-    _settle_workers(workers, start=1)
+    _settle_workers(workers, start=settled_workers)
     assert scheduler._lifecycle_state == "closed"
     manager.close.assert_called_once_with()
 
