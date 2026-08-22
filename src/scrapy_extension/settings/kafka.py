@@ -39,17 +39,40 @@ class KafkaMode(str, Enum):
     CONFLUENT = "confluent"
 
 
+class KafkaTopicNameGeneration(str, Enum):
+    """Physical topic mapping generations.
+
+    ``AUTO`` preserves the historical ``scrapy-<queue>`` topic when it is a
+    valid Kafka name and hashes logical names that are not. ``LEGACY_V1`` is
+    retained only for draining existing safe topics; ``V2`` is deterministic
+    and collision-resistant for every supported logical queue identity.
+    """
+
+    AUTO = "auto"
+    LEGACY_V1 = "legacy"
+    V2 = "v2"
+
+
 _KAFKA_SECURITY_PROTOCOLS = frozenset({"PLAINTEXT", "SSL", "SASL_SSL"})
 _PASSWORD_SASL_MECHANISMS = frozenset({"PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"})
+# R141-F6: the CONFLUENT branch of ``_build_client_security_config`` always
+# hands the SDK a fixed SASL_SSL/PLAIN client. ``_KAFKA_DEFAULT_SECURITY_PROTOCOL``
+# is the STANDALONE field default: an unset and an explicitly-set-to-default
+# value are indistinguishable after the backend's capture-and-revalidate
+# rebuild (``model_validate`` of a full ``__dict__`` marks every field as set),
+# and the fixed client overrides both identically — so both stay valid and only
+# values that differ from BOTH the default and the fixed protocol are refused.
+_KAFKA_DEFAULT_SECURITY_PROTOCOL = "PLAINTEXT"
+_KAFKA_CONFLUENT_FIXED_SECURITY_PROTOCOL = "SASL_SSL"
 
 
 def _kafka_credential_value(value: object, field_name: str) -> str | None:
     """Return a non-empty credential without retaining it in failures."""
     if value is None:
         return None
-    if isinstance(value, SecretStr):
+    if type(value) is SecretStr:
         raw_value = value.get_secret_value()
-    elif isinstance(value, str):
+    elif type(value) is str:
         raw_value = value
     else:
         raise ConfigurationError(
@@ -79,12 +102,21 @@ def validate_kafka_authentication(
     construction. Callers retaining them must use a repr-redacting wrapper.
     Invalid credentials are never attached to the raised exception.
     """
-    if security_protocol not in _KAFKA_SECURITY_PROTOCOLS:
+    if type(mode) not in (KafkaMode, str) or (
+        type(mode) is str and mode not in {member.value for member in KafkaMode}
+    ):
+        raise ConfigurationError("Kafka mode is unsupported.", setting_name="mode")
+    if type(security_protocol) is not str or security_protocol not in {
+        "PLAINTEXT",
+        "SSL",
+        "SASL_PLAINTEXT",
+        "SASL_SSL",
+    }:
         raise ConfigurationError(
             "security_protocol must be a supported Kafka protocol.",
             setting_name="security_protocol",
         )
-    protocol = str(security_protocol)
+    protocol = security_protocol
     if protocol == "SASL_PLAINTEXT":
         raise ConfigurationError(
             "SASL credentials require SASL_SSL; SASL_PLAINTEXT transmits them without TLS.",
@@ -111,7 +143,7 @@ def validate_kafka_authentication(
     username: str | None = None
     password: str | None = None
     if sasl_enabled:
-        if not isinstance(sasl_mechanism, str) or not sasl_mechanism:
+        if type(sasl_mechanism) is not str or not sasl_mechanism:
             raise ConfigurationError(
                 "A SASL security_protocol requires an explicit sasl_mechanism.",
                 setting_name="sasl_mechanism",
@@ -189,11 +221,79 @@ def validate_kafka_transport_security(
     mode: object, security_protocol: object, ssl_check_hostname: object
 ) -> None:
     """Reject TLS configurations that disable broker hostname verification."""
+    if type(mode) not in (KafkaMode, str) or (
+        type(mode) is str and mode not in {member.value for member in KafkaMode}
+    ):
+        raise ConfigurationError("Kafka mode is unsupported.", setting_name="mode")
+    if type(security_protocol) is not str or security_protocol not in {
+        "PLAINTEXT",
+        "SSL",
+        "SASL_PLAINTEXT",
+        "SASL_SSL",
+    }:
+        raise ConfigurationError(
+            "security_protocol must be a supported Kafka protocol.",
+            setting_name="security_protocol",
+        )
     uses_tls = security_protocol in {"SSL", "SASL_SSL"} or mode == KafkaMode.CONFLUENT
     if uses_tls and ssl_check_hostname is not True:
         raise ConfigurationError(
             "Kafka TLS connections require ssl_check_hostname=True.",
             setting_name="ssl_check_hostname",
+        )
+
+
+def validate_kafka_confluent_client_contract(
+    mode: object,
+    security_protocol: object,
+    ssl_cafile: object,
+    ssl_certfile: object,
+    ssl_keyfile: object,
+) -> None:
+    """R141-F6: CONFLUENT mode must fail fast on client config it cannot honor.
+
+    The backend's CONFLUENT branch builds a fixed SASL_SSL/PLAIN client
+    (``_build_client_security_config``): TLS material never reaches the
+    consumer/admin clients and any ``security_protocol`` value is silently
+    overridden. Settings-layer rejection replaces the silent drop, so a pinned
+    private CA cannot "succeed" without ever reaching the SDK. See the
+    ES CLOUD ``ca_certs`` fail-fast precedent for the same pattern.
+    """
+    if type(mode) not in (KafkaMode, str) or (
+        type(mode) is str and mode not in {member.value for member in KafkaMode}
+    ):
+        raise ConfigurationError("Kafka mode is unsupported.", setting_name="mode")
+    if mode not in (KafkaMode.CONFLUENT, KafkaMode.CONFLUENT.value):
+        return
+    for setting_name, tls_material in (
+        ("ssl_cafile", ssl_cafile),
+        ("ssl_certfile", ssl_certfile),
+        ("ssl_keyfile", ssl_keyfile),
+    ):
+        if tls_material is not None:
+            raise ConfigurationError(
+                (
+                    "Kafka CONFLUENT mode does not accept TLS material "
+                    "(ssl_cafile / ssl_certfile / ssl_keyfile) because the backend "
+                    "builds a fixed SASL_SSL client that drops it; a private-CA pin "
+                    "would silently never reach the SDK."
+                ),
+                setting_name=setting_name,
+            )
+    if security_protocol not in (
+        _KAFKA_DEFAULT_SECURITY_PROTOCOL,
+        _KAFKA_CONFLUENT_FIXED_SECURITY_PROTOCOL,
+    ):
+        raise ConfigurationError(
+            (
+                "Kafka CONFLUENT mode does not accept an explicit security_protocol "
+                "because the backend builds a fixed SASL_SSL client that overrides "
+                "it; leave security_protocol unset (recommended) — an explicit "
+                "'SASL_SSL' additionally requires full SASL material "
+                "(sasl_mechanism and sasl_username/sasl_password) that the fixed "
+                "client overrides anyway, and is not recommended."
+            ),
+            setting_name="security_protocol",
         )
 
 
@@ -213,7 +313,7 @@ def _kafka_broker_endpoints_are_loopback(endpoints: str) -> bool:
 
 def _kafka_policy_int(value: object, field_name: str, minimum: int) -> int:
     """Return a bounded policy integer, rejecting bools after model mutation."""
-    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+    if type(value) is not int or value < minimum:
         raise ConfigurationError(
             f"{field_name} must be an integer greater than or equal to {minimum}.",
             setting_name=field_name,
@@ -230,7 +330,7 @@ def validate_kafka_delivery_policy(
     min_insync_replicas: object,
 ) -> tuple[int | str, int, int, int, int]:
     """Validate the broker-confirmed enqueue and new-topic durability policy."""
-    if isinstance(acks, bool) or acks not in (1, "all"):
+    if type(acks) not in (int, str) or acks not in (1, "all"):
         raise ConfigurationError(
             "Kafka QueueBackend requires acks=1 or acks='all'; acks=0 cannot "
             "confirm broker acceptance.",
@@ -299,7 +399,11 @@ class KafkaSettings(RedactedBaseSettings):
     security_protocol: Literal["PLAINTEXT", "SSL", "SASL_PLAINTEXT", "SASL_SSL"] = (
         Field(
             default="PLAINTEXT",
-            description="Security protocol (PLAINTEXT, SSL, SASL_PLAINTEXT, SASL_SSL)",
+            description=(
+                "Security protocol (PLAINTEXT, SSL, SASL_PLAINTEXT, SASL_SSL); "
+                "SASL_PLAINTEXT is permanently unavailable — the validator always "
+                "rejects it"
+            ),
         )
     )
     allow_remote_plaintext: bool = Field(
@@ -320,7 +424,11 @@ class KafkaSettings(RedactedBaseSettings):
         | None
     ) = Field(
         default=None,
-        description="SASL mechanism (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, GSSAPI, OAUTHBEARER)",
+        description=(
+            "SASL mechanism (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, GSSAPI, "
+            "OAUTHBEARER); OAUTHBEARER is permanently unavailable — the validator "
+            "always rejects it"
+        ),
     )
     sasl_username: str | None = Field(
         default=None,
@@ -411,9 +519,8 @@ class KafkaSettings(RedactedBaseSettings):
     enable_auto_commit: bool = Field(
         default=False,
         description=(
-            "Enable auto commit. Defaults to False so callers control ack timing "
-            "via QueueBackend.ack(); auto-commit acks before processing and "
-            "loses messages if the worker crashes mid-request."
+            "Must remain False; the queue ack contract requires manual commit. "
+            "Enabling auto-commit can ack a request before Scrapy processes it."
         ),
     )
     auto_commit_interval_ms: int = Field(
@@ -433,11 +540,19 @@ class KafkaSettings(RedactedBaseSettings):
     )
     request_timeout_ms: int = Field(
         default=40000,
-        ge=0,
+        gt=0,
         description="Request timeout in ms",
     )
 
     # === Topic Settings ===
+    topic_name_generation: KafkaTopicNameGeneration = Field(
+        default=KafkaTopicNameGeneration.AUTO,
+        description=(
+            "Physical topic mapping. auto preserves safe legacy topics and hashes "
+            "logical names requiring v2; legacy drains existing topics only."
+        ),
+        json_schema_extra={"deprecated_values": ["legacy"]},
+    )
     replication_factor: int = Field(
         default=1,
         ge=1,
@@ -490,6 +605,23 @@ class KafkaSettings(RedactedBaseSettings):
             return ""
         return normalize_kafka_broker_endpoints(value, "confluent_bootstrap_servers")
 
+    @field_validator("group_id", mode="before")
+    @classmethod
+    def _reject_blank_group_id(cls, value: object) -> object:
+        """R141-F17: reject a blank consumer identity at settings time.
+
+        Sibling backends reject blank identity fields (RocketMQ
+        ``consumer_group``, Pulsar ``subscription_name``); a blank Kafka
+        ``group_id`` reaches KafkaConsumer verbatim and surfaces as an opaque
+        broker error at first poll rather than here.
+        """
+        if type(value) is not str or not value.strip():
+            raise ConfigurationError(
+                "Kafka group_id must be a non-empty string.",
+                setting_name="group_id",
+            )
+        return value
+
     @field_validator("acks", mode="before")
     @classmethod
     def _reject_boolean_acks(cls, value: object) -> object:
@@ -501,6 +633,45 @@ class KafkaSettings(RedactedBaseSettings):
         if value == "1":
             return 1
         return value
+
+    @model_validator(mode="after")
+    def _require_manual_commit(self) -> KafkaSettings:
+        """R141-F18: enforce the queue ack contract at the settings layer.
+
+        ``KafkaBackend.__init__`` re-checks this for duck-typed configs; the
+        message is kept identical so both layers name the same contract.
+        """
+        if self.enable_auto_commit is not False:
+            raise ConfigurationError(
+                (
+                    "KafkaBackend requires enable_auto_commit=False because queue "
+                    "delivery completion is controlled by QueueBackend.ack(); "
+                    "enabling Kafka auto-commit can commit a request before Scrapy "
+                    "processes it."
+                ),
+                setting_name="enable_auto_commit",
+                setting_value=True,
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_confluent_client_contract(self) -> KafkaSettings:
+        """R141-F6: CONFLUENT TLS material / explicit protocols fail fast.
+
+        Delegates to :func:`validate_kafka_confluent_client_contract`; see its
+        docstring for the fixed-client rationale and the default-protocol
+        exemption (explicitness is erased by capture-and-revalidate). Runs
+        before ``_validate_authentication`` so the categorical CONFLUENT
+        rejection wins over the (moot) TLS cert/key pairing rule.
+        """
+        validate_kafka_confluent_client_contract(
+            self.mode,
+            self.security_protocol,
+            self.ssl_cafile,
+            self.ssl_certfile,
+            self.ssl_keyfile,
+        )
+        return self
 
     @model_validator(mode="after")
     def _validate_authentication(self) -> KafkaSettings:

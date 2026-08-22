@@ -3,9 +3,24 @@
 from __future__ import annotations
 
 import math
+import re
 from typing import Any
 
 from scrapy_extension.exceptions import ConfigurationError
+
+_SAFE_SETTING_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
+def _setting_label(setting_name: object) -> str:
+    """Return a field label safe to include in a diagnostic.
+
+    Setting names normally come from package constants, but these helpers are
+    also part of the programmatic configuration surface.  Never let a caller
+    turn a field label into a URI, header, or arbitrary diagnostic payload.
+    """
+    if type(setting_name) is str and _SAFE_SETTING_NAME.fullmatch(setting_name):
+        return setting_name
+    return "setting"
 
 
 def parse_int_setting(
@@ -16,29 +31,32 @@ def parse_int_setting(
     maximum: int | None = None,
 ) -> int:
     """Parse an integer without accepting bools or truncating floats."""
+    label = _setting_label(setting_name)
     if isinstance(raw, bool) or not isinstance(raw, (int, str)):
         raise ConfigurationError(
-            f"{setting_name} must be an integer, got {raw!r}.",
+            f"{label} must be an integer.",
             setting_name=setting_name,
             setting_value=raw,
         )
     try:
         value = int(raw)
-    except (TypeError, ValueError, OverflowError) as exc:
+    except (TypeError, ValueError, OverflowError):
+        # Do not chain the conversion exception: it retains the raw input in
+        # its message and traceback (notably for URI/credential-shaped text).
         raise ConfigurationError(
-            f"{setting_name} must be an integer, got {raw!r}.",
+            f"{label} must be an integer.",
             setting_name=setting_name,
             setting_value=raw,
-        ) from exc
+        ) from None
     if minimum is not None and value < minimum:
         raise ConfigurationError(
-            f"{setting_name} must be >= {minimum}, got {raw!r}.",
+            f"{label} must be >= {minimum}.",
             setting_name=setting_name,
             setting_value=raw,
         )
     if maximum is not None and value > maximum:
         raise ConfigurationError(
-            f"{setting_name} must be <= {maximum}, got {raw!r}.",
+            f"{label} must be <= {maximum}.",
             setting_name=setting_name,
             setting_value=raw,
         )
@@ -55,23 +73,24 @@ def parse_float_setting(
     maximum_exclusive: bool = False,
 ) -> float:
     """Parse a finite float and enforce optional inclusive/exclusive bounds."""
+    label = _setting_label(setting_name)
     if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
         raise ConfigurationError(
-            f"{setting_name} must be a finite number, got {raw!r}.",
+            f"{label} must be a finite number.",
             setting_name=setting_name,
             setting_value=raw,
         )
     try:
         value = float(raw)
-    except (TypeError, ValueError, OverflowError) as exc:
+    except (TypeError, ValueError, OverflowError):
         raise ConfigurationError(
-            f"{setting_name} must be a finite number, got {raw!r}.",
+            f"{label} must be a finite number.",
             setting_name=setting_name,
             setting_value=raw,
-        ) from exc
+        ) from None
     if not math.isfinite(value):
         raise ConfigurationError(
-            f"{setting_name} must be finite, got {raw!r}.",
+            f"{label} must be finite.",
             setting_name=setting_name,
             setting_value=raw,
         )
@@ -80,7 +99,7 @@ def parse_float_setting(
     ):
         operator = ">" if minimum_exclusive else ">="
         raise ConfigurationError(
-            f"{setting_name} must be {operator} {minimum}, got {raw!r}.",
+            f"{label} must be {operator} {minimum}.",
             setting_name=setting_name,
             setting_value=raw,
         )
@@ -89,7 +108,7 @@ def parse_float_setting(
     ):
         operator = "<" if maximum_exclusive else "<="
         raise ConfigurationError(
-            f"{setting_name} must be {operator} {maximum}, got {raw!r}.",
+            f"{label} must be {operator} {maximum}.",
             setting_name=setting_name,
             setting_value=raw,
         )
@@ -109,7 +128,7 @@ def parse_bool_setting(raw: object, setting_name: str) -> bool:
         if normalized in {"0", "false"}:
             return False
     raise ConfigurationError(
-        f"{setting_name} must be one of 0/1 or true/false, got {raw!r}.",
+        f"{_setting_label(setting_name)} must be one of 0/1 or true/false.",
         setting_name=setting_name,
         setting_value=raw,
     )
@@ -124,12 +143,12 @@ def get_bool_setting(
     raw = settings.get(setting_name, default)
     try:
         value = settings.getbool(setting_name, default)
-    except (TypeError, ValueError, OverflowError) as exc:
+    except (TypeError, ValueError, OverflowError):
         raise ConfigurationError(
-            f"Invalid boolean value for {setting_name}: {raw!r}.",
+            f"Invalid boolean value for {_setting_label(setting_name)}.",
             setting_name=setting_name,
             setting_value=raw,
-        ) from exc
+        ) from None
     # Some lightweight Settings test doubles leave getbool() as an unconfigured
     # mock. Fall back to the raw value in that case; real Scrapy always returns a
     # bool or raises during conversion.

@@ -73,11 +73,12 @@ class Settings(RedactedBaseSettings):
 
         Resolution order:
           1. ``BackendType`` member → returned as-is (bundled-backend fast path).
-          2. Bundled ``BackendType`` value string (``'redis'``) → coerced to the
+          2. Empty text → the unset/default ``BackendType.REDIS`` sentinel.
+          3. Bundled ``BackendType`` value string (``'redis'``) → coerced to the
              member (preserves the byte-identical default-behavior invariant).
-          3. Registry-known 3rd-party string (``'myplugin'``) → returned as-is so
+          4. Registry-known 3rd-party string (``'myplugin'``) → returned as-is so
              ``resolve_backend_config`` can dispatch via the entry-point path.
-          4. Anything else → ``ConfigurationError(setting_name='SCRAPY_BACKEND_TYPE')``.
+          5. Anything else → ``ConfigurationError(setting_name='SCRAPY_BACKEND_TYPE')``.
 
         Args:
             value: The raw input (``BackendType``, ``str``, or invalid).
@@ -92,7 +93,13 @@ class Settings(RedactedBaseSettings):
         # (1) Already a BackendType member — bundled-backend fast path.
         if isinstance(value, BackendType):
             return value
-        # (2) & (3) String — try bundled-member coercion, then registry lookup.
+        # (2) Empty text is the same "unset" sentinel used by the Scrapy
+        # resolver.  BaseSettings still invokes validators for an explicitly
+        # empty environment variable, so normalize it here as well instead of
+        # turning a harmless empty deployment variable into a startup failure.
+        if type(value) is str and value == "":
+            return BackendType.REDIS
+        # (3) String — try bundled-member coercion, then registry lookup.
         if type(value) is str:
             try:
                 return BackendType(value)
@@ -351,6 +358,22 @@ class Settings(RedactedBaseSettings):
         Raises:
             ConfigurationError: on negative values or an inverted hysteresis band.
         """
+        if (
+            self.backpressure_pause_at is not None
+            and type(self.backpressure_pause_at) is not int
+        ):
+            raise ConfigurationError(
+                "backpressure_pause_at must be an integer or None.",
+                setting_name="backpressure_pause_at",
+            )
+        if (
+            self.backpressure_resume_at is not None
+            and type(self.backpressure_resume_at) is not int
+        ):
+            raise ConfigurationError(
+                "backpressure_resume_at must be an integer or None.",
+                setting_name="backpressure_resume_at",
+            )
         if self.backpressure_pause_at is not None and self.backpressure_pause_at < 0:
             raise ConfigurationError(
                 "backpressure_pause_at must be >= 0.",

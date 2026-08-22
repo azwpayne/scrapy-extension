@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import unicodedata
 from enum import Enum
 from ipaddress import IPv4Address, IPv6Address, ip_address
 from typing import Literal, NoReturn, cast
@@ -18,6 +19,10 @@ from typing_extensions import Self
 
 from scrapy_extension.exceptions._redaction import configuration_error_boundary
 from scrapy_extension.exceptions.base import ConfigurationError
+from scrapy_extension.settings._endpoint_validation import (
+    has_invalid_percent_escape,
+    parse_endpoint_port,
+)
 from scrapy_extension.settings._redacted import RedactedBaseSettings
 from scrapy_extension.settings._transport_security import (
     is_loopback_host,
@@ -51,6 +56,11 @@ _MONGODB_CONFIGURATION_FIELD_NAMES: frozenset[str] = frozenset(
     }
 )
 _MONGODB_CONFIGURATION_ERROR = "MongoDB configuration is invalid."
+_MONGODB_MAX_DATABASE_NAME_BYTES = 63
+_MONGODB_RESERVED_COLLECTION_ERROR = (
+    "MongoDB capability collection names must not use '$', NUL, or the reserved "
+    "'system.' namespace."
+)
 
 
 @configuration_error_boundary(
@@ -90,6 +100,14 @@ def validate_mongodb_collection_domains(
             "MongoDB capability collection names must be non-empty.",
             setting_name="collection_names",
         )
+    if any(
+        "\x00" in name or "$" in name or name.casefold().startswith("system.")
+        for name in validated_names
+    ):
+        raise ConfigurationError(
+            _MONGODB_RESERVED_COLLECTION_ERROR,
+            setting_name="collection_names",
+        )
     if len(set(validated_names)) != len(validated_names):
         raise ConfigurationError(
             (
@@ -116,14 +134,14 @@ def validate_mongodb_write_concern(
             "MongoDB w must be a positive integer or 'majority', not a boolean.",
             setting_name="w",
         )
-    if isinstance(w, int):
+    if type(w) is int:
         if w < 1:
             raise ConfigurationError(
                 "MongoDB mutations require an acknowledged write concern (w >= 1).",
                 setting_name="w",
             )
         normalized_w = w
-    elif isinstance(w, str):
+    elif type(w) is str:
         candidate = w.strip()
         if candidate == "majority":
             normalized_w = candidate
@@ -159,14 +177,14 @@ def validate_mongodb_write_concern(
             "MongoDB w_timeout_ms must be a non-negative integer or None.",
             setting_name="w_timeout_ms",
         )
-    elif isinstance(w_timeout_ms, int):
+    elif type(w_timeout_ms) is int:
         if w_timeout_ms < 0:
             raise ConfigurationError(
                 "MongoDB w_timeout_ms must be a non-negative integer or None.",
                 setting_name="w_timeout_ms",
             )
         normalized_timeout = w_timeout_ms
-    elif isinstance(w_timeout_ms, str):
+    elif type(w_timeout_ms) is str:
         normalized_timeout = None
         invalid_timeout = False
         try:
@@ -269,6 +287,14 @@ def validate_mongodb_uri(value: object) -> str:
             "uri must start with 'mongodb://' or 'mongodb+srv://'.",
             setting_name="uri",
         )
+    if has_invalid_percent_escape(value) or any(
+        character.isspace() or unicodedata.category(character).startswith("C")
+        for character in value
+    ):
+        raise ConfigurationError(
+            "MongoDB URI must not contain whitespace or control characters.",
+            setting_name="uri",
+        )
     # MongoDB URIs do not support fragments.  ``urlsplit`` discards one before
     # the query policy is inspected, while PyMongo parses the full connection
     # string and can still consume options after it.
@@ -325,10 +351,30 @@ def validate_mongodb_uri(value: object) -> str:
     _MONGODB_CONFIGURATION_FIELD_NAMES,
 )
 def validate_mongodb_database(value: object) -> str:
-    """Require a concrete database name before indexing a client with it."""
-    if type(value) is not str or not value.strip():
+    """Validate the MongoDB database-name grammar and 63-byte wire limit."""
+    if type(value) is not str or not value:
         raise ConfigurationError(
-            "MongoDB 'database' name must be a non-empty string.",
+            "MongoDB 'database' name must be a non-empty string of at most 63 UTF-8 bytes.",
+            setting_name="database",
+        )
+    if any(
+        character.isspace() or unicodedata.category(character).startswith("C")
+        for character in value
+    ) or any(character in value for character in '.\\/$"'):
+        raise ConfigurationError(
+            "MongoDB 'database' name contains unsupported characters.",
+            setting_name="database",
+        )
+    try:
+        encoded_length = len(value.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise ConfigurationError(
+            "MongoDB 'database' name must be valid UTF-8 and at most 63 bytes.",
+            setting_name="database",
+        ) from None
+    if encoded_length > _MONGODB_MAX_DATABASE_NAME_BYTES:
+        raise ConfigurationError(
+            "MongoDB 'database' name must be at most 63 UTF-8 bytes.",
             setting_name="database",
         )
     return value
@@ -408,10 +454,8 @@ def _normalize_mongodb_seed_host(host: str, setting_name: str) -> str:
 
 def _parse_mongodb_seed_port(port_text: str, setting_name: str) -> int:
     """Parse the optional seed port without accepting URI syntax."""
-    if not port_text or not port_text.isascii() or not port_text.isdecimal():
-        _invalid_mongodb_seed_endpoint(setting_name)
-    port = int(port_text)
-    if not 1 <= port <= 65535:
+    port = parse_endpoint_port(port_text)
+    if port is None:
         _invalid_mongodb_seed_endpoint(setting_name)
     return port
 
@@ -484,13 +528,15 @@ def validate_mongodb_seed_endpoints(
     value: object, setting_name: str
 ) -> tuple[str, ...]:
     """Validate and normalize a list of URI-safe replica/mongos seeds."""
-    if not isinstance(value, (list, tuple)):
+    if type(value) not in (list, tuple):
         raise ConfigurationError(
             "MongoDB seed endpoints must be a list or tuple of endpoint strings.",
             setting_name=setting_name,
         )
+    endpoints = cast(list[object] | tuple[object, ...], value)
     return tuple(
-        _parse_mongodb_seed_endpoint(endpoint, setting_name)[0] for endpoint in value
+        _parse_mongodb_seed_endpoint(endpoint, setting_name)[0]
+        for endpoint in endpoints
     )
 
 
@@ -554,7 +600,7 @@ def _mongodb_uri_option_pairs(query: str) -> tuple[tuple[str, str], ...]:
 def _mongodb_password_text(value: object) -> str | None:
     if value is None:
         return None
-    if isinstance(value, SecretStr):
+    if type(value) is SecretStr:
         return value.get_secret_value()
     if type(value) is str:
         return value
@@ -664,7 +710,7 @@ def _mongodb_endpoint_is_loopback(endpoint: object) -> bool:
     return is_loopback_host(host)
 
 
-def is_mongodb_direct_loopback_uri(uri: str) -> bool:
+def is_mongodb_direct_loopback_uri(uri: object) -> bool:
     """Return whether a URI can safely use the local plaintext compatibility path.
 
     A single loopback seed alone is not sufficient: PyMongo can discover a
@@ -672,6 +718,8 @@ def is_mongodb_direct_loopback_uri(uri: str) -> bool:
     members.  The backend pins direct mode for this narrow path, so reject
     topology-bearing URI options that would conflict with it.
     """
+    if type(uri) is not str:
+        return False
     if "#" in uri:
         return False
     try:
@@ -698,19 +746,34 @@ def _mongodb_endpoints_are_loopback(
     mongos_routers: object,
 ) -> bool:
     """Return true only when every effective endpoint is known loopback."""
-    if mode is MongoDBMode.REPLICA_SET and replica_set_members:
+    if type(mode) is not MongoDBMode or type(uri) is not str:
+        return False
+    if mode is MongoDBMode.REPLICA_SET:
+        if type(replica_set_members) not in (list, tuple):
+            return False
         endpoints = replica_set_members
-    elif mode is MongoDBMode.SHARDED_CLUSTER and mongos_routers:
+        if not endpoints:
+            parsed = urlsplit(uri)
+            if parsed.scheme.lower() == "mongodb+srv":
+                return False
+            endpoints = parsed.netloc.split(",")
+    elif mode is MongoDBMode.SHARDED_CLUSTER:
+        if type(mongos_routers) not in (list, tuple):
+            return False
         endpoints = mongos_routers
+        if not endpoints:
+            parsed = urlsplit(uri)
+            if parsed.scheme.lower() == "mongodb+srv":
+                return False
+            endpoints = parsed.netloc.split(",")
     else:
         parsed = urlsplit(uri)
         if parsed.scheme.lower() == "mongodb+srv":
             return False
         endpoints = parsed.netloc.split(",")
-    return (
-        isinstance(endpoints, (list, tuple))
-        and bool(endpoints)
-        and all(_mongodb_endpoint_is_loopback(endpoint) for endpoint in endpoints)
+    endpoint_values = cast(list[object] | tuple[object, ...], endpoints)
+    return bool(endpoint_values) and all(
+        _mongodb_endpoint_is_loopback(endpoint) for endpoint in endpoint_values
     )
 
 
@@ -736,7 +799,7 @@ def validate_mongodb_transport_security(
     tls_key_file: object = None,
 ) -> None:
     """Require verified TLS for remote authenticated MongoDB connections."""
-    if not isinstance(mode, MongoDBMode):
+    if type(mode) is not MongoDBMode:
         raise ConfigurationError("MongoDB mode is unsupported.", setting_name="mode")
     normalized_uri = validate_mongodb_uri(uri)
     normalized_replica_set_members = validate_mongodb_seed_endpoints(
@@ -745,11 +808,11 @@ def validate_mongodb_transport_security(
     normalized_mongos_routers = validate_mongodb_seed_endpoints(
         mongos_routers, "mongos_routers"
     )
-    if not isinstance(tls_enabled, bool):
+    if type(tls_enabled) is not bool:
         raise ConfigurationError(
             "MongoDB tls_enabled must be a boolean.", setting_name="tls_enabled"
         )
-    if not isinstance(tls_allow_invalid_certificates, bool):
+    if type(tls_allow_invalid_certificates) is not bool:
         raise ConfigurationError(
             "MongoDB tls_allow_invalid_certificates must be a boolean.",
             setting_name="tls_allow_invalid_certificates",
@@ -896,13 +959,10 @@ class MongoDBSettings(RedactedBaseSettings):
     )
 
     # === Atlas Settings ===
-    atlas_cluster_name: str | None = Field(
-        default=None,
-        description=(
-            "Optional Atlas cluster label. It cannot replace uri because an Atlas "
-            "SRV hostname cannot be derived from the display name alone."
-        ),
-    )
+    # There is no atlas_cluster_name setting — do NOT re-add it (R141-F16
+    # removed vestigial, unconsumed dead config: the backend connects with
+    # ``uri`` verbatim and a complete Atlas SRV hostname cannot be derived
+    # from a cluster display name, so the label never reached any consumer).
 
     # === Connection Pool Settings ===
     min_pool_size: int = Field(
@@ -1036,7 +1096,7 @@ class MongoDBSettings(RedactedBaseSettings):
         validate_mongodb_write_concern(self.w, self.w_timeout_ms)
         return self
 
-    @field_validator("database", mode="after")
+    @field_validator("database", mode="before")
     @classmethod
     def _reject_blank_database(cls, value: str) -> str:
         """Keep construction and connection-time database checks identical."""
@@ -1057,6 +1117,11 @@ class MongoDBSettings(RedactedBaseSettings):
         R31-A's sweep covered auth_source but missed the username/password siblings.
         None is allowed (credential unset).
         """
+        if value is not None and type(value) is not str:
+            raise ConfigurationError(
+                "MongoDB 'username' must be non-empty.",
+                setting_name="username",
+            )
         if value is not None and not value.strip():
             raise ConfigurationError(
                 "MongoDB 'username' must be non-empty.",
@@ -1073,6 +1138,11 @@ class MongoDBSettings(RedactedBaseSettings):
         verbatim → opaque auth failure. Same rationale as ``username``. None is allowed.
         ``setting_value`` is intentionally omitted (secret — never surface in errors).
         """
+        if value is not None and type(value) is not SecretStr:
+            raise ConfigurationError(
+                "MongoDB 'password' must be non-empty.",
+                setting_name="password",
+            )
         if value is not None and not value.get_secret_value().strip():
             raise ConfigurationError(
                 "MongoDB 'password' must be non-empty.",
@@ -1140,7 +1210,7 @@ class MongoDBSettings(RedactedBaseSettings):
             )
         return self
 
-    @field_validator("uri")
+    @field_validator("uri", mode="before")
     @classmethod
     def _validate_uri_scheme(cls, v: str) -> str:
         """SV4: ``uri`` must start with ``mongodb://`` or ``mongodb+srv://``.
@@ -1166,8 +1236,9 @@ class MongoDBSettings(RedactedBaseSettings):
           (mongodb.py:_connect_replica_set) while catching the genuine footgun
           (REPLICA_SET mode with neither name nor URI hint → opaque driver error).
         - ATLAS: requires an explicit ``mongodb+srv://`` URI. The backend connects
-          with ``uri`` verbatim; ``atlas_cluster_name`` is only a label and lacks
-          the deployment-specific DNS suffix needed to construct a connection URI.
+          with ``uri`` verbatim; a cluster display name (the removed
+          ``atlas_cluster_name`` label, R141-F16 dead config) lacks the
+          deployment-specific DNS suffix needed to construct a connection URI.
 
         Mirrors the Redis SENTINEL validator (raise, not warn). STANDALONE and
         SHARDED_CLUSTER are unaffected (SHARDED_CLUSTER uses mongos routers in
@@ -1176,6 +1247,17 @@ class MongoDBSettings(RedactedBaseSettings):
         Raises:
             ConfigurationError: if a mode-specific required field is missing.
         """
+        if type(self.mode) is not MongoDBMode:
+            raise ConfigurationError(
+                "MongoDB mode is unsupported.", setting_name="mode"
+            )
+        if type(self.uri) is not str:
+            raise ConfigurationError("MongoDB URI is malformed.", setting_name="uri")
+        if self.replica_set_name is not None and type(self.replica_set_name) is not str:
+            raise ConfigurationError(
+                "MongoDB 'replica_set_name' must be a non-empty string when set.",
+                setting_name="replica_set_name",
+            )
         if self.mode == MongoDBMode.REPLICA_SET:
             # PyMongo parses URI options case-insensitively, so match any-case
             # ``replicaSet`` via the parsed query (helper at line 539) rather than
@@ -1227,6 +1309,16 @@ class MongoDBSettings(RedactedBaseSettings):
         Raises:
             ConfigurationError: if ``min_pool_size > max_pool_size``.
         """
+        if type(self.min_pool_size) is not int:
+            raise ConfigurationError(
+                "min_pool_size must be a non-negative integer.",
+                setting_name="min_pool_size",
+            )
+        if type(self.max_pool_size) is not int:
+            raise ConfigurationError(
+                "max_pool_size must be a positive integer.",
+                setting_name="max_pool_size",
+            )
         if self.min_pool_size > self.max_pool_size:
             raise ConfigurationError(
                 (

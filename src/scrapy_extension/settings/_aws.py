@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 from pydantic import SecretStr
 
 from scrapy_extension.exceptions import ConfigurationError
+from scrapy_extension.settings._endpoint_validation import parse_endpoint_host
 from scrapy_extension.settings._transport_security import is_loopback_host
 
 # AWS partition region identifiers are not all three labels: GovCloud/ISO use
@@ -50,6 +51,7 @@ _AWS_SAFE_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
             "endpoint_url must not contain URL userinfo; configure AWS credentials "
             "through the dedicated credential fields."
         ),
+        "endpoint_url must not contain a query or fragment.",
         "An explicit endpoint_url in cloud mode must use HTTPS.",
         "allow_remote_http must be a boolean.",
         (
@@ -66,9 +68,7 @@ _AWS_SAFE_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
 
 def validate_aws_region_name(region_name: object) -> str:
     """Return one AWS-style region name or raise a typed config error."""
-    if not isinstance(region_name, str) or not _AWS_REGION_PATTERN.fullmatch(
-        region_name
-    ):
+    if type(region_name) is not str or not _AWS_REGION_PATTERN.fullmatch(region_name):
         raise ConfigurationError(
             (
                 "region_name must be a lowercase, hyphen-delimited AWS region "
@@ -84,9 +84,9 @@ def _credential_value(value: SecretStr | str | None, setting_name: str) -> str |
     """Extract one explicitly configured credential and reject blank values."""
     if value is None:
         return None
-    if isinstance(value, SecretStr):
+    if type(value) is SecretStr:
         text = value.get_secret_value()
-    elif isinstance(value, str):
+    elif type(value) is str:
         text = value
     else:
         raise ConfigurationError(
@@ -127,7 +127,7 @@ def normalize_allow_remote_http(value: object) -> bool:
     """Parse canonical environment booleans without accepting truthy lookalikes."""
     if type(value) is bool:
         return value
-    if isinstance(value, str):
+    if type(value) is str:
         normalized = value.strip().lower()
         if normalized == "true":
             return True
@@ -149,6 +149,24 @@ def validate_allow_remote_http(value: object) -> bool:
     return value
 
 
+def is_remote_http_endpoint(endpoint_url: object) -> bool:
+    """Return whether a validated endpoint is non-loopback plaintext HTTP.
+
+    This helper is also used by mutable-settings revalidation.  Treat malformed
+    scalars and containers as non-endpoints instead of handing them to
+    ``urlsplit`` (which attempts bytes coercion and can invoke hostile methods).
+    """
+    if type(endpoint_url) is not str:
+        return False
+    parsed = urlsplit(endpoint_url)
+    hostname = parsed.hostname
+    return (
+        parsed.scheme.lower() == "http"
+        and hostname is not None
+        and not is_loopback_host(hostname)
+    )
+
+
 def validate_aws_endpoint(
     endpoint_url: str | None,
     *,
@@ -159,6 +177,16 @@ def validate_aws_endpoint(
 ) -> str | None:
     """Validate an AWS endpoint override without retaining or echoing userinfo."""
     remote_http_allowed = validate_allow_remote_http(allow_remote_http)
+    if type(cloud) is not bool or type(require_endpoint) is not bool:
+        raise ConfigurationError(
+            "AWS endpoint policy flags must be booleans.",
+            setting_name="endpoint_url",
+        )
+    if type(explicit_credentials) is not bool:
+        raise ConfigurationError(
+            "AWS credential policy flag must be a boolean.",
+            setting_name="endpoint_url",
+        )
     if endpoint_url is None:
         if require_endpoint:
             raise ConfigurationError(
@@ -167,13 +195,13 @@ def validate_aws_endpoint(
                 setting_name="endpoint_url",
             )
         return None
-    if not isinstance(endpoint_url, str) or not endpoint_url.strip():
+    if type(endpoint_url) is not str or not endpoint_url.strip():
         raise ConfigurationError(
             "endpoint_url must be a non-empty HTTP(S) URL.",
             setting_name="endpoint_url",
         )
     if endpoint_url != endpoint_url.strip() or any(
-        ord(character) < 32 for character in endpoint_url
+        ord(character) < 32 or ord(character) == 127 for character in endpoint_url
     ):
         raise ConfigurationError(
             "endpoint_url must not contain surrounding whitespace or control characters.",
@@ -195,18 +223,11 @@ def validate_aws_endpoint(
             "endpoint_url must be an absolute HTTP(S) URL with a hostname.",
             setting_name="endpoint_url",
         )
-    if parsed.username is not None or parsed.password is not None:
-        raise ConfigurationError(
-            "endpoint_url must not contain URL userinfo; configure AWS credentials "
-            "through the dedicated credential fields.",
-            setting_name="endpoint_url",
-        )
-    if cloud and scheme != "https":
-        raise ConfigurationError(
-            "An explicit endpoint_url in cloud mode must use HTTPS.",
-            setting_name="endpoint_url",
-        )
-    if not cloud and scheme == "http" and not is_loopback_host(hostname):
+    # Apply the transport policy before strict host canonicalization. A
+    # malformed-but-routable-looking HTTP authority is still remote intent and
+    # must fail on the explicit opt-in field rather than being reclassified as a
+    # harmless endpoint-shape error.
+    if not cloud and is_remote_http_endpoint(endpoint_url):
         if explicit_credentials:
             raise ConfigurationError(
                 "Explicit AWS credentials cannot be sent to a remote HTTP endpoint; "
@@ -219,4 +240,32 @@ def validate_aws_endpoint(
                 "Use this override only for an explicitly trusted private network.",
                 setting_name="allow_remote_http",
             )
+    if (
+        type(hostname) is not str
+        or parse_endpoint_host(hostname, allow_brackets=False) is None
+    ):
+        raise ConfigurationError(
+            "endpoint_url must be an absolute HTTP(S) URL with a hostname.",
+            setting_name="endpoint_url",
+        )
+    if parsed.username is not None or parsed.password is not None:
+        raise ConfigurationError(
+            "endpoint_url must not contain URL userinfo; configure AWS credentials "
+            "through the dedicated credential fields.",
+            setting_name="endpoint_url",
+        )
+    # ``urlsplit`` discards an empty trailing ``?``/``#`` delimiter, but
+    # those delimiters are still not part of an endpoint origin. Reject the raw
+    # delimiters as well as non-empty parsed values so mutable settings cannot
+    # smuggle URL-shaped data through a syntactically empty query or fragment.
+    if parsed.query or parsed.fragment or "?" in endpoint_url or "#" in endpoint_url:
+        raise ConfigurationError(
+            "endpoint_url must not contain a query or fragment.",
+            setting_name="endpoint_url",
+        )
+    if cloud and scheme != "https":
+        raise ConfigurationError(
+            "An explicit endpoint_url in cloud mode must use HTTPS.",
+            setting_name="endpoint_url",
+        )
     return endpoint_url

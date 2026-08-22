@@ -158,15 +158,31 @@ def test_elasticsearch_cloud_credentials_ignore_standalone_default_hosts() -> No
     assert settings.api_key is not None
 
 
-def test_mongodb_atlas_cluster_name_does_not_replace_srv_uri() -> None:
+def test_mongodb_atlas_mode_requires_srv_uri() -> None:
+    """ATLAS mode without an ``mongodb+srv://`` uri fails fast — the backend
+    connects with ``uri`` verbatim (a cluster display name cannot replace it;
+    the former ``atlas_cluster_name`` label was never consumed)."""
     with pytest.raises(ConfigurationError) as exc_info:
-        MongoDBSettings(
-            mode=MongoDBMode.ATLAS,
-            atlas_cluster_name="cluster0",
-        )
+        MongoDBSettings(mode=MongoDBMode.ATLAS)
 
     assert exc_info.value.setting_name == "uri"
     assert "mongodb+srv://" in str(exc_info.value)
+
+
+def test_mongodb_atlas_cluster_name_removed_as_dead_config() -> None:
+    """R141-F16: ``atlas_cluster_name`` was accepted but zero-consumed dead
+    config (only ever echoed in the ATLAS error text). The field is removed;
+    re-adding it must reject via ``extra="forbid"`` instead of being silently
+    accepted, mirroring the R25-H RocketMQ tombstone."""
+    with pytest.raises(ValidationError) as exc_info:
+        MongoDBSettings(
+            mode=MongoDBMode.ATLAS,
+            atlas_cluster_name="cluster0",  # type: ignore[call-overload]
+        )
+    errors = exc_info.value.errors()
+    assert errors
+    assert all(error["type"] == "value_error" for error in errors)
+    assert all(error["loc"] == ("configuration",) for error in errors)
 
 
 @pytest.mark.parametrize(
@@ -355,6 +371,30 @@ def test_aws_endpoint_rejects_userinfo_without_leaking_it(
     assert password not in repr(exc_info.value)
     assert password not in repr(exc_info.value.setting_value)
     assert exc_info.value.__cause__ is None
+
+
+@pytest.mark.parametrize("settings_cls", [SqsSettings, DynamoDBSettings])
+@pytest.mark.parametrize(
+    "endpoint_url",
+    [
+        "https://aws.example:4566?X-Amz-Security-Token=endpoint-secret",
+        "https://aws.example:4566#endpoint-secret",
+        "https://aws.example" + chr(127) + ":4566",
+        "https://aws" + chr(0) + ".example:4566",
+    ],
+)
+def test_aws_endpoint_rejects_queries_fragments_and_hidden_controls(
+    settings_cls: type[SqsSettings] | type[DynamoDBSettings], endpoint_url: str
+) -> None:
+    """Custom AWS endpoints cannot smuggle URL data or hidden controls."""
+    with pytest.raises(ConfigurationError) as exc_info:
+        settings_cls(mode="cloud", endpoint_url=endpoint_url)
+
+    error = exc_info.value
+    assert error.setting_name == "endpoint_url"
+    assert "endpoint-secret" not in str(error)
+    assert endpoint_url not in repr(error)
+    assert error.__cause__ is None
 
 
 @pytest.mark.parametrize("settings_cls", [SqsSettings, DynamoDBSettings])

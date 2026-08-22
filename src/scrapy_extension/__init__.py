@@ -71,7 +71,11 @@ if TYPE_CHECKING:
         ElasticSearchMode,
         ElasticSearchSettings,
     )
-    from scrapy_extension.settings.kafka import KafkaMode, KafkaSettings
+    from scrapy_extension.settings.kafka import (
+        KafkaMode,
+        KafkaSettings,
+        KafkaTopicNameGeneration,
+    )
     from scrapy_extension.settings.memcached import MemcachedMode, MemcachedSettings
     from scrapy_extension.settings.mongodb import MongoDBMode, MongoDBSettings
     from scrapy_extension.settings.pulsar import PulsarMode, PulsarSettings
@@ -122,6 +126,10 @@ _OPTIONAL_IMPORTS: dict[str, tuple[str, str]] = {
     ),
     "KafkaMode": ("scrapy_extension.settings.kafka", "KafkaMode"),
     "KafkaSettings": ("scrapy_extension.settings.kafka", "KafkaSettings"),
+    "KafkaTopicNameGeneration": (
+        "scrapy_extension.settings.kafka",
+        "KafkaTopicNameGeneration",
+    ),
     "MemcachedMode": ("scrapy_extension.settings.memcached", "MemcachedMode"),
     "MemcachedSettings": ("scrapy_extension.settings.memcached", "MemcachedSettings"),
     "MongoDBMode": ("scrapy_extension.settings.mongodb", "MongoDBMode"),
@@ -153,6 +161,7 @@ _BACKEND_EXTRAS: dict[str, str] = {
     "KafkaBackend": "kafka",
     "KafkaMode": "kafka",
     "KafkaSettings": "kafka",
+    "KafkaTopicNameGeneration": "kafka",
     "MemcachedBackend": "memcached",
     "MemcachedMode": "memcached",
     "MemcachedSettings": "memcached",
@@ -263,8 +272,8 @@ def __dir__() -> list[str]:
     """PEP 562 companion — expose lazily-imported names to dir() and autocomplete.
 
     Without this, ``dir(scrapy_extension)`` / ``pydoc`` / IDE autocomplete see
-    only eagerly-imported names; the 30 lazily-imported ``__all__`` members
-    (backends, Mode enums, Settings classes) are invisible despite importing
+    only eagerly-imported names; the lazily-imported ``__all__`` members
+    (backends, configuration enums, Settings classes) are invisible despite importing
     successfully on access. Returns eager globals union the lazy
     ``_OPTIONAL_IMPORTS`` keys — no optional dep is imported (dict keys only).
     """
@@ -304,6 +313,7 @@ __all__ = [
     "KafkaBackend",
     "KafkaMode",
     "KafkaSettings",
+    "KafkaTopicNameGeneration",
     "MembershipFilter",
     "MemcachedBackend",
     "MemcachedMode",

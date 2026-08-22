@@ -6,9 +6,9 @@
 # @desc    :
 from __future__ import annotations
 
+import unicodedata
 from collections.abc import Mapping
 from enum import Enum
-from ipaddress import ip_address
 from typing import Any, Literal
 from urllib.parse import unquote
 
@@ -16,7 +16,13 @@ from pydantic import AmqpDsn, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import SettingsConfigDict
 
 from scrapy_extension.exceptions.base import ConfigurationError
+from scrapy_extension.settings._endpoint_validation import (
+    has_invalid_percent_escape,
+    parse_endpoint_host,
+    parse_host_port_authority,
+)
 from scrapy_extension.settings._redacted import RedactedBaseSettings
+from scrapy_extension.settings._transport_security import is_loopback_host
 
 
 class RabbitMQMode(str, Enum):
@@ -33,108 +39,78 @@ class RabbitMQMode(str, Enum):
     MIRRORED_QUEUES = "mirrored_queues"
 
 
-def _secret_text(value: SecretStr | str | None) -> str | None:
+def _secret_text(value: object) -> str | None:
     """Extract a secret for validation without retaining it in an exception."""
-    if isinstance(value, SecretStr):
+    if value is None:
+        return None
+    if type(value) is SecretStr:
         return value.get_secret_value()
-    return value
+    if type(value) is str:
+        return value
+    return None
 
 
-def normalize_rabbitmq_host(host: str) -> str:
-    """Normalize a RabbitMQ hostname for Pika and loopback classification."""
-    if not isinstance(host, str):
+def normalize_rabbitmq_host(host: object) -> str:
+    """Normalize a strict RabbitMQ host for Pika and loopback classification."""
+    normalized = parse_endpoint_host(host)
+    if normalized is None:
         raise ConfigurationError(
-            "RabbitMQ host must be a non-empty hostname or IP address.",
-            setting_name="host",
-        )
-    normalized = host.strip()
-    if normalized.startswith("[") and normalized.endswith("]"):
-        normalized = normalized[1:-1]
-    if not normalized or any(char in normalized for char in "/@?#"):
-        raise ConfigurationError(
-            "RabbitMQ host must be a non-empty hostname or IP address.",
+            "RabbitMQ host must be a valid DNS name, IPv4 address, or IPv6 address.",
             setting_name="host",
         )
     return normalized
 
 
-def parse_rabbitmq_node(node: str, default_port: int) -> tuple[str, int]:
-    """Parse one cluster node without confusing bracketed or bare IPv6 hosts."""
-    if not isinstance(node, str) or not node.strip():
-        raise ConfigurationError(
-            "RabbitMQ cluster nodes must be non-empty host or host:port values.",
-            setting_name="cluster_nodes",
+def validate_rabbitmq_virtual_host(value: object) -> str:
+    """Validate the vhost identifier before it reaches Pika."""
+    if (
+        type(value) is not str
+        or not value
+        or any(
+            character.isspace() or unicodedata.category(character).startswith("C")
+            for character in value
         )
-    text = node.strip()
-    port = default_port
-    if text.startswith("["):
-        closing = text.find("]")
-        if closing < 0:
-            raise ConfigurationError(
-                "RabbitMQ cluster node has an invalid bracketed IPv6 host.",
-                setting_name="cluster_nodes",
-            )
-        host = text[1:closing]
-        remainder = text[closing + 1 :]
-        if remainder:
-            if not remainder.startswith(":") or not remainder[1:]:
-                raise ConfigurationError(
-                    "RabbitMQ cluster node must use '[IPv6]:port' syntax.",
-                    setting_name="cluster_nodes",
-                )
-            port_text = remainder[1:]
-            try:
-                port = int(port_text)
-            except ValueError:
-                raise ConfigurationError(
-                    "RabbitMQ cluster node port must be an integer.",
-                    setting_name="cluster_nodes",
-                ) from None
-    else:
-        try:
-            ip_address(text)
-        except ValueError:
-            if text.count(":") > 1:
-                raise ConfigurationError(
-                    "RabbitMQ IPv6 cluster nodes with a port must use '[IPv6]:port'.",
-                    setting_name="cluster_nodes",
-                ) from None
-            if ":" in text:
-                host, port_text = text.rsplit(":", 1)
-                if not port_text:
-                    raise ConfigurationError(
-                        "RabbitMQ cluster node port cannot be empty.",
-                        setting_name="cluster_nodes",
-                    )
-                try:
-                    port = int(port_text)
-                except ValueError:
-                    raise ConfigurationError(
-                        "RabbitMQ cluster node port must be an integer.",
-                        setting_name="cluster_nodes",
-                    ) from None
-            else:
-                host = text
-        else:
-            host = text
+    ):
+        raise ConfigurationError(
+            "RabbitMQ virtual_host must be a non-empty value without whitespace or controls.",
+            setting_name="virtual_host",
+        )
+    return value
 
-    normalized_host = normalize_rabbitmq_host(host)
-    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+
+def _decode_rabbitmq_virtual_host(path: str | None) -> str:
+    """Decode a URL vhost while rejecting malformed escapes and controls."""
+    raw_path = path or ""
+    if has_invalid_percent_escape(raw_path):
+        raise ConfigurationError(
+            "RabbitMQ URL virtual host contains an invalid percent escape.",
+            setting_name="url",
+        )
+    decoded = unquote(raw_path[1:] if raw_path.startswith("/") else raw_path)
+    return validate_rabbitmq_virtual_host(decoded or "/")
+
+
+def parse_rabbitmq_node(node: str, default_port: int) -> tuple[str, int]:
+    """Parse one cluster node with strict host and port grammar."""
+    if type(default_port) is not int or not 1 <= default_port <= 65535:
         raise ConfigurationError(
             "RabbitMQ cluster node port must be between 1 and 65535.",
             setting_name="cluster_nodes",
         )
-    return normalized_host, port
+    parsed = parse_host_port_authority(node, default_port=default_port)
+    if parsed is None:
+        raise ConfigurationError(
+            "RabbitMQ cluster nodes must be valid host or host:port values.",
+            setting_name="cluster_nodes",
+        )
+    host, port = parsed
+    assert port is not None
+    return host, port
 
 
 def _is_loopback_host(host: str) -> bool:
-    normalized = normalize_rabbitmq_host(host).lower().rstrip(".")
-    if normalized == "localhost":
-        return True
-    try:
-        return ip_address(normalized).is_loopback
-    except ValueError:
-        return False
+    normalized = normalize_rabbitmq_host(host)
+    return is_loopback_host(normalized)
 
 
 def validate_rabbitmq_connection(
@@ -152,34 +128,39 @@ def validate_rabbitmq_connection(
 ) -> tuple[str, tuple[tuple[str, int], ...]]:
     """Validate a complete connection snapshot and return parsed endpoints."""
     normalized_host = normalize_rabbitmq_host(host)
-    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+    if type(port) is not int or not 1 <= port <= 65535:
         raise ConfigurationError(
             "RabbitMQ port must be between 1 and 65535.",
             setting_name="port",
         )
-    if not isinstance(username, str) or not username.strip():
+    if type(username) is not str or not username.strip():
         raise ConfigurationError(
             "RabbitMQ username must be explicitly set and cannot be blank.",
             setting_name="username",
         )
-    if not isinstance(password, str) or not password.strip():
+    if type(password) is not str or not password.strip():
         raise ConfigurationError(
             "RabbitMQ password must be explicitly set and cannot be blank.",
             setting_name="password",
         )
-    if not isinstance(ssl_enabled, bool):
+    if type(ssl_enabled) is not bool:
         raise ConfigurationError(
             "RabbitMQ ssl_enabled must be a boolean.",
             setting_name="ssl_enabled",
         )
 
+    if type(cluster_nodes) not in (list, tuple):
+        raise ConfigurationError(
+            "RabbitMQ cluster nodes must be a list or tuple of host:port values.",
+            setting_name="cluster_nodes",
+        )
     tls_paths = {
         "ssl_cafile": ssl_cafile,
         "ssl_certfile": ssl_certfile,
         "ssl_keyfile": ssl_keyfile,
     }
     for setting_name, value in tls_paths.items():
-        if value is not None and (not isinstance(value, str) or not value.strip()):
+        if value is not None and (type(value) is not str or not value.strip()):
             raise ConfigurationError(
                 f"RabbitMQ TLS setting '{setting_name}' cannot be blank.",
                 setting_name=setting_name,
@@ -190,7 +171,9 @@ def validate_rabbitmq_connection(
             "RabbitMQ TLS client authentication requires both certificate and key files.",
             setting_name=missing_name,
         )
-    if ssl_enabled and ssl_verify_mode != "CERT_REQUIRED":
+    if type(ssl_verify_mode) is not str or (
+        ssl_enabled and ssl_verify_mode != "CERT_REQUIRED"
+    ):
         raise ConfigurationError(
             "RabbitMQ TLS requires CERT_REQUIRED certificate and hostname verification.",
             setting_name="ssl_verify_mode",
@@ -278,10 +261,10 @@ class RabbitMQSettings(RedactedBaseSettings):
         default_factory=list,
         description="List of cluster node host:port (for cluster/mirrored_queues mode)",
     )
-    cluster_node_type: Literal["disc", "ram"] = Field(
-        default="disc",
-        description="Node type for cluster (disc or ram)",
-    )
+    # There is no cluster_node_type setting — do NOT re-add it (R141-F16
+    # removed vestigial, unconsumed dead config: the disc/ram node type only
+    # steers broker-side clustering via rabbitmqctl and was never sent to the
+    # AMQP client, mirroring the R25-H RocketMQ dead-config removal).
 
     # === Mirrored Queue Settings (HA) ===
     ha_mode: str | None = Field(
@@ -388,6 +371,20 @@ class RabbitMQSettings(RedactedBaseSettings):
         ),
     )
 
+    @field_validator("virtual_host", mode="before")
+    @classmethod
+    def _validate_virtual_host(cls, value: object) -> str:
+        """Reject vhost subclasses and control/whitespace identifiers."""
+        return validate_rabbitmq_virtual_host(value)
+
+    @field_validator("host", mode="before")
+    @classmethod
+    def _validate_host(cls, value: object) -> str:
+        """Reject host subclasses before pydantic can normalize them."""
+        if type(value) is str and value == "":
+            return value
+        return normalize_rabbitmq_host(value)
+
     @field_validator("prefetch_size", mode="after")
     @classmethod
     def _reject_byte_based_prefetch(cls, value: int) -> int:
@@ -420,10 +417,20 @@ class RabbitMQSettings(RedactedBaseSettings):
             return data
 
         url_value = (
-            raw_url.get_secret_value()
-            if isinstance(raw_url, SecretStr)
-            else str(raw_url)
+            raw_url.get_secret_value() if type(raw_url) is SecretStr else raw_url
         )
+        if (
+            type(url_value) is not str
+            or not url_value.isascii()
+            or any(
+                character.isspace() or ord(character) < 32 or ord(character) == 127
+                for character in url_value
+            )
+        ):
+            raise ConfigurationError(
+                "url must use an ASCII AMQP authority without whitespace or controls.",
+                setting_name="url",
+            )
         try:
             parsed = AmqpDsn(url_value)
         except ValueError:
@@ -442,24 +449,41 @@ class RabbitMQSettings(RedactedBaseSettings):
                 "RabbitMQ URL must include a host.",
                 setting_name="url",
             )
+        if parsed.query or parsed.fragment:
+            raise ConfigurationError(
+                "RabbitMQ URL must not contain a query or fragment.",
+                setting_name="url",
+            )
+        if parsed.port is not None and not 1 <= parsed.port <= 65535:
+            raise ConfigurationError(
+                "RabbitMQ URL port must be between 1 and 65535.",
+                setting_name="url",
+            )
+        normalized_url_host = parse_endpoint_host(parsed.host)
+        if normalized_url_host is None:
+            raise ConfigurationError(
+                "RabbitMQ URL must contain a valid DNS or IP host.",
+                setting_name="url",
+            )
 
         values = dict(data)
-        if parsed.host is not None:
-            host = parsed.host
-            if host.startswith("[") and host.endswith("]"):
-                host = host[1:-1]
-            values.setdefault("host", host)
+        values.setdefault("host", normalized_url_host)
         values.setdefault(
-            "port", parsed.port or (5671 if parsed.scheme == "amqps" else 5672)
+            "port",
+            parsed.port
+            if parsed.port is not None
+            else (5671 if parsed.scheme == "amqps" else 5672),
         )
-        path = parsed.path or ""
-        virtual_host = unquote(path[1:] if path.startswith("/") else path)
-        values.setdefault("virtual_host", virtual_host or "/")
+        virtual_host = _decode_rabbitmq_virtual_host(parsed.path)
+        values.setdefault("virtual_host", virtual_host)
         if parsed.scheme == "amqps" and "ssl_enabled" in values:
             explicit_ssl = values["ssl_enabled"]
-            false_text = isinstance(
-                explicit_ssl, str
-            ) and explicit_ssl.strip().lower() in {"0", "false", "no", "off"}
+            false_text = type(explicit_ssl) is str and explicit_ssl.strip().lower() in {
+                "0",
+                "false",
+                "no",
+                "off",
+            }
             if explicit_ssl is False or explicit_ssl == 0 or false_text:
                 raise ConfigurationError(
                     "An amqps:// URL cannot be downgraded with ssl_enabled=False.",
@@ -475,6 +499,13 @@ class RabbitMQSettings(RedactedBaseSettings):
         - CLUSTER: requires non-empty ``cluster_nodes``. Without it the client
           connects to a single ``host:port`` — the operator asked for a cluster
           but only one node is wired.
+        - STANDALONE: rejects non-empty ``cluster_nodes``. The standalone
+          connect path dials ``host:port`` only, but the nodes still counted
+          as endpoints for TLS/guest classification — the security posture
+          and the actual connection surface disagreed (a multi-node config
+          silently degraded to a single point). Non-selected topology nodes
+          fail rather than being ignored, mirroring the Redis mode-intent
+          rejection contract.
         - MIRRORED_QUEUES: requires ``ha_mode``. Without it the connect path
           silently skips HA policy setup (the queue is non-mirrored despite the
           mode name). ``cluster_nodes`` is intentionally NOT required for
@@ -483,8 +514,18 @@ class RabbitMQSettings(RedactedBaseSettings):
           ``host:port`` when ``cluster_nodes`` is empty.
 
         Raises:
-            ConfigurationError: if a mode-specific required field is missing.
+            ConfigurationError: if a mode-specific required field is missing
+                or contradicts the selected mode's connection surface.
         """
+        if type(self.mode) is not RabbitMQMode:
+            raise ConfigurationError(
+                "RabbitMQ mode is unsupported.", setting_name="mode"
+            )
+        if type(self.cluster_nodes) is not list:
+            raise ConfigurationError(
+                "RabbitMQ cluster nodes must be a list of host or host:port values.",
+                setting_name="cluster_nodes",
+            )
         if self.mode == RabbitMQMode.CLUSTER and not self.cluster_nodes:
             raise ConfigurationError(
                 (
@@ -494,12 +535,24 @@ class RabbitMQSettings(RedactedBaseSettings):
                 ),
                 setting_name="cluster_nodes",
             )
+        # R141-F16: standalone mode would silently ignore ``cluster_nodes`` for
+        # connecting while the nodes still drove TLS/guest classification.
+        if self.mode == RabbitMQMode.STANDALONE and self.cluster_nodes:
+            raise ConfigurationError(
+                (
+                    "RabbitMQ cluster_nodes require mode='cluster' or mode='mirrored_queues'. "
+                    "STANDALONE mode connects to a single host:port and would silently "
+                    "ignore the configured nodes, so they are rejected rather than "
+                    "ignored — remove cluster_nodes or switch the mode."
+                ),
+                setting_name="cluster_nodes",
+            )
         # R30-B: strip-aware — whitespace ``ha_mode`` (``not "  "`` is False)
         # bypassed the bare truthiness check and surfaced later as a misleading
         # 'ha_mode required' at connect. Mirrors R29-D's pattern.
         ha_mode = self.ha_mode
         if self.mode == RabbitMQMode.MIRRORED_QUEUES and (
-            ha_mode is None or not ha_mode.strip()
+            ha_mode is None or type(ha_mode) is not str or not ha_mode.strip()
         ):
             raise ConfigurationError(
                 (

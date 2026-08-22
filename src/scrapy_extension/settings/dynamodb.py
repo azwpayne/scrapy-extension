@@ -6,12 +6,14 @@
 # @desc    : Amazon DynamoDB settings (subsystem ③ — new NoSQL backend)
 from __future__ import annotations
 
+import re
 from enum import Enum
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import SettingsConfigDict
 from typing_extensions import Self
 
+from scrapy_extension.exceptions.base import ConfigurationError
 from scrapy_extension.settings._aws import (
     normalize_allow_remote_http,
     validate_aws_credentials,
@@ -21,6 +23,17 @@ from scrapy_extension.settings._aws import (
 from scrapy_extension.settings._redacted import RedactedBaseSettings
 
 _DEFAULT_LOCAL_ENDPOINT = "http://localhost:4566"
+_DYNAMODB_TABLE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{3,255}$")
+_DYNAMODB_TABLE_NAME_ERROR = (
+    "DynamoDB table_name must be 3-255 letters, digits, dots, hyphens, or underscores."
+)
+
+
+def validate_dynamodb_table_name(value: object) -> str:
+    """Validate one physical table identifier before boto3 resource I/O."""
+    if type(value) is not str or _DYNAMODB_TABLE_NAME_PATTERN.fullmatch(value) is None:
+        raise ConfigurationError(_DYNAMODB_TABLE_NAME_ERROR, setting_name="table_name")
+    return value
 
 
 class DynamoDBMode(str, Enum):
@@ -87,6 +100,12 @@ class DynamoDBSettings(RedactedBaseSettings):
             "revisionless legacy rows. Enable only while every table writer is stopped."
         ),
     )
+
+    @field_validator("table_name", mode="after")
+    @classmethod
+    def _validate_table_name(cls, value: str) -> str:
+        """Reject malformed physical table names before client construction."""
+        return validate_dynamodb_table_name(value)
 
     @field_validator("allow_remote_http", mode="before")
     @classmethod

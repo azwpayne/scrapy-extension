@@ -56,6 +56,15 @@ class TestSettings:
         settings = Settings(backend_type=BackendType.MONGODB)
         assert settings.backend_type == BackendType.MONGODB
 
+    def test_empty_backend_type_matches_unset_default(self, monkeypatch):
+        """An empty environment value remains the documented unset sentinel."""
+        monkeypatch.setenv("SCRAPY_BACKEND_TYPE", "")
+
+        settings = Settings()
+
+        assert settings.backend_type == BackendType.REDIS
+        assert Settings(backend_type="").backend_type == BackendType.REDIS
+
     @pytest.mark.parametrize("age", [0.0, -0.1])
     def test_storage_buffer_max_age_must_be_positive(self, age):
         with pytest.raises(ValidationError):
@@ -348,6 +357,21 @@ def test_mongodb_collection_names_whitespace_rejected():
 
     with pytest.raises(ConfigurationError):
         MongoDBSettings(set_collection="   ")
+
+
+@pytest.mark.parametrize(
+    "collection_name", ["system.users", "scrapy$queue", "bad\x00name"]
+)
+def test_mongodb_reserved_collection_names_rejected(collection_name):
+    """Capability collections must not alias MongoDB system or invalid names."""
+    from scrapy_extension.settings import MongoDBSettings
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        MongoDBSettings(storage_collection=collection_name)
+
+    assert exc_info.value.setting_name == "collection_names"
+    assert collection_name not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
 
 
 def test_mongodb_database_empty_rejected():

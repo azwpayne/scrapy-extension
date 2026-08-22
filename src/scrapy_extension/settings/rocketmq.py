@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from enum import Enum
 
 from pydantic import Field, SecretStr, field_validator, model_validator
@@ -20,6 +21,24 @@ from scrapy_extension.settings._transport_security import (
     validate_allow_remote_plaintext,
 )
 
+_ROCKETMQ_MAX_TOPIC_PREFIX_CHARS = 127
+_ROCKETMQ_TOPIC_PREFIX_PATTERN = re.compile(r"^[A-Za-z0-9._-]+\Z")
+
+
+def validate_rocketmq_topic_prefix(value: object) -> str:
+    """Validate one RocketMQ topic prefix before topic construction."""
+    if (
+        type(value) is not str
+        or not value
+        or len(value) > _ROCKETMQ_MAX_TOPIC_PREFIX_CHARS
+        or _ROCKETMQ_TOPIC_PREFIX_PATTERN.fullmatch(value) is None
+    ):
+        raise ConfigurationError(
+            "RocketMQ topic_prefix must use 1-127 ASCII topic characters.",
+            setting_name="topic_prefix",
+        )
+    return value
+
 
 class RocketMQMode(str, Enum):
     """RocketMQ deployment modes."""
@@ -33,9 +52,9 @@ def _credential_value(value: SecretStr | str | None, setting_name: str) -> str |
     """Extract a credential without retaining or echoing invalid values."""
     if value is None:
         return None
-    if isinstance(value, SecretStr):
+    if type(value) is SecretStr:
         text = value.get_secret_value()
-    elif isinstance(value, str):
+    elif type(value) is str:
         text = value
     else:
         raise ConfigurationError(
@@ -50,8 +69,10 @@ def _credential_value(value: SecretStr | str | None, setting_name: str) -> str |
     return text
 
 
-def _rocketmq_namesrv_endpoints_are_loopback(endpoints: str) -> bool:
+def _rocketmq_namesrv_endpoints_are_loopback(endpoints: object) -> bool:
     """Return whether every normalized RocketMQ proxy endpoint is local."""
+    if type(endpoints) is not str:
+        return False
     hosts = [endpoint.rsplit(":", 1)[0] for endpoint in endpoints.split(";")]
     return bool(hosts) and all(is_loopback_host(host) for host in hosts)
 
@@ -65,18 +86,14 @@ def validate_rocketmq_connection(
     allow_remote_plaintext: object = False,
 ) -> tuple[RocketMQMode, str, str | None, str | None, bool]:
     """Validate and return one coherent RocketMQ connection snapshot."""
-    if mode not in (
-        RocketMQMode.STANDALONE,
-        RocketMQMode.CLUSTER,
-        RocketMQMode.CLOUD,
-    ):
+    if type(mode) is not RocketMQMode:
         raise ConfigurationError(
             "Unsupported RocketMQ mode.",
             setting_name="mode",
         )
 
     namesrv_address = normalize_rocketmq_namesrv_endpoints(namesrv_address)
-    if not isinstance(tls_enabled, bool):
+    if type(tls_enabled) is not bool:
         raise ConfigurationError(
             "tls_enabled must be a boolean.",
             setting_name="tls_enabled",
@@ -193,6 +210,12 @@ class RocketMQSettings(RedactedBaseSettings):
     def _normalize_remote_plaintext_opt_in(cls, value: object) -> bool:
         """Accept canonical environment booleans but reject truthy lookalikes."""
         return normalize_allow_remote_plaintext(value)
+
+    @field_validator("topic_prefix", mode="before")
+    @classmethod
+    def _validate_topic_prefix(cls, value: object) -> str:
+        """Reject topic names the RocketMQ client cannot publish."""
+        return validate_rocketmq_topic_prefix(value)
 
     @field_validator("consumer_group", mode="after")
     @classmethod

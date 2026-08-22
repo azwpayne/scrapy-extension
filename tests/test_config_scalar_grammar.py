@@ -34,7 +34,9 @@ _BUNDLED_BOOL_FIELDS: tuple[tuple[type[Any], str, str], ...] = (
         "SCRAPY_ELASTICSEARCH_RETRY_ON_TIMEOUT",
     ),
     (MemcachedSettings, "allow_flush_all", "SCRAPY_MEMCACHED_ALLOW_FLUSH_ALL"),
-    (KafkaSettings, "enable_auto_commit", "SCRAPY_KAFKA_ENABLE_AUTO_COMMIT"),
+    # R141-F18: enable_auto_commit=True is rejected at settings construction, so
+    # the boolean-grammar matrix uses the unconstrained TLS hostname flag.
+    (KafkaSettings, "ssl_check_hostname", "SCRAPY_KAFKA_SSL_CHECK_HOSTNAME"),
     (
         PulsarSettings,
         "allow_insecure_connection",

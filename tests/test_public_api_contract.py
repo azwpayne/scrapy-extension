@@ -25,3 +25,12 @@ def test_documented_core_surfaces_are_top_level_exports() -> None:
     for name, value in expected.items():
         assert name in scrapy_extension.__all__
         assert getattr(scrapy_extension, name) is value
+
+
+def test_new_kafka_topic_generation_enum_has_consistent_exports() -> None:
+    import scrapy_extension
+    from scrapy_extension.settings import KafkaTopicNameGeneration
+
+    assert "KafkaTopicNameGeneration" in scrapy_extension.__all__
+    assert scrapy_extension.KafkaTopicNameGeneration is KafkaTopicNameGeneration
+    assert KafkaTopicNameGeneration.V2.value == "v2"

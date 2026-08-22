@@ -13,6 +13,7 @@ import ipaddress
 from typing import NoReturn
 
 from scrapy_extension.exceptions.base import ConfigurationError
+from scrapy_extension.settings._endpoint_validation import parse_endpoint_port
 
 KAFKA_BROKER_ENDPOINTS_ERROR = (
     "Kafka broker endpoints must be a comma-separated list of valid host[:port] values."
@@ -37,21 +38,19 @@ def _raise_invalid_rocketmq_endpoints() -> NoReturn:
     )
 
 
-def _contains_forbidden_characters(value: str) -> bool:
+def _contains_forbidden_characters(value: object) -> bool:
     """Reject controls and non-ASCII before a parser can reinterpret them."""
+    if type(value) is not str:
+        return True
     return not value.isascii() or any(
         ord(character) < 32 or ord(character) == 127 for character in value
     )
 
 
 def _parse_port(value: str) -> str | None:
-    """Return a valid ASCII TCP port, or ``None`` for an invalid value."""
-    if not value or not value.isascii() or not value.isdigit():
-        return None
-    port = int(value)
-    if not 1 <= port <= 65535:
-        return None
-    return value
+    """Return a canonical valid ASCII TCP port, or ``None`` if invalid."""
+    port = parse_endpoint_port(value)
+    return str(port) if port is not None else None
 
 
 def _parse_ipv4(value: str) -> str | None:
@@ -178,7 +177,7 @@ def _parse_kafka_endpoint(value: str) -> str | None:
 
 def normalize_kafka_broker_endpoints(value: object, setting_name: str) -> str:
     """Validate and canonicalize one comma-separated Kafka endpoint string."""
-    if not isinstance(value, str):
+    if type(value) is not str:
         _raise_invalid_kafka_endpoints(setting_name)
     if _contains_forbidden_characters(value):
         _raise_invalid_kafka_endpoints(setting_name)
@@ -218,7 +217,7 @@ def normalize_rocketmq_namesrv_endpoints(value: object) -> str:
     list of IPv4 addresses.  Rejecting all other forms before client import
     prevents its ambiguous address resolver from reaching a network call.
     """
-    if not isinstance(value, str) or _contains_forbidden_characters(value):
+    if type(value) is not str or _contains_forbidden_characters(value):
         _raise_invalid_rocketmq_endpoints()
     parsed: list[tuple[str, str]] = []
     for member in value.split(";"):

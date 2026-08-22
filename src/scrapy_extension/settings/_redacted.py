@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
 from importlib import import_module
 from typing import Annotated, Any, NoReturn, cast, get_args, get_origin
@@ -34,6 +35,8 @@ _SAFE_SETTINGS_ERROR_NAMES: frozenset[str] = frozenset(
 _SAFE_SETTINGS_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
     {
         "api_key and basic-auth (username/password) are mutually exclusive; remove one authentication method.",
+        "basic authentication requires both username and password; set 'password'.",
+        "basic authentication requires both username and password; set 'username'.",
         "api_key must not be blank when supplied.",
         "password must not be blank when supplied.",
         "Authenticated Pulsar connections require 'pulsar+ssl://' transport.",
@@ -43,6 +46,20 @@ _SAFE_SETTINGS_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
         "Kafka CONFLUENT mode requires 'confluent_api_key' to be set. Without them the client could fall back to an unauthenticated SDK transport.",
         "Kafka CONFLUENT mode requires 'confluent_api_key and confluent_api_secret' to be set. Without them the client could fall back to an unauthenticated SDK transport.",
         "Kafka CONFLUENT mode requires 'confluent_api_secret' to be set. Without them the client could fall back to an unauthenticated SDK transport.",
+        (
+            "Kafka CONFLUENT mode does not accept TLS material "
+            "(ssl_cafile / ssl_certfile / ssl_keyfile) because the backend builds "
+            "a fixed SASL_SSL client that drops it; a private-CA pin would "
+            "silently never reach the SDK."
+        ),
+        (
+            "Kafka CONFLUENT mode does not accept an explicit security_protocol "
+            "because the backend builds a fixed SASL_SSL client that overrides "
+            "it; leave security_protocol unset (recommended) — an explicit "
+            "'SASL_SSL' additionally requires full SASL material "
+            "(sasl_mechanism and sasl_username/sasl_password) that the fixed "
+            "client overrides anyway, and is not recommended."
+        ),
         "Kafka TLS connections require ssl_check_hostname=True.",
         "Kafka TLS client authentication requires both certificate and key files.",
         KAFKA_BROKER_ENDPOINTS_ERROR,
@@ -69,6 +86,36 @@ _SAFE_SETTINGS_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
         "Remote Pulsar TLS connections require hostname verification.",
         "Remote Redis TLS connections require ssl_check_hostname=True.",
         "Remote standalone HTTP endpoints require allow_remote_http=True. Use this override only for an explicitly trusted private network.",
+        (
+            "Remote unauthenticated plaintext Elasticsearch connections require "
+            "allow_remote_plaintext=True. Enable TLS or use this override only "
+            "for a trusted private network."
+        ),
+        (
+            "Remote unauthenticated plaintext Kafka connections require "
+            "allow_remote_plaintext=True. Enable TLS or use this override only "
+            "for a trusted private network."
+        ),
+        (
+            "Remote unauthenticated plaintext MongoDB connections require "
+            "allow_remote_plaintext=True. Enable TLS or use this override only "
+            "for a trusted private network."
+        ),
+        (
+            "Remote unauthenticated plaintext Pulsar connections require "
+            "allow_remote_plaintext=True. Enable TLS or use this override only "
+            "for a trusted private network."
+        ),
+        (
+            "Remote unauthenticated plaintext Redis connections require "
+            "allow_remote_plaintext=True. Enable TLS or use this override only "
+            "for a trusted private network."
+        ),
+        (
+            "Remote unauthenticated plaintext RocketMQ connections require "
+            "allow_remote_plaintext=True. Enable TLS or use this override only "
+            "for a trusted private network."
+        ),
         "Remote or authenticated Elasticsearch TLS requires verify_certs=True.",
         "Authenticated RocketMQ connections require tls_enabled=True.",
         "Cloud mode requires access_key and secret_key.",
@@ -83,13 +130,43 @@ _SAFE_SETTINGS_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
         "Kafka CONFLUENT mode requires a real Confluent Cloud endpoint: set 'confluent_bootstrap_servers' (e.g. pkc-xxx.us-east-1.aws.confluent.cloud:9092) or override 'bootstrap_servers' with a real endpoint. An empty, whitespace, or localhost:9092 (the STANDALONE default) value cannot reach Confluent Cloud.",
         "Kafka QueueBackend requires acks=1 or acks='all'; acks=0 cannot confirm broker acceptance.",
         "Kafka acks must be 1 or 'all', not a boolean.",
+        "Kafka group_id must be a non-empty string.",
+        (
+            "KafkaBackend requires enable_auto_commit=False because queue "
+            "delivery completion is controlled by QueueBackend.ack(); enabling "
+            "Kafka auto-commit can commit a request before Scrapy processes it."
+        ),
+        "PLAIN authentication requires sasl_username.",
+        "PLAIN authentication requires sasl_password.",
+        "SCRAM-SHA-256 authentication requires sasl_username.",
+        "SCRAM-SHA-256 authentication requires sasl_password.",
+        "SCRAM-SHA-512 authentication requires sasl_username.",
+        "SCRAM-SHA-512 authentication requires sasl_password.",
+        "confluent_api_key must be a string when explicitly configured.",
+        "confluent_api_key must be non-empty when explicitly configured.",
+        "confluent_api_secret must be a string when explicitly configured.",
+        "confluent_api_secret must be non-empty when explicitly configured.",
+        "sasl_username must be a string when explicitly configured.",
+        "sasl_username must be non-empty when explicitly configured.",
+        "sasl_password must be a string when explicitly configured.",
+        "sasl_password must be non-empty when explicitly configured.",
+        "max_priority_partitions must be an integer greater than or equal to 1.",
+        "num_partitions must be an integer greater than or equal to 1.",
+        "replication_factor must be an integer greater than or equal to 1.",
+        "retention_ms must be an integer greater than or equal to 0.",
+        "min_insync_replicas must be an integer greater than or equal to 1.",
         "Memcached host must be a bare hostname or IP address.",
         "Memcached host must be a non-empty hostname or IP address.",
+        "Memcached host must be a valid DNS name, IPv4 address, or IPv6 address.",
         "Memcached host must not include a port or URL scheme.",
         "Memcached port must be between 1 and 65535.",
         "Memcached timeout must be finite, greater than 0, and at most 86400 seconds.",
         "MongoDB 'auth_source' must be a non-empty string.",
         "MongoDB 'database' name must be a non-empty string.",
+        "MongoDB 'database' name contains unsupported characters.",
+        "MongoDB 'database' name must be a non-empty string of at most 63 UTF-8 bytes.",
+        "MongoDB 'database' name must be at most 63 UTF-8 bytes.",
+        "MongoDB 'database' name must be valid UTF-8 and at most 63 bytes.",
         "MongoDB 'password' must be a string or SecretStr.",
         "MongoDB 'password' must be non-empty.",
         "MongoDB 'replica_set_name' must be a non-empty string when set.",
@@ -104,10 +181,12 @@ _SAFE_SETTINGS_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
         "MongoDB URI must not contain fragments.",
         "MongoDB URI must not contain proxy query options.",
         "MongoDB URI must not contain userinfo; configure username/password settings instead.",
+        "MongoDB URI must not contain whitespace or control characters.",
         "MongoDB URI must not disable TLS certificate or hostname verification.",
         "MongoDB auth_mechanism is unsupported.",
         "MongoDB capability collection names must be built-in strings.",
         "MongoDB capability collection names must be non-empty.",
+        "MongoDB capability collection names must not use '$', NUL, or the reserved 'system.' namespace.",
         "MongoDB external authentication requires auth_source='$external'.",
         "MongoDB mode is unsupported.",
         "MongoDB mutations require an acknowledged write concern (w >= 1).",
@@ -124,42 +203,92 @@ _SAFE_SETTINGS_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
         "MongoDB w_timeout_ms must be a non-negative integer or None.",
         "OAUTHBEARER is unsupported because this backend does not expose the token-provider object required by kafka-python.",
         "Pulsar service_url must not contain URL userinfo; configure auth_token separately.",
+        "Pulsar subscription_name must use 1-255 ASCII name characters.",
         "tls_trust_certs_file requires a pulsar+ssl:// service_url.",
         "tls_validate_hostname applies only to pulsar+ssl:// and must remain true for plaintext.",
         "verify_certs=False is invalid when every Elasticsearch host uses http://.",
         "RabbitMQ CLUSTER mode requires 'cluster_nodes' to be set (a non-empty list of host:port). Without it the client connects to a single host:port, losing cluster topology.",
+        (
+            "RabbitMQ cluster_nodes require mode='cluster' or "
+            "mode='mirrored_queues'. STANDALONE mode connects to a single "
+            "host:port and would silently ignore the configured nodes, so they "
+            "are rejected rather than ignored — remove cluster_nodes or switch "
+            "the mode."
+        ),
         "RabbitMQ IPv6 cluster nodes with a port must use '[IPv6]:port'.",
         "RabbitMQ MIRRORED_QUEUES mode requires 'ha_mode' to be set (one of: all, exactly, nodes). Without it the connect path silently skips HA policy setup — the queue is non-mirrored despite the mode name.",
         "RabbitMQ TLS client authentication requires both certificate and key files.",
         "RabbitMQ TLS requires CERT_REQUIRED certificate and hostname verification.",
+        "RabbitMQ TLS setting 'ssl_cafile' cannot be blank.",
+        "RabbitMQ TLS setting 'ssl_certfile' cannot be blank.",
+        "RabbitMQ TLS setting 'ssl_keyfile' cannot be blank.",
         "RabbitMQ URL must include a host.",
+        "RabbitMQ URL must contain a valid DNS or IP host.",
+        "RabbitMQ URL must not contain a query or fragment.",
+        "RabbitMQ URL port must be between 1 and 65535.",
         "RabbitMQ URL userinfo is not allowed; use explicit credential settings.",
+        "RabbitMQ URL virtual host contains an invalid percent escape.",
         "RabbitMQ cluster node has an invalid bracketed IPv6 host.",
         "RabbitMQ cluster node must use '[IPv6]:port' syntax.",
         "RabbitMQ cluster node port cannot be empty.",
         "RabbitMQ cluster node port must be an integer.",
         "RabbitMQ cluster node port must be between 1 and 65535.",
         "RabbitMQ cluster nodes must be non-empty host or host:port values.",
+        "RabbitMQ cluster nodes must be a list or tuple of host:port values.",
+        "RabbitMQ cluster nodes must be valid host or host:port values.",
         "RabbitMQ connections outside loopback require verified TLS.",
         "RabbitMQ host must be a non-empty hostname or IP address.",
+        "RabbitMQ host must be a valid DNS name, IPv4 address, or IPv6 address.",
         "RabbitMQ does not implement byte-based prefetch; prefetch_size must be 0. A nonzero value is rejected by the broker and closes the channel at connect.",
         "RabbitMQ password must be explicitly set and cannot be blank.",
         "RabbitMQ port must be between 1 and 65535.",
         "RabbitMQ ssl_enabled must be a boolean.",
         "RabbitMQ username must be explicitly set and cannot be blank.",
+        "RabbitMQ virtual_host must be a non-empty value without whitespace or controls.",
         "RabbitMQ's guest user is restricted to loopback endpoints.",
         "Redis Cluster supports only database 0; use namespace for isolation.",
         "Redis TLS certificate settings require ssl_enabled=True.",
         "Redis TLS client authentication requires both certificate and key files.",
+        "Redis TLS setting 'ssl_cafile' cannot be blank.",
+        "Redis TLS setting 'ssl_certfile' cannot be blank.",
+        "Redis TLS setting 'ssl_keyfile' cannot be blank.",
+        "Redis 'password' must be non-empty.",
+        "Redis 'sentinel_password' must be non-empty.",
+        "Redis 'sentinel_username' must be non-empty.",
+        "Redis 'username' must be non-empty.",
         "Redis authentication outside a direct literal-loopback standalone connection requires ssl_check_hostname=True.",
         "Redis authentication outside a direct literal-loopback standalone connection requires ssl_enabled=True.",
         "Redis cluster_startup_nodes require mode='cluster'.",
+        "Redis setting 'cluster_max_redirects' requires mode='cluster'.",
+        "Redis setting 'cluster_skip_full_coverage_check' requires mode='cluster'.",
+        "Redis setting 'min_other_sentinels' requires mode='sentinel'.",
+        "Redis setting 'sentinel_master_name' requires mode='sentinel'.",
+        "Redis setting 'sentinel_password' requires mode='sentinel'.",
+        "Redis setting 'sentinel_retry_on_timeout' requires mode='sentinel'.",
+        "Redis setting 'sentinel_username' requires mode='sentinel'.",
         "Redis replica routing is unsupported; read_from_replicas must be false.",
         "Redis replica routing is unsupported; replicas must remain empty.",
         "Redis sentinels require mode='sentinel'.",
         "Redis setting 'masters' is unsupported; use cluster_startup_nodes.",
+        "Redis setting 'cluster_startup_nodes' contains an invalid address.",
+        "Redis setting 'host' contains an invalid address.",
+        "Redis setting 'port' contains an invalid address.",
+        "Redis setting 'replicas' contains an invalid address.",
+        "Redis setting 'sentinels' contains an invalid address.",
+        "Redis setting 'transport_endpoint' contains an invalid address.",
+        "Redis setting 'cluster_startup_nodes' must be a JSON endpoint list.",
+        "Redis setting 'replicas' must be a JSON endpoint list.",
+        "Redis setting 'sentinels' must be a JSON endpoint list.",
+        "Redis setting 'cluster_startup_nodes' must be a list of endpoints.",
+        "Redis setting 'replicas' must be a list of endpoints.",
+        "Redis setting 'sentinels' must be a list of endpoints.",
         "Remote Memcached uses an unauthenticated plaintext protocol. Set allow_remote_plaintext=True only for an explicitly trusted private network.",
         "RocketMQ 'consumer_group' must be non-empty.",
+        "RocketMQ topic_prefix must use 1-127 ASCII topic characters.",
+        "access_key must be a string when explicitly configured.",
+        "access_key must be non-empty when explicitly configured.",
+        "secret_key must be a string when explicitly configured.",
+        "secret_key must be non-empty when explicitly configured.",
         "SASL credentials require SASL_SSL; SASL_PLAINTEXT transmits them without TLS.",
         "STANDALONE mode requires at least one 'hosts' entry (e.g. http://host:9200 or https://host:9200). Got hosts=[]. CLOUD mode uses 'cloud_id' and does not require hosts.",
         "Selected backend type is not a registered backend type.",
@@ -181,6 +310,8 @@ _SAFE_SETTINGS_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
         "min_insync_replicas cannot exceed replication_factor.",
         "num_partitions and max_priority_partitions must match because Kafka priority values map directly to physical partitions.",
         "queue_index, set_index, and storage_index must be pairwise distinct so a capability clear cannot delete another capability's data.",
+        "Elasticsearch index names must start with a lowercase letter or digit and contain only lowercase letters, digits, dots, underscores, or hyphens.",
+        "DynamoDB table_name must be 3-255 letters, digits, dots, hyphens, or underscores.",
         "sasl_mechanism must be supported by this Kafka backend.",
         "secret_key is required when access_key is configured.",
         "security_protocol must be a supported Kafka protocol.",
@@ -193,10 +324,61 @@ _SAFE_SETTINGS_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
         "tls_validate_hostname must be a boolean.",
         "uri must start with 'mongodb://' or 'mongodb+srv://'.",
         "url must be a valid 'amqp://' or 'amqps://' connection URL.",
+        "url must use an ASCII AMQP authority without whitespace or controls.",
         "verify_certs must be enabled for authenticated standalone connections.",
+        "AWS credential policy flag must be a boolean.",
+        "AWS endpoint policy flags must be booleans.",
+        "Elasticsearch mode is unsupported.",
+        "Kafka mode is unsupported.",
+        "RabbitMQ cluster nodes must be a list of host or host:port values.",
+        "RabbitMQ mode is unsupported.",
+        "Redis db must be an integer.",
+        "Redis mode is unsupported.",
+        "Redis read_from_replicas must be a boolean.",
+        "Redis sentinel_master_name must be a string.",
+        "Redis ssl_check_hostname must be a boolean.",
+        "Redis ssl_enabled must be a boolean.",
+        "api_key must be a string when explicitly configured.",
+        "backpressure_pause_at must be an integer or None.",
+        "backpressure_resume_at must be an integer or None.",
+        "cloud_id must be a string when explicitly configured.",
+        "hosts must be a list of endpoint strings.",
+        "max_pool_size must be a positive integer.",
+        "min_pool_size must be a non-negative integer.",
+        "password must be a string when explicitly configured.",
+        "username must be a string when explicitly configured.",
+        "verify_certs must be a boolean.",
     }
     | _AWS_SAFE_CONFIGURATION_MESSAGES
 )
+# R141-F15: the Redis address validator appends an ``enumerate()`` position
+# (`` at index {n}``) to its otherwise-static message, so those variants
+# cannot be enumerated exactly. They are matched with anchored patterns whose
+# only non-static parts are the validator's hardcoded field names and a bare
+# non-negative decimal index — never caller input — so a match carries the
+# same safety guarantee as exact membership above; every other message still
+# collapses to the generic placeholder.
+_SAFE_SETTINGS_CONFIGURATION_MESSAGE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"Redis setting "
+        r"'(?:cluster_startup_nodes|replicas|sentinels)' "
+        r"contains an invalid address at index \d+\."
+    ),
+)
+
+
+def _settings_message_is_safe(message: object) -> bool:
+    """Return whether a validator message may cross the redaction boundary."""
+    if type(message) is not str:
+        return False
+    if message in _SAFE_SETTINGS_CONFIGURATION_MESSAGES:
+        return True
+    return any(
+        pattern.fullmatch(message)
+        for pattern in _SAFE_SETTINGS_CONFIGURATION_MESSAGE_PATTERNS
+    )
+
+
 _TRUSTED_SETTINGS_CLASSES: frozenset[tuple[str, str]] = frozenset(
     {
         ("scrapy_extension.settings.base", "Settings"),
@@ -595,8 +777,7 @@ class RedactedBaseSettings(BaseSettings):
                         if (
                             field_names
                             and type(original_message) is str
-                            and original_message
-                            in _SAFE_SETTINGS_CONFIGURATION_MESSAGES
+                            and _settings_message_is_safe(original_message)
                         )
                         else "Settings contain an invalid configuration value."
                     ),
@@ -711,8 +892,7 @@ class RedactedBaseSettings(BaseSettings):
                         if (
                             field_names
                             and type(original_message) is str
-                            and original_message
-                            in _SAFE_SETTINGS_CONFIGURATION_MESSAGES
+                            and _settings_message_is_safe(original_message)
                         )
                         else "Settings contain an invalid configuration value."
                     ),

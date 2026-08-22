@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 from enum import Enum
-from ipaddress import ip_address
 from math import isfinite
 from typing import Literal, cast
 
@@ -16,7 +15,9 @@ from pydantic_settings import SettingsConfigDict
 from typing_extensions import Self
 
 from scrapy_extension.exceptions.base import ConfigurationError
+from scrapy_extension.settings._endpoint_validation import parse_endpoint_host
 from scrapy_extension.settings._redacted import RedactedBaseSettings
+from scrapy_extension.settings._transport_security import is_loopback_host
 
 _MEMCACHED_MAX_TIMEOUT_SECONDS = 86_400.0
 _MEMCACHED_TIMEOUT_ERROR = (
@@ -35,40 +36,20 @@ class MemcachedMode(str, Enum):
 
 
 def normalize_memcached_host(host: object) -> str:
-    """Return a bare Memcached host without retaining malformed input."""
-    if not isinstance(host, str):
+    """Return a strict bare Memcached host without retaining malformed input."""
+    normalized = parse_endpoint_host(host)
+    if normalized is None:
         raise ConfigurationError(
-            "Memcached host must be a non-empty hostname or IP address.",
+            "Memcached host must be a valid DNS name, IPv4 address, or IPv6 address.",
             setting_name="host",
         )
-    normalized = host.strip()
-    if normalized.startswith("[") and normalized.endswith("]"):
-        normalized = normalized[1:-1]
-    if not normalized or any(char in normalized for char in "/@?#"):
-        raise ConfigurationError(
-            "Memcached host must be a bare hostname or IP address.",
-            setting_name="host",
-        )
-    try:
-        ip_address(normalized)
-    except ValueError:
-        if ":" in normalized:
-            raise ConfigurationError(
-                "Memcached host must not include a port or URL scheme.",
-                setting_name="host",
-            ) from None
     return normalized
 
 
 def is_memcached_loopback(host: str) -> bool:
     """Return whether ``host`` is confined to the local machine."""
-    normalized = normalize_memcached_host(host).lower().rstrip(".")
-    if normalized == "localhost":
-        return True
-    try:
-        return ip_address(normalized).is_loopback
-    except ValueError:
-        return False
+    normalized = normalize_memcached_host(host)
+    return is_loopback_host(normalized)
 
 
 def validate_memcached_connection(
@@ -84,7 +65,7 @@ def validate_memcached_connection(
             setting_name="mode",
         )
     normalized_host = normalize_memcached_host(host)
-    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+    if type(port) is not int or not 1 <= port <= 65535:
         raise ConfigurationError(
             "Memcached port must be between 1 and 65535.", setting_name="port"
         )
@@ -128,7 +109,7 @@ def validate_memcached_flush_policy(allow_flush_all: object) -> bool:
 
 def normalize_memcached_flush_setting(allow_flush_all: object) -> bool:
     """Parse canonical environment booleans without accepting broad coercions."""
-    if isinstance(allow_flush_all, str):
+    if type(allow_flush_all) is str:
         normalized = allow_flush_all.strip().lower()
         if normalized == "true":
             return True
@@ -193,6 +174,14 @@ class MemcachedSettings(RedactedBaseSettings):
             "default because Memcached cannot scope deletion to this application."
         ),
     )
+
+    @field_validator("host", mode="before")
+    @classmethod
+    def _validate_host(cls, value: object) -> str:
+        """Reject host subclasses before pydantic can normalize them."""
+        if type(value) is str and value == "":
+            return value
+        return normalize_memcached_host(value)
 
     @field_validator("allow_flush_all", mode="before")
     @classmethod

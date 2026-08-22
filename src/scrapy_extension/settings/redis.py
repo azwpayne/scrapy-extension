@@ -11,7 +11,7 @@ import re
 from collections.abc import Mapping
 from enum import Enum
 from ipaddress import IPv6Address, ip_address
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 
 from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_validator
 from pydantic.json_schema import SkipJsonSchema
@@ -69,7 +69,7 @@ def _parsed_ip(value: str) -> Any | None:
 
 def normalize_redis_host(host: object, *, setting_name: str = "host") -> str:
     """Return a canonical bare DNS/IP host without retaining malformed input."""
-    if not isinstance(host, str) or not host or not host.isascii():
+    if type(host) is not str or not host or not host.isascii():
         raise _redis_address_error(setting_name)
     if any(
         char.isspace() or ord(char) < 32 or ord(char) == 127 for char in host
@@ -124,11 +124,9 @@ def normalize_redis_port(
     index: int | None = None,
 ) -> int:
     """Return a strict Redis TCP port without retaining malformed input."""
-    if isinstance(port, bool):
-        raise _redis_address_error(setting_name, index=index)
-    if isinstance(port, int):
+    if type(port) is int:
         normalized = port
-    elif isinstance(port, str) and _ASCII_PORT.fullmatch(port):
+    elif type(port) is str and _ASCII_PORT.fullmatch(port):
         normalized = int(port)
     else:
         raise _redis_address_error(setting_name, index=index)
@@ -144,7 +142,7 @@ def parse_redis_endpoint(
     index: int | None = None,
 ) -> tuple[str, int]:
     """Parse strict ``host:port`` or ``[IPv6]:port`` endpoint syntax."""
-    if not isinstance(endpoint, str) or not endpoint or not endpoint.isascii():
+    if type(endpoint) is not str or not endpoint or not endpoint.isascii():
         raise _redis_address_error(setting_name, index=index)
     if any(
         char.isspace() or ord(char) < 32 or ord(char) == 127 for char in endpoint
@@ -195,8 +193,13 @@ def validate_redis_tls(
         "ssl_certfile": ssl_certfile,
         "ssl_keyfile": ssl_keyfile,
     }
+    if type(ssl_enabled) is not bool:
+        raise ConfigurationError(
+            "Redis ssl_enabled must be a boolean.",
+            setting_name="ssl_enabled",
+        )
     for setting_name, value in tls_paths.items():
-        if value is not None and not value.strip():
+        if value is not None and (type(value) is not str or not value.strip()):
             raise ConfigurationError(
                 f"Redis TLS setting '{setting_name}' cannot be blank.",
                 setting_name=setting_name,
@@ -223,6 +226,20 @@ def validate_redis_tls(
         )
 
 
+def _credential_has_content(value: str | SecretStr | None) -> bool:
+    """Return whether an authentication credential has non-whitespace content.
+
+    redis-py gates AUTH on bare truthiness, so a whitespace-only credential is
+    truthy and would be handed to the server verbatim. Authentication intent is
+    therefore decided on stripped text, not the mere presence of a value.
+    """
+    if value is None:
+        return False
+    if isinstance(value, SecretStr):
+        return bool(value.get_secret_value().strip())
+    return bool(value.strip())
+
+
 def validate_redis_transport_security(
     *,
     mode: RedisMode,
@@ -243,6 +260,13 @@ def validate_redis_transport_security(
     cannot prove that every eventual authenticated connection stays local.  The
     explicit plaintext exception is deliberately limited to standalone.
     """
+    if type(mode) is not RedisMode:
+        raise ConfigurationError("Redis mode is unsupported.", setting_name="mode")
+    if type(ssl_check_hostname) is not bool:
+        raise ConfigurationError(
+            "Redis ssl_check_hostname must be a boolean.",
+            setting_name="ssl_check_hostname",
+        )
     validate_redis_tls(
         ssl_enabled,
         ssl_cafile,
@@ -250,7 +274,7 @@ def validate_redis_transport_security(
         ssl_keyfile,
     )
     has_authentication = any(
-        value is not None
+        _credential_has_content(value)
         for value in (username, password, sentinel_username, sentinel_password)
     )
     is_direct_loopback = mode is RedisMode.STANDALONE and is_redis_loopback_host(host)
@@ -570,6 +594,72 @@ class RedisSettings(RedactedBaseSettings):
         """Validate the scalar port before Pydantic can retain malformed input."""
         return normalize_redis_port(value)
 
+    @field_validator("username", mode="after")
+    @classmethod
+    def _reject_blank_username(cls, value: str | None) -> str | None:
+        """R141-F5: reject empty/whitespace ``username`` — redis-py gates AUTH on bare
+        truthiness (``if self.credential_provider or (self.username or self.password)``)
+        and hands a blank username to the server verbatim, so a whitespace value
+        surfaces as an opaque ACL failure at connect time. None is allowed
+        (credential unset).
+        """
+        if value is not None and not value.strip():
+            raise ConfigurationError(
+                "Redis 'username' must be non-empty.",
+                setting_name="username",
+            )
+        return value
+
+    @field_validator("password", mode="after")
+    @classmethod
+    def _reject_blank_password(cls, value: SecretStr | None) -> SecretStr | None:
+        """R141-F5: reject empty/whitespace ``password`` — ``SecretStr('')`` is falsy
+        but ``SecretStr('  ')`` is truthy, so a whitespace password bypasses the
+        backend's blank check while an empty one makes redis-py silently skip AUTH
+        (the operator believes authentication is configured when it is not).
+        None is allowed (credential unset). ``setting_value`` is intentionally
+        omitted (secret — never surface in errors).
+        """
+        if value is not None and not value.get_secret_value().strip():
+            raise ConfigurationError(
+                "Redis 'password' must be non-empty.",
+                setting_name="password",
+            )
+        return value
+
+    @field_validator("sentinel_username", mode="after")
+    @classmethod
+    def _reject_blank_sentinel_username(cls, value: str | None) -> str | None:
+        """R141-F5: reject empty/whitespace ``sentinel_username`` — the Sentinel
+        control-plane client receives the value verbatim and a blank username
+        fails as an opaque ACL error at connect time. Same rationale as
+        ``username``. None is allowed (credential unset).
+        """
+        if value is not None and not value.strip():
+            raise ConfigurationError(
+                "Redis 'sentinel_username' must be non-empty.",
+                setting_name="sentinel_username",
+            )
+        return value
+
+    @field_validator("sentinel_password", mode="after")
+    @classmethod
+    def _reject_blank_sentinel_password(
+        cls, value: SecretStr | None
+    ) -> SecretStr | None:
+        """R141-F5: reject empty/whitespace ``sentinel_password`` — the Sentinel
+        client treats it exactly like the data-plane password, so a blank value
+        either silently skips control-plane AUTH or fails opaquely at connect.
+        None is allowed (credential unset). ``setting_value`` is intentionally
+        omitted (secret — never surface in errors).
+        """
+        if value is not None and not value.get_secret_value().strip():
+            raise ConfigurationError(
+                "Redis 'sentinel_password' must be non-empty.",
+                setting_name="sentinel_password",
+            )
+        return value
+
     @field_validator("replicas", "sentinels", "cluster_startup_nodes", mode="before")
     @classmethod
     def _normalize_endpoint_list(cls, value: object, info: ValidationInfo) -> list[str]:
@@ -577,7 +667,7 @@ class RedisSettings(RedactedBaseSettings):
         setting_name = info.field_name or "redis"
         decoded_value: object | None = None
         decode_failed = False
-        if isinstance(value, str):
+        if type(value) is str:
             try:
                 decoded_value = json.loads(value)
             except (TypeError, ValueError):
@@ -588,13 +678,14 @@ class RedisSettings(RedactedBaseSettings):
                     setting_name=setting_name,
                 )
             value = decoded_value
-        if not isinstance(value, (list, tuple)):
+        if type(value) not in (list, tuple):
             raise ConfigurationError(
                 f"Redis setting '{setting_name}' must be a list of endpoints.",
                 setting_name=setting_name,
             )
         normalized: list[str] = []
-        for index, endpoint in enumerate(value):
+        endpoints = cast(list[object] | tuple[object, ...], value)
+        for index, endpoint in enumerate(endpoints):
             host, port = parse_redis_endpoint(
                 endpoint,
                 setting_name=setting_name,
@@ -619,11 +710,31 @@ class RedisSettings(RedactedBaseSettings):
         Raises:
             ConfigurationError: If a SENTINEL-mode required field is missing.
         """
+        if type(self.mode) is not RedisMode:
+            raise ConfigurationError("Redis mode is unsupported.", setting_name="mode")
+        if type(self.sentinel_master_name) is not str:
+            raise ConfigurationError(
+                "Redis sentinel_master_name must be a string.",
+                setting_name="sentinel_master_name",
+            )
+        for field_name, value in (
+            ("sentinels", self.sentinels),
+            ("replicas", self.replicas),
+            ("cluster_startup_nodes", self.cluster_startup_nodes),
+        ):
+            if type(value) is not list:
+                raise ConfigurationError(
+                    f"Redis setting '{field_name}' must be a list of endpoints.",
+                    setting_name=field_name,
+                )
         if self.mode == RedisMode.SENTINEL:
             missing = []
             if not self.sentinels:
                 missing.append("sentinels")
-            if not self.sentinel_master_name.strip():
+            if (
+                type(self.sentinel_master_name) is not str
+                or not self.sentinel_master_name.strip()
+            ):
                 missing.append("sentinel_master_name")
             if missing:
                 fields = " and ".join(missing)
@@ -634,6 +745,8 @@ class RedisSettings(RedactedBaseSettings):
                     ),
                     setting_name=missing[0],
                 )
+        if type(self.db) is not int:
+            raise ConfigurationError("Redis db must be an integer.", setting_name="db")
         if self.mode == RedisMode.CLUSTER and self.db != 0:
             raise ConfigurationError(
                 "Redis Cluster supports only database 0; use namespace for isolation.",
@@ -685,6 +798,11 @@ class RedisSettings(RedactedBaseSettings):
                 "Redis replica routing is unsupported; replicas must remain empty.",
                 setting_name="replicas",
             )
+        if type(self.read_from_replicas) is not bool:
+            raise ConfigurationError(
+                "Redis read_from_replicas must be a boolean.",
+                setting_name="read_from_replicas",
+            )
         if self.read_from_replicas:
             raise ConfigurationError(
                 "Redis replica routing is unsupported; read_from_replicas must be false.",
@@ -711,8 +829,17 @@ class RedisSettings(RedactedBaseSettings):
         allow_remote_plaintext = validate_allow_remote_plaintext(
             self.allow_remote_plaintext
         )
+        # V2-2: reuse the same blank-aware helper as
+        # ``validate_redis_transport_security`` so the two authentication-intent
+        # definitions cannot drift. This is a conservative intent call, not a
+        # redis-py emulation: redis-py gates AUTH on bare truthiness and would
+        # hand a whitespace-only (truthy) credential to the server verbatim,
+        # but blank credentials do not demonstrate a deliberate
+        # remote-plaintext-exemption intent, so they must not count as
+        # authentication here (otherwise they would silently skip the
+        # remote-plaintext opt-in).
         has_authentication = any(
-            value is not None
+            _credential_has_content(value)
             for value in (
                 self.username,
                 self.password,

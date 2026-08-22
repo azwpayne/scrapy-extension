@@ -33,7 +33,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from scrapy_extension.exceptions import ConfigurationError
 from scrapy_extension.settings import (
@@ -42,6 +42,7 @@ from scrapy_extension.settings import (
     MongoDBSettings,
     PulsarSettings,
     RabbitMQSettings,
+    RedisMode,
     RedisSettings,
 )
 from scrapy_extension.settings.base import Settings
@@ -54,6 +55,7 @@ from scrapy_extension.settings.kafka import KafkaMode
 from scrapy_extension.settings.mongodb import MongoDBMode
 from scrapy_extension.settings.pulsar import PulsarMode
 from scrapy_extension.settings.rabbitmq import RabbitMQMode
+from scrapy_extension.settings.redis import validate_redis_transport_security
 from scrapy_extension.settings.rocketmq import RocketMQSettings
 from scrapy_extension.settings.sqs import SqsSettings
 
@@ -228,24 +230,22 @@ class TestRabbitMQLiterals:
         )
         assert s.ssl_verify_mode == value
 
-    def test_cluster_node_type_rejects_disk_typo(self) -> None:
-        """`"disk"` (should be `"disc"`) must reject."""
-        with pytest.raises(ValidationError):
+    def test_cluster_node_type_removed_is_rejected_as_extra(self) -> None:
+        """R141-F16: ``cluster_node_type`` was dead config (grep-verified zero
+        consumers in ``src/`` — the node type only steers broker-side clustering
+        via ``rabbitmqctl`` and never reached the AMQP client). The field is
+        removed; re-adding it must reject instead of being silently accepted
+        (``extra="forbid"``), mirroring the R25-H RocketMQ tombstone."""
+        with pytest.raises(ValidationError) as exc_info:
             RabbitMQSettings(
                 username="u",
                 password="p",
-                cluster_node_type="disk",  # type: ignore[arg-type]
+                cluster_node_type="disc",  # type: ignore[call-overload]
             )
-
-    @pytest.mark.parametrize("value", ["disc", "ram"])
-    def test_cluster_node_type_accepts_valid(self, value: str) -> None:
-        """Both RabbitMQ node types stay valid."""
-        s = RabbitMQSettings(
-            username="u",
-            password="p",
-            cluster_node_type=value,  # type: ignore[arg-type]
-        )
-        assert s.cluster_node_type == value
+        errors = exc_info.value.errors()
+        assert errors
+        assert all(error["type"] == "value_error" for error in errors)
+        assert all(error["loc"] == ("configuration",) for error in errors)
 
 
 class TestMongoDBLiterals:
@@ -707,6 +707,195 @@ class TestKafkaDeliveryPolicy:
         assert exc_info.value.setting_name == "num_partitions"
 
 
+class TestKafkaConfluentClientContract:
+    """R141-F6: CONFLUENT mode fails fast on client config it cannot honor.
+
+    The backend's CONFLUENT branch builds a fixed SASL_SSL/PLAIN client
+    (``_build_client_security_config``): ``ssl_cafile`` / ``ssl_certfile`` /
+    ``ssl_keyfile`` never reach the consumer/admin clients and any
+    ``security_protocol`` value is silently overridden. Pre-F6 both
+    configurations passed settings validation, so a pinned private CA
+    "succeeded" without ever reaching the SDK.
+    """
+
+    @pytest.mark.parametrize(
+        "setting_name", ["ssl_cafile", "ssl_certfile", "ssl_keyfile"]
+    )
+    def test_confluent_rejects_dropped_tls_material(self, setting_name: str) -> None:
+        """Validated CA/cert/key paths would be silently dropped by the fixed client."""
+        with pytest.raises(ConfigurationError) as exc_info:
+            KafkaSettings(
+                mode=KafkaMode.CONFLUENT,
+                confluent_api_key="key",  # type: ignore[arg-type]
+                confluent_api_secret="secret",  # type: ignore[arg-type]
+                confluent_bootstrap_servers="pkc-xxx.us-east-1.aws.confluent.cloud:9092",
+                **{setting_name: "/ca.pem"},
+            )
+        assert exc_info.value.setting_name == setting_name
+
+    def test_confluent_rejects_explicit_ssl_protocol(self) -> None:
+        """An explicit ``SSL`` protocol would be silently overridden (SASL_SSL)."""
+        with pytest.raises(ConfigurationError) as exc_info:
+            KafkaSettings(
+                mode=KafkaMode.CONFLUENT,
+                confluent_api_key="key",  # type: ignore[arg-type]
+                confluent_api_secret="secret",  # type: ignore[arg-type]
+                confluent_bootstrap_servers="pkc-xxx.us-east-1.aws.confluent.cloud:9092",
+                security_protocol="SSL",  # type: ignore[arg-type]
+            )
+        assert exc_info.value.setting_name == "security_protocol"
+
+    def test_confluent_accepts_explicit_sasl_ssl_protocol(self) -> None:
+        """The one protocol value the fixed client actually uses stays valid.
+
+        The pre-existing SASL coherence rules still apply to an explicit
+        ``SASL_SSL``: it must carry an explicit mechanism and password
+        credentials. F6 only forbids values the fixed client would override.
+        """
+        s = KafkaSettings(
+            mode=KafkaMode.CONFLUENT,
+            confluent_api_key="key",  # type: ignore[arg-type]
+            confluent_api_secret="secret",  # type: ignore[arg-type]
+            confluent_bootstrap_servers="pkc-xxx.us-east-1.aws.confluent.cloud:9092",
+            security_protocol="SASL_SSL",
+            sasl_mechanism="PLAIN",
+            sasl_username="user",
+            sasl_password="pw",  # type: ignore[arg-type]
+        )
+        assert s.security_protocol == "SASL_SSL"
+
+    def test_confluent_accepts_unset_default_protocol(self) -> None:
+        """An unset ``security_protocol`` keeps every existing CONFLUENT flow valid.
+
+        The field default is indistinguishable from an explicitly-set-to-default
+        value after the backend's capture-and-revalidate rebuild (``model_validate``
+        of a full ``__dict__`` marks every field as set), and the fixed client
+        overrides both identically — so only values that differ from BOTH the
+        default and the fixed ``SASL_SSL`` protocol are refused.
+        """
+        s = KafkaSettings(
+            mode=KafkaMode.CONFLUENT,
+            confluent_api_key="key",  # type: ignore[arg-type]
+            confluent_api_secret="secret",  # type: ignore[arg-type]
+            confluent_bootstrap_servers="pkc-xxx.us-east-1.aws.confluent.cloud:9092",
+        )
+        assert s.security_protocol == "PLAINTEXT"
+
+    def test_non_confluent_modes_keep_tls_material(self) -> None:
+        """STANDALONE/CLUSTER still pass CA material through to the client."""
+        s = KafkaSettings(security_protocol="SSL", ssl_cafile="/ca.pem")
+        assert s.ssl_cafile == "/ca.pem"
+
+    def test_confluent_contract_messages_are_static(self) -> None:
+        """Exact diagnostics pinned via the helper, outside the sanitize boundary."""
+        from scrapy_extension.settings.kafka import (
+            validate_kafka_confluent_client_contract,
+        )
+
+        with pytest.raises(ConfigurationError) as tls_error:
+            validate_kafka_confluent_client_contract(
+                KafkaMode.CONFLUENT, "SASL_SSL", "/ca.pem", None, None
+            )
+        assert tls_error.value.setting_name == "ssl_cafile"
+        assert "fixed SASL_SSL client" in str(tls_error.value)
+
+        with pytest.raises(ConfigurationError) as protocol_error:
+            validate_kafka_confluent_client_contract(
+                KafkaMode.CONFLUENT, "SSL", None, None, None
+            )
+        assert protocol_error.value.setting_name == "security_protocol"
+        assert "fixed SASL_SSL client" in str(protocol_error.value)
+
+    def test_confluent_protocol_hint_recommends_unset_not_sasl_ssl(self) -> None:
+        """V2-3: the hint must not steer users into the second-layer SASL error.
+
+        The old hint offered "leave security_protocol unset or set it to
+        'SASL_SSL'" as equal remedies, but an explicit 'SASL_SSL' trips the
+        SASL coherence rules (it demands an explicit mechanism plus password
+        credentials) which the fixed CONFLUENT client then overrides anyway —
+        a second error chasing a misdirection. The hint must recommend leaving
+        ``security_protocol`` unset and mark an explicit 'SASL_SSL' as
+        requiring material the fixed client overrides (not recommended).
+        """
+        from scrapy_extension.settings.kafka import (
+            validate_kafka_confluent_client_contract,
+        )
+
+        with pytest.raises(ConfigurationError) as exc_info:
+            validate_kafka_confluent_client_contract(
+                KafkaMode.CONFLUENT, "SSL", None, None, None
+            )
+        message = str(exc_info.value)
+        # Correct action first: leave the setting unset.
+        assert "leave security_protocol unset" in message
+        # The misdirection (unset and explicit SASL_SSL framed as equal
+        # remedies) must be gone.
+        assert "or set it to 'SASL_SSL'" not in message
+        # If set anyway: full SASL material is required and gets overridden
+        # by the fixed client, so it must be flagged as not recommended.
+        assert "SASL material" in message
+        assert "not recommended" in message
+
+
+class TestKafkaGroupIdContract:
+    """R141-F17: blank consumer identity is rejected at settings time.
+
+    Sibling backends reject blank identity fields (RocketMQ ``consumer_group``,
+    Pulsar ``subscription_name``); a blank Kafka ``group_id`` reaches
+    KafkaConsumer verbatim and surfaces as an opaque broker error at first
+    poll — later and less actionable than config time.
+    """
+
+    @pytest.mark.parametrize("group_id", ["", "   ", "\t\n "])
+    def test_blank_group_id_rejected(self, group_id: str) -> None:
+        with pytest.raises(ConfigurationError) as exc_info:
+            KafkaSettings(group_id=group_id)
+        assert exc_info.value.setting_name == "group_id"
+
+    def test_non_string_group_id_rejected(self) -> None:
+        """Non-str input raises the typed error family, not a pydantic failure."""
+        with pytest.raises(ConfigurationError) as exc_info:
+            KafkaSettings(group_id=123)  # type: ignore[arg-type]
+        assert not isinstance(exc_info.value, ValidationError)
+        assert exc_info.value.setting_name == "group_id"
+
+    def test_non_blank_group_id_accepted(self) -> None:
+        assert KafkaSettings(group_id="worker-1").group_id == "worker-1"
+        assert KafkaSettings().group_id == "scrapy-extension"
+
+
+class TestKafkaManualCommitContract:
+    """R141-F18: the settings layer enforces the queue ack contract up front.
+
+    Pre-F18 ``enable_auto_commit=True`` was presented as an available option
+    but every real ``KafkaBackend`` construction rejected it — the wrong
+    failure layer. The settings validator now raises the backend's exact
+    contract message at config time (the backend guard remains for duck-typed
+    configs).
+    """
+
+    _BACKEND_CONTRACT_MESSAGE = (
+        "KafkaBackend requires enable_auto_commit=False because queue "
+        "delivery completion is controlled by QueueBackend.ack(); enabling "
+        "Kafka auto-commit can commit a request before Scrapy processes it."
+    )
+
+    def test_enable_auto_commit_true_rejected_at_settings_layer(self) -> None:
+        with pytest.raises(ConfigurationError) as exc_info:
+            KafkaSettings(enable_auto_commit=True)
+        assert exc_info.value.setting_name == "enable_auto_commit"
+        # Until the G8 safe-list sync lands, the settings boundary substitutes
+        # its generic placeholder for the not-yet-safe-listed static message.
+        assert exc_info.value.args[0] in (
+            self._BACKEND_CONTRACT_MESSAGE,
+            "Settings contain an invalid configuration value.",
+        )
+
+    def test_enable_auto_commit_false_stays_the_only_valid_value(self) -> None:
+        assert KafkaSettings(enable_auto_commit=False).enable_auto_commit is False
+        assert KafkaSettings().enable_auto_commit is False
+
+
 class TestRabbitMQModeConditional:
     """RabbitMQSettings SV2 CLUSTER/MIRRORED_QUEUES validators."""
 
@@ -716,6 +905,30 @@ class TestRabbitMQModeConditional:
         with pytest.raises(ConfigurationError) as exc_info:
             RabbitMQSettings(username="u", password="p", mode=RabbitMQMode.CLUSTER)
         assert exc_info.value.setting_name == "cluster_nodes"
+
+    def test_standalone_rejects_cluster_nodes(self) -> None:
+        """R141-F16: STANDALONE + ``cluster_nodes`` must fail fast.
+
+        The standalone connect path dials ``host:port`` only, but the nodes
+        still counted as endpoints for TLS/guest classification — the security
+        posture and the actual connection surface disagreed (multi-node
+        config silently degraded to a single point). Non-selected topology
+        nodes fail rather than being ignored, mirroring the Redis mode-intent
+        rejection contract."""
+        with pytest.raises(ConfigurationError) as exc_info:
+            RabbitMQSettings(
+                username="u",
+                password="p",
+                mode=RabbitMQMode.STANDALONE,
+                cluster_nodes=["node2:5672"],
+            )
+        assert exc_info.value.setting_name == "cluster_nodes"
+
+    def test_standalone_without_cluster_nodes_remains_valid(self) -> None:
+        """STANDALONE without ``cluster_nodes`` is the plain single-node path."""
+        s = RabbitMQSettings(username="u", password="p")
+        assert s.mode == RabbitMQMode.STANDALONE
+        assert s.cluster_nodes == []
 
     def test_cluster_accepts_cluster_nodes(self) -> None:
         """CLUSTER mode + ``cluster_nodes`` is valid."""
@@ -748,6 +961,20 @@ class TestRabbitMQModeConditional:
             ha_mode="all",
         )
         assert s.ha_mode == "all"
+
+    def test_mirrored_queues_accepts_cluster_nodes(self) -> None:
+        """MIRRORED_QUEUES + ``cluster_nodes`` stays valid: the mirrored connect
+        path dials the full node list, so cluster_nodes remain consumed there
+        (only the STANDALONE non-selected-topology rejection is new)."""
+        s = RabbitMQSettings(
+            username="u",
+            password="p",
+            mode=RabbitMQMode.MIRRORED_QUEUES,
+            ha_mode="all",
+            cluster_nodes=["node2:5672"],
+            ssl_enabled=True,
+        )
+        assert s.cluster_nodes == ["node2:5672"]
 
     def test_mirrored_queues_ha_mode_whitespace_rejected(self) -> None:
         """R30-B: whitespace ``ha_mode`` must reject — the check used bare truthiness
@@ -859,26 +1086,25 @@ class TestPulsarServiceUrlScheme:
         """Valid ``pulsar://`` and ``pulsar+ssl://`` URLs stay accepted."""
         assert PulsarSettings(service_url=url).service_url == url
 
+    def test_service_url_keeps_scheme_case_migration_compatibility(self) -> None:
+        """Scheme case remains normalized when the authority is already strict."""
+        assert PulsarSettings(service_url="PULSAR://localhost:6650").service_url == (
+            "pulsar://localhost:6650"
+        )
+
     @pytest.mark.parametrize(
-        ("raw_url", "canonical_url"),
+        "service_url",
         [
-            (" Pulsar+SSL://broker:6651 ", "pulsar+ssl://broker:6651"),
-            ("PULSAR://one:6650, two:6650", "pulsar://one:6650,two:6650"),
+            " Pulsar+SSL://broker:6651 ",
+            "pulsar://one:6650, two:6650",
+            "pulsar://one:6650\\n",
         ],
     )
-    def test_service_url_canonicalizes_sdk_sensitive_syntax(
-        self,
-        raw_url: str,
-        canonical_url: str,
-    ) -> None:
-        """Normalize scheme case and endpoint whitespace before SDK construction."""
-        assert (
-            PulsarSettings(
-                service_url=raw_url,
-                allow_remote_plaintext=raw_url.strip().lower().startswith("pulsar://"),
-            ).service_url
-            == canonical_url
-        )
+    def test_service_url_rejects_authority_whitespace(self, service_url: str) -> None:
+        """Whitespace is not migrated or trimmed into an SDK authority."""
+        with pytest.raises(ConfigurationError) as exc_info:
+            PulsarSettings(service_url=service_url)
+        assert exc_info.value.setting_name == "service_url"
 
     def test_cluster_service_url_rejects_repeated_schemes(self) -> None:
         """The SDK expects one scheme followed by a comma-separated host list."""
@@ -1075,6 +1301,8 @@ class TestElasticSearchHostsScheme:
             "https://user:secret@es.example:9200",
             "https://es.example:9200?api_key=secret",
             "https://es.example:9200#secret",
+            "https://es%00.example:9200",
+            "https://es.example" + chr(127) + ":9200",
             "https://es.example:9200\n",
             "https:///missing-host",
             "https://es.example:not-a-port",
@@ -1109,6 +1337,31 @@ class TestElasticSearchCapabilityIsolation:
         assert exc_info.value.setting_name == "queue_index"
 
     @pytest.mark.parametrize("field", ["queue_index", "set_index", "storage_index"])
+    @pytest.mark.parametrize(
+        "invalid_name",
+        [
+            "Queue",
+            "queue*",
+            "queue/name",
+            "queue:name",
+            "queue#name",
+            "_queue",
+            "café",
+        ],
+    )
+    def test_index_names_reject_wildcards_and_driver_unsafe_syntax(
+        self, field: str, invalid_name: str
+    ) -> None:
+        """Index settings cannot retarget wildcard or another capability path."""
+        with pytest.raises(ConfigurationError) as exc_info:
+            ElasticSearchSettings(**{field: invalid_name})
+
+        error = exc_info.value
+        assert error.setting_name == field
+        assert invalid_name not in str(error)
+        assert error.__cause__ is None
+
+    @pytest.mark.parametrize("field", ["queue_index", "set_index", "storage_index"])
     def test_blank_index_rejected(self, field: str) -> None:
         with pytest.raises(ConfigurationError) as exc_info:
             ElasticSearchSettings(**{field: " \t "})
@@ -1119,6 +1372,23 @@ class TestElasticSearchCapabilityIsolation:
             queue_index="jobs", set_index="seen", storage_index="items"
         )
         assert settings.storage_index == "items"
+
+
+class TestDynamoDBTableName:
+    """DynamoDB table names are resource identifiers, not arbitrary strings."""
+
+    @pytest.mark.parametrize(
+        "table_name",
+        ["x", "", "table/name", "table?secret", "table name", "table\\x00name"],
+    )
+    def test_invalid_table_names_fail_before_client_io(self, table_name: str) -> None:
+        with pytest.raises(ConfigurationError) as exc_info:
+            DynamoDBSettings(table_name=table_name)
+
+        error = exc_info.value
+        assert error.setting_name == "table_name"
+        assert "secret" not in str(error)
+        assert error.__cause__ is None
 
 
 class TestAwsRegionNameFormat:
@@ -1460,6 +1730,111 @@ class TestSV3RedisSslRequiresCafile:
         s = RedisSettings()
         assert s.ssl_enabled is False
         assert s.ssl_cafile is None
+
+
+class TestRedisBlankCredentialsRejected:
+    """R141-F5: blank Redis credentials fail fast instead of half-authenticating.
+
+    All nine sibling backends reject blank credentials. redis-py gates AUTH on
+    bare truthiness (``if self.credential_provider or (self.username or
+    self.password)``), so an empty ``password`` silently skips AUTH (the operator
+    believes authentication is configured when it is not), while a whitespace
+    ``username`` reaches the server verbatim and fails as an opaque ACL error at
+    connect time.
+    """
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("username", "   "),
+            ("username", ""),
+            ("password", "   "),
+            ("password", ""),
+            ("sentinel_username", "   "),
+            ("sentinel_username", ""),
+            ("sentinel_password", "   "),
+            ("sentinel_password", ""),
+        ],
+    )
+    def test_blank_credential_rejected(self, field: str, value: str) -> None:
+        """Empty and whitespace-only credentials raise ``ConfigurationError``."""
+        kwargs: dict[str, object] = {"host": "localhost"}
+        if field.startswith("sentinel_"):
+            kwargs.update(
+                mode=RedisMode.SENTINEL,
+                sentinels=["localhost:26379"],
+            )
+        kwargs[field] = value
+        with pytest.raises(ConfigurationError) as exc_info:
+            RedisSettings(**kwargs)  # type: ignore[arg-type]
+        assert exc_info.value.setting_name == field
+        if value:
+            assert value not in str(exc_info.value)
+            assert value not in repr(exc_info.value)
+
+    def test_unset_and_non_blank_credentials_stay_valid(self) -> None:
+        """``None`` (credential unset) and real values remain accepted."""
+        standalone = RedisSettings(
+            host="localhost", username="acl-user", password="secret"
+        )
+        assert standalone.username == "acl-user"
+        sentinel = RedisSettings(
+            mode=RedisMode.SENTINEL,
+            sentinels=["localhost:26379"],
+            sentinel_username="sentinel-user",
+            sentinel_password="sentinel-secret",
+            ssl_enabled=True,
+            ssl_cafile="/tls/ca.pem",
+        )
+        assert sentinel.sentinel_username == "sentinel-user"
+
+    def test_blank_credentials_do_not_count_as_authentication_intent(self) -> None:
+        """``validate_redis_transport_security`` treats blanks as unset.
+
+        redis-py would never attempt AUTH with only-blank credentials, so a
+        blank value must not force the authenticated remote-TLS boundary either.
+        """
+        validate_redis_transport_security(
+            mode=RedisMode.STANDALONE,
+            host="redis.internal",
+            username="   ",
+            password=SecretStr(""),
+            sentinel_username="   ",
+            sentinel_password=SecretStr(""),
+            ssl_enabled=False,
+            ssl_cafile=None,
+            ssl_certfile=None,
+            ssl_keyfile=None,
+            ssl_check_hostname=True,
+        )
+
+    def test_model_validator_blank_credentials_do_not_count_as_authentication(
+        self,
+    ) -> None:
+        """V2-2: the model validator's ``has_authentication`` must be blank-aware.
+
+        The model validator computes its own authentication-intent flag for
+        the remote-plaintext opt-in gate. Presence-based checking
+        (``value is not None``) classified a blank credential as
+        authentication, drifting from ``validate_redis_transport_security``
+        (which uses the blank-aware ``_credential_has_content`` helper): a
+        blank password on a remote host would skip the
+        ``allow_remote_plaintext`` opt-in without ever counting as real AUTH.
+        Field validators reject blanks at construction time, so the drift is
+        pinned by exercising the model validator directly on an instance whose
+        credential is blank.
+        """
+        settings = RedisSettings(host="localhost")
+        object.__setattr__(settings, "host", "redis.internal")
+        object.__setattr__(settings, "password", SecretStr("   "))
+        with pytest.raises(ConfigurationError) as exc_info:
+            RedisSettings._validate_transport_security(settings)
+        assert exc_info.value.setting_name == "allow_remote_plaintext"
+        assert exc_info.value.args[0] == (
+            "Remote unauthenticated plaintext Redis connections require "
+            "allow_remote_plaintext=True. Enable TLS or use this override only "
+            "for a trusted private network."
+        )
 
 
 class TestSV3MongoPoolSizeOrdering:

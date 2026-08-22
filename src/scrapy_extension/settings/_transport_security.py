@@ -15,7 +15,7 @@ def is_loopback_host(host: object) -> bool:
     exact hostname (with at most one trailing dot) and strict literal loopback
     addresses receive the local-development exception.
     """
-    if not isinstance(host, str):
+    if type(host) is not str:
         return False
 
     candidate = host.lower()
@@ -47,7 +47,7 @@ def normalize_allow_remote_plaintext(value: object) -> bool:
     """Parse canonical environment booleans without accepting truthy lookalikes."""
     if type(value) is bool:
         return value
-    if isinstance(value, str):
+    if type(value) is str:
         normalized = value.strip().lower()
         if normalized == "true":
             return True

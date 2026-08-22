@@ -6,15 +6,16 @@
 # @desc    : Pulsar settings (subsystem ③ — new backend)
 from __future__ import annotations
 
+import re
 from enum import Enum
 from typing import Literal
-from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import SettingsConfigDict
 from typing_extensions import Self
 
 from scrapy_extension.exceptions.base import ConfigurationError
+from scrapy_extension.settings._endpoint_validation import parse_host_port_authority
 from scrapy_extension.settings._redacted import RedactedBaseSettings
 from scrapy_extension.settings._transport_security import (
     is_loopback_host,
@@ -24,15 +25,32 @@ from scrapy_extension.settings._transport_security import (
 )
 
 _VALID_PULSAR_SCHEMES: tuple[str, ...] = ("pulsar://", "pulsar+ssl://")
+_PULSAR_MAX_SUBSCRIPTION_NAME_CHARS = 255
+_PULSAR_SUBSCRIPTION_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_=:.\-]+$")
+
+
+def validate_pulsar_subscription_name(value: object) -> str:
+    """Validate a Pulsar subscription name before consumer creation."""
+    if (
+        type(value) is not str
+        or not value
+        or len(value) > _PULSAR_MAX_SUBSCRIPTION_NAME_CHARS
+        or _PULSAR_SUBSCRIPTION_NAME_PATTERN.fullmatch(value) is None
+    ):
+        raise ConfigurationError(
+            "Pulsar subscription_name must use 1-255 ASCII name characters.",
+            setting_name="subscription_name",
+        )
+    return value
 
 
 def _auth_token_value(value: object) -> str | None:
     """Extract a non-empty Pulsar token without retaining invalid input."""
     if value is None:
         return None
-    if isinstance(value, SecretStr):
+    if type(value) is SecretStr:
         token = value.get_secret_value()
-    elif isinstance(value, str):
+    elif type(value) is str:
         token = value
     else:
         raise ConfigurationError(
@@ -57,16 +75,15 @@ def validate_pulsar_connection(
 ) -> tuple[str, str | None, str | None, bool, bool]:
     """Validate and normalize one coherent Pulsar connection value set.
 
-    The returned token is raw for SDK use; callers that retain it must wrap it
-    in the backend's repr-redacting string type. Invalid URLs and credentials are
-    never attached to the raised exception.
+    Endpoint authorities are parsed without DNS resolution. The returned token
+    is raw for SDK use; callers that retain it must wrap it in the backend's
+    repr-redacting string type.
     """
-    if not isinstance(service_url, str):
+    if type(service_url) is not str:
         raise ConfigurationError(
             "service_url must be a string.", setting_name="service_url"
         )
-    url = service_url.strip()
-    lowered = url.lower()
+    lowered = service_url.lower()
     scheme = next(
         (
             candidate
@@ -80,70 +97,37 @@ def validate_pulsar_connection(
             "service_url must start with 'pulsar://' or 'pulsar+ssl://'.",
             setting_name="service_url",
         )
-    endpoint_text = url[len(scheme) :]
-    if "://" in endpoint_text:
+    endpoint_text = service_url[len(scheme) :]
+    if not endpoint_text or "://" in endpoint_text:
         raise ConfigurationError(
             "Pulsar cluster service_url must use a single scheme followed by a "
             "comma-separated endpoint list.",
             setting_name="service_url",
         )
-    endpoints = tuple(endpoint.strip() for endpoint in endpoint_text.split(","))
+    endpoints = tuple(endpoint_text.split(","))
     if not endpoints or any(not endpoint for endpoint in endpoints):
         raise ConfigurationError(
             "service_url must contain one or more non-empty Pulsar endpoints.",
             setting_name="service_url",
         )
-    if any("@" in endpoint for endpoint in endpoints):
-        raise ConfigurationError(
-            "Pulsar service_url must not contain URL userinfo; configure "
-            "auth_token separately.",
-            setting_name="service_url",
-        )
     endpoint_hosts: list[str] = []
+    normalized_endpoints: list[str] = []
     for endpoint in endpoints:
-        try:
-            parsed = urlsplit(f"//{endpoint}")
-            _ = parsed.port
-        except ValueError:
-            raise ConfigurationError(
-                "Each Pulsar endpoint must be a host with an optional valid port.",
-                setting_name="service_url",
-            ) from None
-        netloc = parsed.netloc
-        port_text = (
-            netloc[netloc.rfind("]") + 2 :]
-            if netloc.startswith("[")
-            and "]" in netloc
-            and len(netloc) > netloc.rfind("]") + 1
-            else netloc.rsplit(":", 1)[1]
-            if ":" in netloc
-            else None
-        )
-        if (
-            not parsed.hostname
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.path
-            or parsed.query
-            or parsed.fragment
-            or (
-                port_text is not None
-                and (
-                    not port_text.isascii()
-                    or not port_text.isdecimal()
-                    or not 1 <= int(port_text) <= 65535
-                )
-            )
-        ):
+        parsed_endpoint = parse_host_port_authority(endpoint)
+        if parsed_endpoint is None:
             raise ConfigurationError(
                 "Each Pulsar endpoint must be a host with an optional valid port.",
                 setting_name="service_url",
             )
-        assert parsed.hostname is not None
-        endpoint_hosts.append(parsed.hostname)
+        host, port = parsed_endpoint
+        endpoint_hosts.append(host)
+        endpoint_text_value = f"[{host}]" if ":" in host else host
+        if port is not None:
+            endpoint_text_value = f"{endpoint_text_value}:{port}"
+        normalized_endpoints.append(endpoint_text_value)
 
     if tls_trust_certs_file is not None and (
-        not isinstance(tls_trust_certs_file, str) or not tls_trust_certs_file.strip()
+        type(tls_trust_certs_file) is not str or not tls_trust_certs_file.strip()
     ):
         raise ConfigurationError(
             "tls_trust_certs_file must be a non-empty path when configured.",
@@ -164,7 +148,7 @@ def validate_pulsar_connection(
     )
 
     token = _auth_token_value(auth_token)
-    normalized_url = f"{scheme}{','.join(endpoints)}"
+    normalized_url = f"{scheme}{','.join(normalized_endpoints)}"
     endpoints_are_loopback = all(is_loopback_host(host) for host in endpoint_hosts)
     if scheme == "pulsar://":
         if tls_trust_certs_file is not None:
@@ -307,11 +291,27 @@ class PulsarSettings(RedactedBaseSettings):
         ),
     )
 
+    @field_validator("service_url", mode="before")
+    @classmethod
+    def _reject_service_url_subclasses(cls, value: object) -> str:
+        """Reject URL subclasses before pydantic can erase their identity."""
+        if type(value) is not str:
+            raise ConfigurationError(
+                "service_url must be a string.", setting_name="service_url"
+            )
+        return value
+
     @field_validator("allow_remote_plaintext", mode="before")
     @classmethod
     def _normalize_remote_plaintext_opt_in(cls, value: object) -> bool:
         """Accept canonical environment booleans but reject truthy lookalikes."""
         return normalize_allow_remote_plaintext(value)
+
+    @field_validator("subscription_name", mode="before")
+    @classmethod
+    def _validate_subscription_name(cls, value: object) -> str:
+        """Keep construction and connection-time subscription checks identical."""
+        return validate_pulsar_subscription_name(value)
 
     @model_validator(mode="after")
     def _validate_connection(self) -> Self:
@@ -321,8 +321,8 @@ class PulsarSettings(RedactedBaseSettings):
         opaque ``ValueError`` inside the pulsar client at connect. The SDK treats
         the scheme as case-sensitive and expects a cluster as one scheme followed
         by comma-separated endpoints (``pulsar://one:6650,two:6650``). Normalize
-        scheme case and surrounding endpoint whitespace here so every accepted
-        value is directly consumable by the client.
+        scheme case but reject whitespace and controls so every accepted value is
+        directly consumable by the client.
 
         Raises:
             ConfigurationError: if ``service_url`` does not start with a valid

@@ -6,7 +6,9 @@ ElasticSearch backend connections.
 
 from __future__ import annotations
 
+import re
 from enum import Enum
+from ipaddress import IPv6Address
 from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, field_validator, model_validator
@@ -23,6 +25,30 @@ from scrapy_extension.settings._transport_security import (
 )
 
 _VALID_ES_SCHEMES: frozenset[str] = frozenset({"http", "https"})
+_ES_INDEX_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+_ES_ZONE_ID_PATTERN = re.compile(r"^[A-Za-z0-9._~-]+$")
+_ELASTICSEARCH_INDEX_NAME_ERROR = (
+    "Elasticsearch index names must start with a lowercase letter or digit and "
+    "contain only lowercase letters, digits, dots, underscores, or hyphens."
+)
+
+
+def _has_safe_host_percent_encoding(netloc: object, hostname: object) -> bool:
+    """Allow only RFC 6874's ``%25zone`` form inside an IPv6 literal."""
+    if type(netloc) is not str or (hostname is not None and type(hostname) is not str):
+        return False
+    if "%" not in netloc:
+        return True
+    if hostname is None:
+        return False
+    address, delimiter, zone = hostname.partition("%25")
+    if not delimiter or "%" in zone or _ES_ZONE_ID_PATTERN.fullmatch(zone) is None:
+        return False
+    try:
+        IPv6Address(address)
+    except ValueError:
+        return False
+    return True
 
 
 class ElasticSearchMode(str, Enum):
@@ -166,6 +192,14 @@ class ElasticSearchSettings(RedactedBaseSettings):
         Raises:
             ConfigurationError: if any host entry lacks a valid scheme.
         """
+        if type(self.mode) is not ElasticSearchMode:
+            raise ConfigurationError(
+                "Elasticsearch mode is unsupported.", setting_name="mode"
+            )
+        if type(self.hosts) is not list:
+            raise ConfigurationError(
+                "hosts must be a list of endpoint strings.", setting_name="hosts"
+            )
         # R28-B: STANDALONE targets the cluster via ``hosts``; an empty list
         # (e.g. ``SCRAPY_ELASTICSEARCH_HOSTS=`` set to an empty value) otherwise
         # surfaces as an opaque elasticsearch-py client error at connect().
@@ -180,7 +214,7 @@ class ElasticSearchSettings(RedactedBaseSettings):
                 setting_name="hosts",
             )
         for host in self.hosts:
-            if not isinstance(host, str) or not host:
+            if type(host) is not str or not host:
                 raise ConfigurationError(
                     "each hosts entry must be a non-empty http:// or https:// endpoint.",
                     setting_name="hosts",
@@ -188,7 +222,9 @@ class ElasticSearchSettings(RedactedBaseSettings):
             # Check raw input before urlsplit(), which deliberately normalizes some
             # controls such as newlines. Do not include the host in an error because
             # URL userinfo/query strings may contain credentials.
-            if any(char.isspace() or ord(char) < 32 for char in host):
+            if any(
+                char.isspace() or ord(char) < 32 or ord(char) == 127 for char in host
+            ):
                 raise ConfigurationError(
                     "hosts entries must not contain whitespace or control characters.",
                     setting_name="hosts",
@@ -214,6 +250,7 @@ class ElasticSearchSettings(RedactedBaseSettings):
                 or parsed.password is not None
                 or parsed.query
                 or parsed.fragment
+                or not _has_safe_host_percent_encoding(parsed.netloc, parsed.hostname)
             ):
                 raise ConfigurationError(
                     "each hosts entry must be an http:// or https:// endpoint without "
@@ -225,6 +262,21 @@ class ElasticSearchSettings(RedactedBaseSettings):
     @model_validator(mode="after")
     def _validate_auth_completeness(self) -> Self:
         """Reject blank, partial, or ambiguous authentication before client setup."""
+        if self.api_key is not None and type(self.api_key) is not SecretStr:
+            raise ConfigurationError(
+                "api_key must be a string when explicitly configured.",
+                setting_name="api_key",
+            )
+        if self.password is not None and type(self.password) is not SecretStr:
+            raise ConfigurationError(
+                "password must be a string when explicitly configured.",
+                setting_name="password",
+            )
+        if self.username is not None and type(self.username) is not str:
+            raise ConfigurationError(
+                "username must be a string when explicitly configured.",
+                setting_name="username",
+            )
         api_key = self.api_key.get_secret_value() if self.api_key is not None else None
         password = (
             self.password.get_secret_value() if self.password is not None else None
@@ -268,9 +320,16 @@ class ElasticSearchSettings(RedactedBaseSettings):
             "storage_index": self.storage_index,
         }
         for name, value in indices.items():
-            if not value.strip():
+            if (
+                type(value) is not str
+                or not value.isascii()
+                or len(value) > 255
+                or _ES_INDEX_NAME_PATTERN.fullmatch(value) is None
+                or value in {".", ".."}
+            ):
                 raise ConfigurationError(
-                    f"{name} must not be blank.", setting_name=name
+                    _ELASTICSEARCH_INDEX_NAME_ERROR,
+                    setting_name=name,
                 )
         if len(set(indices.values())) != len(indices):
             raise ConfigurationError(
@@ -301,7 +360,16 @@ class ElasticSearchSettings(RedactedBaseSettings):
             ConfigurationError: If CLOUD mode is selected without ``cloud_id`` or
                 without any auth method.
         """
+        if type(self.mode) is not ElasticSearchMode:
+            raise ConfigurationError(
+                "Elasticsearch mode is unsupported.", setting_name="mode"
+            )
         if self.mode == ElasticSearchMode.CLOUD:
+            if self.cloud_id is not None and type(self.cloud_id) is not str:
+                raise ConfigurationError(
+                    "cloud_id must be a string when explicitly configured.",
+                    setting_name="cloud_id",
+                )
             if not self.cloud_id:
                 raise ConfigurationError(
                     "ElasticSearch CLOUD mode requires 'cloud_id' to be set.",
@@ -334,6 +402,16 @@ class ElasticSearchSettings(RedactedBaseSettings):
             ConfigurationError: if any host URL scheme is ``http://`` and either
                 ``api_key`` or ``password`` is set.
         """
+        if type(self.mode) is not ElasticSearchMode:
+            raise ConfigurationError(
+                "Elasticsearch mode is unsupported.", setting_name="mode"
+            )
+        if type(self.hosts) is not list or any(
+            type(host) is not str for host in self.hosts
+        ):
+            raise ConfigurationError(
+                "hosts must be a list of endpoint strings.", setting_name="hosts"
+            )
         # Cloud connections use ``cloud_id`` and never pass ``hosts`` to the
         # Elasticsearch client. The standalone localhost default is therefore not
         # a transport target in CLOUD mode and must not trigger this guard.
@@ -357,6 +435,20 @@ class ElasticSearchSettings(RedactedBaseSettings):
     @model_validator(mode="after")
     def _validate_tls_verification_and_intent(self) -> Self:
         """Require verified remote TLS and reject TLS settings the mode ignores."""
+        if type(self.mode) is not ElasticSearchMode:
+            raise ConfigurationError(
+                "Elasticsearch mode is unsupported.", setting_name="mode"
+            )
+        if type(self.hosts) is not list or any(
+            type(host) is not str for host in self.hosts
+        ):
+            raise ConfigurationError(
+                "hosts must be a list of endpoint strings.", setting_name="hosts"
+            )
+        if type(self.verify_certs) is not bool:
+            raise ConfigurationError(
+                "verify_certs must be a boolean.", setting_name="verify_certs"
+            )
         if self.mode is ElasticSearchMode.CLOUD:
             if self.ca_certs is not None:
                 raise ConfigurationError(
@@ -400,6 +492,16 @@ class ElasticSearchSettings(RedactedBaseSettings):
     @model_validator(mode="after")
     def _require_remote_unauthenticated_plaintext_opt_in(self) -> Self:
         """Require explicit acceptance before using remote anonymous HTTP."""
+        if type(self.mode) is not ElasticSearchMode:
+            raise ConfigurationError(
+                "Elasticsearch mode is unsupported.", setting_name="mode"
+            )
+        if type(self.hosts) is not list or any(
+            type(host) is not str for host in self.hosts
+        ):
+            raise ConfigurationError(
+                "hosts must be a list of endpoint strings.", setting_name="hosts"
+            )
         allow_remote_plaintext = validate_allow_remote_plaintext(
             self.allow_remote_plaintext
         )
