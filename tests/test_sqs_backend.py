@@ -371,6 +371,43 @@ class TestSqsConnect:
         assert b.is_connected() is True
         client.close.assert_not_called()
 
+    def test_legacy_warning_failure_does_not_retire_published_generation(
+        self, mocker
+    ) -> None:
+        b = _make_backend(queue_name_generation=SqsQueueNameGeneration.LEGACY_V1)
+        client = mocker.MagicMock(name="legacy-client")
+        _patch_client(mocker, return_value=client)
+        mocker.patch(
+            "scrapy_extension.backends.sqs.warnings.warn",
+            side_effect=KeyboardInterrupt("warning interrupted"),
+        )
+
+        b.connect()
+
+        assert b.is_connected() is True
+        assert b._generation is not None
+        assert b._generation.client is client
+        client.close.assert_not_called()
+
+    def test_same_thread_disconnect_during_client_construction_fences_candidate(
+        self, mocker
+    ) -> None:
+        backend = _make_backend()
+        candidate = mocker.MagicMock(name="candidate-client")
+        session = mocker.MagicMock(name="private-session")
+
+        def construct(_service: str, **_kwargs: object):
+            backend.disconnect()
+            return candidate
+
+        session.client.side_effect = construct
+        mocker.patch.object(boto3.session, "Session", return_value=session)
+
+        backend.connect()
+
+        assert backend.is_connected() is False
+        candidate.close.assert_called_once_with()
+
     def test_private_session_construction_failure_is_retryable(self, mocker) -> None:
         b = _make_backend()
         failure = RuntimeError("private Session construction failed")
@@ -476,6 +513,46 @@ class TestSqsConnect:
         b, client = _connected(mocker)
         b.disconnect()
         client.close.assert_called_once()
+        assert b.is_connected() is False
+
+    def test_disconnect_close_callback_is_idempotent_without_double_close(
+        self, mocker
+    ) -> None:
+        b, client = _connected(mocker)
+        client.close.side_effect = b.disconnect
+
+        b.disconnect()
+
+        assert b.is_connected() is False
+        assert b._generation is None
+        client.close.assert_called_once_with()
+
+    def test_connect_callback_reentry_fails_before_candidate_publication(
+        self, mocker
+    ) -> None:
+        b = _make_backend()
+        session = mocker.MagicMock(name="private-session")
+        candidate = mocker.MagicMock(name="candidate")
+        nested_errors: list[BackendConnectionError] = []
+
+        def construct(_service: str, **_kwargs: object):
+            try:
+                b.connect()
+            except BackendConnectionError as error:
+                nested_errors.append(error)
+            raise RuntimeError("candidate construction aborted")
+
+        session.client.side_effect = construct
+        mocker.patch.object(boto3.session, "Session", return_value=session)
+
+        with pytest.raises(BackendConnectionError) as exc_info:
+            b.connect()
+
+        assert str(exc_info.value) == "Failed to create SQS client."
+        assert len(nested_errors) == 1
+        assert str(nested_errors[0]) == "Failed to create SQS client."
+        assert nested_errors[0].__cause__ is None
+        candidate.close.assert_not_called()
         assert b.is_connected() is False
 
     def test_in_flight_overflow_warning_flag_resets_on_disconnect(self, mocker) -> None:
@@ -915,6 +992,20 @@ class TestSqsConnect:
 
 
 class TestSqsPushPop:
+    def test_disconnect_reentry_from_send_is_rejected_without_deadlock(
+        self, mocker
+    ) -> None:
+        backend, client = _connected(mocker)
+        client.send_message.side_effect = backend.disconnect
+
+        with pytest.raises(QueueError):
+            backend.push("queue1", b"payload")
+
+        assert backend.is_connected() is True
+        client.close.assert_not_called()
+        backend.disconnect()
+        client.close.assert_called_once_with()
+
     def test_disconnected_push_redacts_queue_context(self) -> None:
         b = _make_backend()
 
@@ -1790,11 +1881,25 @@ class TestSqsAckToken:
             t5,
         }  # dedup via __hash__
 
-    def test_token_repr_is_useful(self) -> None:
+    def test_token_repr_redacts_transport_fields(self) -> None:
         t = _SqsAckToken(queue_url="https://sqs/qA", receipt_handle="rh-1")
         r = repr(t)
-        assert "https://sqs/qA" in r
-        assert "rh-1" in r
+        assert "https://sqs/qA" not in r
+        assert "receipt_handle=<redacted>" in r
+        assert "rh-1" not in r
+
+    def test_token_repr_masks_live_shaped_receipt_handle(self) -> None:
+        # A real ReceiptHandle is opaque base64-ish text that matches no
+        # keyword/scheme heuristic, yet it authorizes DeleteMessage and
+        # visibility changes — mask it unconditionally (R141-F14), mirroring
+        # the Pulsar ack token's message_id treatment.
+        t = _SqsAckToken(
+            queue_url="https://sqs/qA",
+            receipt_handle="AQEBMASsILlagmFv0JkRJjY4RkI=",
+        )
+        r = repr(t)
+        assert "AQEBMASsILlagmFv0JkRJjY4RkI=" not in r
+        assert "receipt_handle=<redacted>" in r
 
     def test_token_uses_slots(self) -> None:
         t = _SqsAckToken(queue_url="u", receipt_handle="r")

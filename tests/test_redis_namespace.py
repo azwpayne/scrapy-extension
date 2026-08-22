@@ -87,6 +87,28 @@ def test_blocking_pop_polls_with_atomic_lua_instead_of_destructive_bzpop(
     client.pipeline.assert_not_called()
 
 
+@pytest.mark.parametrize("diagnostic_error", [None, RuntimeError("logger failed")])
+def test_orphaned_queue_member_is_discarded_without_retry(
+    mocker, diagnostic_error: BaseException | None
+) -> None:
+    """Lua's orphan status is a committed cleanup, not an ambiguous failure."""
+    from scrapy_extension.backends import redis as redis_module
+
+    backend, client = _connected_backend(mocker, namespace="crawler-a")
+    pop_script = mocker.MagicMock(return_value=[2, "opaque-sidecar-marker"])
+    client.register_script.return_value = pop_script
+    if diagnostic_error is not None:
+        mocker.patch.object(redis_module.logger, "debug", side_effect=diagnostic_error)
+
+    assert backend.pop("jobs") is None
+
+    pop_script.assert_called_once_with(
+        keys=["{crawler-a:queue:jobs}:items", "{crawler-a:queue:jobs}:payload"]
+    )
+    client.register_script.assert_called_once()
+    client.bzpopmin.assert_not_called()
+
+
 def test_all_set_operations_use_set_domain(mocker) -> None:
     """Every SetBackend operation must resolve through the set domain."""
     backend, client = _connected_backend(mocker, namespace="crawler-a")

@@ -684,10 +684,37 @@ class ElasticSearchBackend(Backend, QueueBackend, SetBackend, StorageBackend):
                 # Preserve narrowly scoped compatibility for code that populated the
                 # historical private mirrors. Adopt both into one atomic generation.
                 if injected_client is not None:
-                    snapshot = injected_snapshot or self._capture_connection_snapshot()
-                    injected_generation = self._build_generation(
-                        injected_client, snapshot
-                    )
+                    try:
+                        snapshot = (
+                            injected_snapshot or self._capture_connection_snapshot()
+                        )
+                        injected_generation = self._build_generation(
+                            injected_client, snapshot
+                        )
+                    except BackendConnectionError:
+                        self._abort_failed_connect(injected_client)
+                        raise
+                    except ConfigurationError:
+                        self._abort_failed_connect(injected_client)
+                        raise
+                    except Exception:
+                        # Keep compatibility injection under the same static
+                        # startup contract as a freshly constructed client; an
+                        # SDK/plugin exception must not escape with its endpoint,
+                        # credentials, or traceback graph.
+                        self._abort_failed_connect(injected_client)
+                        raise BackendConnectionError(
+                            "Failed to connect to Elasticsearch.",
+                            backend_type="elasticsearch",
+                        ) from None
+                    except BaseException:
+                        # A compatibility-injected client is still an owned
+                        # generation candidate.  If options() fails before the
+                        # generation is published, leave no half-connected mirror
+                        # behind and close it exactly once; preserve the original
+                        # control-flow error if cleanup also fails.
+                        self._abort_failed_connect(injected_client)
+                        raise
                     try:
                         with self._generation_condition:
                             self._generation = injected_generation

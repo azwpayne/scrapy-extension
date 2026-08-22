@@ -33,12 +33,14 @@ import warnings
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from functools import wraps
 from typing import Any
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
 
 try:
     import boto3
+    from botocore import UNSIGNED
     from botocore.config import Config as BotoConfig
 except ImportError as e:
     if not _is_missing_optional_dependency(e, "boto3"):
@@ -47,7 +49,7 @@ except ImportError as e:
         "SQS backend requires 'boto3'. Install with: pip install scrapy-extension[sqs]"
     ) from e
 
-from scrapy_extension.backends._redaction import _redact
+from scrapy_extension.backends._redaction import _diagnostic_repr, _redact
 from scrapy_extension.backends.base import (
     Backend,
     BackendType,
@@ -71,6 +73,7 @@ from scrapy_extension.settings import (
 )
 from scrapy_extension.settings._aws import (
     _AWS_SAFE_CONFIGURATION_MESSAGES,
+    is_remote_http_endpoint,
     validate_aws_credentials,
     validate_aws_endpoint,
     validate_aws_region_name,
@@ -135,6 +138,32 @@ _QUEUE_MISSING_CODES = frozenset(
 )
 
 
+def _sqs_connect_reentry_boundary(function: Callable[..., Any]) -> Callable[..., Any]:
+    """Reject connect callbacks that would recursively take the non-reentrant lock."""
+
+    @wraps(function)
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        depth = int(getattr(self._connect_local, "depth", 0))
+        if depth:
+            raise BackendConnectionError(
+                "Cannot connect to SQS re-entrantly during connect.",
+                backend_type="sqs",
+            )
+        with self._generation_condition:
+            if self._disconnect_owner == threading.get_ident():
+                raise BackendConnectionError(
+                    "Cannot connect to SQS re-entrantly during disconnect.",
+                    backend_type="sqs",
+                )
+        self._connect_local.depth = depth + 1
+        try:
+            return function(self, *args, **kwargs)
+        finally:
+            self._connect_local.depth = depth
+
+    return wrapped
+
+
 def _is_queue_missing(exc: BaseException) -> bool:
     """Return whether an SQS client error specifically means queue missing."""
     response = getattr(exc, "response", None)
@@ -177,6 +206,13 @@ def _physical_queue_name(
     direct-or-hash behavior so operators can explicitly drain existing queues.
     The caller selects one generation; this function never dual-reads.
     """
+    # This helper is also used by ownership/tag code and is independently
+    # callable from tests and integrations.  Do not let a non-string value reach
+    # f-string concatenation: that would either publish a surprising physical
+    # identity or fail with an implementation ``TypeError`` rather than the
+    # stable naming contract.
+    if type(prefix) is not str or type(queue_name) is not str:
+        raise ValueError("SQS physical queue inputs must be strings.")
     if generation is SqsQueueNameGeneration.V2:
         digest = _length_prefixed_digest(
             _V2_QUEUE_NAME_DOMAIN, prefix, queue_name, digest_size=20
@@ -356,9 +392,14 @@ class _SqsAckToken:
         return hash((self.queue_url, self.receipt_handle, id(self.generation_key)))
 
     def __repr__(self) -> str:
+        # QueueUrl is transport material and goes through the shared diagnostic
+        # filter.  ReceiptHandle authorizes DeleteMessage / visibility changes
+        # for its delivery and its real shape (opaque base64-ish text) matches
+        # no keyword/scheme heuristic, so it is masked unconditionally —
+        # mirroring the Pulsar ack token's message_id treatment.
         return (
-            f"_SqsAckToken(queue_url={self.queue_url!r}, "
-            f"receipt_handle={self.receipt_handle!r})"
+            f"_SqsAckToken(queue_url={_diagnostic_repr(self.queue_url)}, "
+            "receipt_handle=<redacted>)"
         )
 
 
@@ -429,6 +470,10 @@ class SqsBackend(Backend, QueueBackend):
     def __init__(self, config: SqsSettings) -> None:
         self.config = config
         self._connect_lock = threading.Lock()
+        self._connect_local = threading.local()
+        self._lease_local = threading.local()
+        self._disconnect_owner: int | None = None
+        self._lifecycle_epoch = 0
         self._generation_condition = threading.Condition()
         self._generation: _SqsClientGeneration | None = None
         # Compatibility mirrors for diagnostics and older tests. Internal
@@ -509,12 +554,21 @@ class SqsBackend(Backend, QueueBackend):
             queue_name_generation=queue_name_generation,
             visibility_timeout=visibility_timeout,
         )
+        # A permitted remote HTTP endpoint is intentionally anonymous.  A private
+        # Session still resolves boto3's ambient environment/profile/metadata chain,
+        # so explicitly disable botocore signing rather than allowing those
+        # credentials to authenticate the plaintext request.
+        config_kwargs: dict[str, Any] = {
+            "ignore_configured_endpoint_urls": True,
+        }
+        if is_remote_http_endpoint(endpoint_url):
+            config_kwargs["signature_version"] = UNSIGNED
         kwargs: dict[str, Any] = {
             "region_name": region_name,
             # SQS endpoint policy belongs to the validated settings snapshot.
             # Ignore AWS_ENDPOINT_URL[_SQS] and shared-config endpoint overrides so
             # an ambient HTTP URL cannot bypass the cloud-mode TLS guard.
-            "config": BotoConfig(ignore_configured_endpoint_urls=True),
+            "config": BotoConfig(**config_kwargs),
         }
         if endpoint_url is not None:
             kwargs["endpoint_url"] = endpoint_url
@@ -535,6 +589,7 @@ class SqsBackend(Backend, QueueBackend):
         safe_messages=_SQS_SAFE_CONFIGURATION_MESSAGES,
         pass_through_exception_types=(BackendConnectionError,),
     )
+    @_sqs_connect_reentry_boundary
     def connect(self) -> None:
         """Publish one immutable SQS client generation, idempotently.
 
@@ -545,6 +600,7 @@ class SqsBackend(Backend, QueueBackend):
             with self._generation_condition:
                 if self._generation is not None:
                     return
+                request_epoch = self._lifecycle_epoch
             snapshot, kwargs = self._capture_connection_snapshot()
             candidate: Any | None = None
             generation: _SqsClientGeneration | None = None
@@ -560,11 +616,16 @@ class SqsBackend(Backend, QueueBackend):
                     key=object(), session=session, client=candidate, snapshot=snapshot
                 )
                 with self._generation_condition:
-                    self._generation = generation
-                    self._client = candidate
-                    self._queue_urls = generation.queue_urls
-                    self._queue_lifecycles = generation.queue_lifecycles
-                    self._queue_lifecycles_lock = generation.cache_lock
+                    publish = (
+                        request_epoch == self._lifecycle_epoch
+                        and self._generation is None
+                    )
+                    if publish:
+                        self._generation = generation
+                        self._client = candidate
+                        self._queue_urls = generation.queue_urls
+                        self._queue_lifecycles = generation.queue_lifecycles
+                        self._queue_lifecycles_lock = generation.cache_lock
                     self._generation_condition.notify_all()
             except BaseException as error:
                 # ``session.client`` has already opened the candidate by the time a
@@ -591,20 +652,37 @@ class SqsBackend(Backend, QueueBackend):
                 # Raise outside the driver exception handler so endpoint/credential
                 # text cannot survive through ``__cause__`` or ``__context__``.
                 raise startup_error
+            if not publish:
+                # A same-thread disconnect callback can fence a private candidate
+                # without waiting on the non-reentrant connect lock. It is no longer
+                # eligible for publication and must not emit success diagnostics.
+                if candidate is not None:
+                    try:
+                        candidate.close()
+                    except BaseException:
+                        pass
+                return
             # Publication is the linearization point. Deprecation is reported only
             # for a validated legacy generation that actually became authoritative;
             # constructor-only configuration and failed connection attempts do not
             # warn. An explicit reconnect reports the newly captured generation.
             if snapshot.queue_name_generation is SqsQueueNameGeneration.LEGACY_V1:
-                warnings.warn(
-                    (
-                        "SQS legacy_v1 physical queue-name mapping is deprecated and "
-                        "must be used only to drain existing queues before an atomic "
-                        "worker switch to v2."
-                    ),
-                    FutureWarning,
-                    stacklevel=1,
-                )
+                # Warning filters are application code and may raise.  Publication
+                # already committed ownership of this client, so a warning failure
+                # must not report a false failed connect or cause a later cleanup
+                # path to close a live generation.
+                try:
+                    warnings.warn(
+                        (
+                            "SQS legacy_v1 physical queue-name mapping is deprecated and "
+                            "must be used only to drain existing queues before an atomic "
+                            "worker switch to v2."
+                        ),
+                        FutureWarning,
+                        stacklevel=1,
+                    )
+                except BaseException:
+                    pass
             # A success diagnostic runs strictly after publication, so even a
             # control-flow failure from a logging extension must not make ``connect``
             # report failure or discard the now-authoritative generation.
@@ -613,11 +691,65 @@ class SqsBackend(Backend, QueueBackend):
             except BaseException:
                 pass
 
+    @contextmanager
+    def _disconnect_barrier(self) -> Iterator[bool]:
+        """Own teardown without allowing same-thread lifecycle deadlocks."""
+        current_thread = threading.get_ident()
+        with self._generation_condition:
+            if self._disconnect_owner == current_thread:
+                # A client.close() callback may call disconnect() again.  The outer
+                # teardown already detached admission and owns cleanup; treating the
+                # nested call as an idempotent no-op avoids taking _connect_lock twice.
+                yield False
+                return
+            if int(getattr(self._lease_local, "depth", 0)):
+                raise BackendConnectionError(
+                    "Cannot disconnect SQS re-entrantly from an active operation.",
+                    backend_type="sqs",
+                )
+            connecting_reentrantly = int(getattr(self._connect_local, "depth", 0))
+
+        # A same-thread connect callback cannot wait on _connect_lock. It can still
+        # fence the epoch; the private candidate will observe that fence before
+        # publication and close itself. Peer teardown retains the historical
+        # single-flight boundary and waits for client construction to finish.
+        if connecting_reentrantly:
+            with self._generation_condition:
+                if self._disconnect_owner == current_thread:
+                    yield False
+                    return
+                self._disconnect_owner = current_thread
+            try:
+                yield True
+            finally:
+                with self._generation_condition:
+                    if self._disconnect_owner == current_thread:
+                        self._disconnect_owner = None
+                        self._generation_condition.notify_all()
+            return
+
+        with self._connect_lock:
+            with self._generation_condition:
+                if self._disconnect_owner == current_thread:
+                    yield False
+                    return
+                self._disconnect_owner = current_thread
+            try:
+                yield True
+            finally:
+                with self._generation_condition:
+                    if self._disconnect_owner == current_thread:
+                        self._disconnect_owner = None
+                        self._generation_condition.notify_all()
+
     def disconnect(self) -> None:
         """Detach, drain, and close the current SQS client generation."""
         primary_error: BaseException | None = None
-        with self._connect_lock:
+        with self._disconnect_barrier() as owns_barrier:
+            if not owns_barrier:
+                return
             with self._generation_condition:
+                self._lifecycle_epoch += 1
                 generation = self._generation
                 if generation is not None:
                     generation.accepting = False
@@ -681,15 +813,22 @@ class SqsBackend(Backend, QueueBackend):
         if not leased:
             yield None
             return
-        # ``generation`` was narrowed by the active lease.
+        # ``generation`` was narrowed by the active lease.  Track ownership in
+        # thread-local state so disconnect() can reject same-thread re-entry
+        # instead of waiting forever for this lease to release.
         assert generation is not None  # noqa: S101  # nosec B101
+        previous_depth = int(getattr(self._lease_local, "depth", 0))
+        self._lease_local.depth = previous_depth + 1
         try:
             yield generation
         finally:
-            with self._generation_condition:
-                generation.active_leases -= 1
-                if generation.active_leases == 0:
-                    self._generation_condition.notify_all()
+            try:
+                with self._generation_condition:
+                    generation.active_leases -= 1
+                    if generation.active_leases == 0:
+                        self._generation_condition.notify_all()
+            finally:
+                self._lease_local.depth = previous_depth
 
     def is_connected(self) -> bool:
         """Return True if the client has been created."""

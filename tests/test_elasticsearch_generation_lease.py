@@ -78,6 +78,38 @@ def _wait_for_disconnect_entry(backend: ElasticSearchBackend) -> None:
         )
 
 
+@pytest.mark.parametrize("control_flow", [False, True])
+def test_injected_client_failure_is_closed_before_connect_retries(
+    mocker: Any, control_flow: bool
+) -> None:
+    """A compatibility mirror cannot survive a failed mutation-view build."""
+    backend = ElasticSearchBackend(ElasticSearchSettings())
+    client = mocker.MagicMock()
+    failure: BaseException = (
+        KeyboardInterrupt("options interrupted")
+        if control_flow
+        else RuntimeError("options failed")
+    )
+    client.options.side_effect = failure
+    backend._client = client
+    backend._connection_snapshot = backend._capture_connection_snapshot()
+
+    expected_type = KeyboardInterrupt if control_flow else BackendConnectionError
+    with pytest.raises(expected_type) as raised:
+        backend.connect()
+
+    if control_flow:
+        assert raised.value is failure
+    else:
+        assert "options failed" not in str(raised.value)
+    assert backend._client is None
+    assert backend._generation is None
+    assert backend._connection_snapshot is None
+    assert backend._connecting is False
+    assert backend._connect_owner is None
+    client.close.assert_called_once_with()
+
+
 def test_push_lease_keeps_client_open_until_sdk_call_finishes(mocker: Any) -> None:
     backend, client = _injected_backend(mocker, queue_index="queue-a")
     entered = threading.Event()

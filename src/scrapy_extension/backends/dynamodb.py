@@ -21,14 +21,18 @@ import math
 import threading
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal
+from functools import wraps
 from typing import Any
 
 from scrapy_extension.backends._optional import _is_missing_optional_dependency
 
 try:
     import boto3
+    from botocore import UNSIGNED
     from botocore.config import Config as BotoConfig
 except ImportError as e:
     if not _is_missing_optional_dependency(e, "boto3"):
@@ -56,10 +60,12 @@ from scrapy_extension.exceptions.base import StorageError
 from scrapy_extension.settings import DynamoDBMode, DynamoDBSettings
 from scrapy_extension.settings._aws import (
     _AWS_SAFE_CONFIGURATION_MESSAGES,
+    is_remote_http_endpoint,
     validate_aws_credentials,
     validate_aws_endpoint,
     validate_aws_region_name,
 )
+from scrapy_extension.settings.dynamodb import validate_dynamodb_table_name
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +79,7 @@ _DYNAMODB_SAFE_CONFIGURATION_MESSAGES: frozenset[str] = frozenset(
     {
         "Unsupported DynamoDB mode.",
         _DYNAMODB_INVALID_LEGACY_CLEAR_OVERRIDE,
+        "DynamoDB table_name must be 3-255 letters, digits, dots, hyphens, or underscores.",
     }
     | _AWS_SAFE_CONFIGURATION_MESSAGES
 )
@@ -139,6 +146,28 @@ _DYNAMODB_SAFE_STORAGE_MESSAGES: frozenset[str] = frozenset(
 )
 _MISSING = object()
 _DDB_USABLE_TABLE_STATUSES = frozenset({"ACTIVE", "UPDATING"})
+
+
+def _dynamodb_connect_reentry_boundary(
+    function: Any,
+) -> Any:
+    """Reject callbacks that would recursively take the connect lock."""
+
+    @wraps(function)
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        depth = int(getattr(self._connect_local, "depth", 0))
+        if depth:
+            raise BackendConnectionError(
+                "Cannot connect to DynamoDB re-entrantly during connect.",
+                backend_type="dynamodb",
+            )
+        self._connect_local.depth = depth + 1
+        try:
+            return function(self, *args, **kwargs)
+        finally:
+            self._connect_local.depth = depth
+
+    return wrapped
 
 
 class _DynamoDBConnectCancelled(Exception):
@@ -319,6 +348,12 @@ class DynamoDBBackend(Backend, StorageBackend):
         # disconnect cannot close a Resource until its admitted operation exits.
         self._operation_lock = threading.RLock()
         self._connect_lock = threading.Lock()
+        self._disconnect_lock = threading.Lock()
+        self._lifecycle_state_lock = threading.Lock()
+        self._connect_local = threading.local()
+        self._operation_local = threading.local()
+        self._disconnecting = False
+        self._disconnect_owner: int | None = None
         self._lifecycle_epoch = 0
         self._generation: _DynamoDBGeneration | None = None
         # Compatibility/diagnostic mirrors. Internal operations use only the
@@ -334,8 +369,13 @@ class DynamoDBBackend(Backend, StorageBackend):
     def _raise_if_connect_cancelled(self, request_epoch: int) -> None:
         """Stop a stale candidate before its next externally visible SDK step."""
         with self._operation_lock:
-            if request_epoch != self._lifecycle_epoch or self._generation is not None:
-                raise _DynamoDBConnectCancelled
+            cancelled = (
+                request_epoch != self._lifecycle_epoch or self._generation is not None
+            )
+        with self._lifecycle_state_lock:
+            disconnecting = self._disconnecting
+        if cancelled or disconnecting:
+            raise _DynamoDBConnectCancelled
 
     @configuration_error_boundary(
         "DynamoDB configuration is invalid.",
@@ -348,7 +388,7 @@ class DynamoDBBackend(Backend, StorageBackend):
     ) -> tuple[_DynamoDBConnectionSnapshot, dict[str, Any]]:
         """Capture and revalidate every value consumed by one connect attempt."""
         mode = self.config.mode
-        table_name = self.config.table_name
+        table_name = validate_dynamodb_table_name(self.config.table_name)
         access_key = self.config.aws_access_key_id
         secret_key = self.config.aws_secret_access_key
         allow_remote_http = self.config.allow_remote_http
@@ -386,12 +426,21 @@ class DynamoDBBackend(Backend, StorageBackend):
             allow_unfenced_legacy_clear=allow_unfenced_legacy_clear,
             allow_remote_http=allow_remote_http,
         )
+        # A permitted remote HTTP endpoint is intentionally anonymous.  A private
+        # Session still resolves boto3's ambient environment/profile/metadata chain,
+        # so explicitly disable botocore signing rather than allowing those
+        # credentials to authenticate the plaintext request.
+        config_kwargs: dict[str, Any] = {
+            "ignore_configured_endpoint_urls": True,
+        }
+        if is_remote_http_endpoint(endpoint_url):
+            config_kwargs["signature_version"] = UNSIGNED
         kwargs: dict[str, Any] = {
             "region_name": region_name,
             # The endpoint policy belongs to this validated snapshot. Ignore
             # AWS_ENDPOINT_URL[_DYNAMODB] and shared-config endpoint overrides so an
             # ambient HTTP URL cannot bypass the cloud-mode transport guard.
-            "config": BotoConfig(ignore_configured_endpoint_urls=True),
+            "config": BotoConfig(**config_kwargs),
         }
         if endpoint_url is not None:
             kwargs["endpoint_url"] = endpoint_url
@@ -708,6 +757,7 @@ class DynamoDBBackend(Backend, StorageBackend):
         safe_messages=_DYNAMODB_SAFE_CONFIGURATION_MESSAGES,
         pass_through_exception_types=(BackendConnectionError,),
     )
+    @_dynamodb_connect_reentry_boundary
     def connect(self) -> None:
         """Privately prepare and atomically publish one table generation.
 
@@ -718,6 +768,18 @@ class DynamoDBBackend(Backend, StorageBackend):
             BackendConnectionError: If the resource/table cannot be set up.
             ConfigurationError: If the captured configuration is invalid.
         """
+        current_thread = threading.get_ident()
+        with self._lifecycle_state_lock:
+            if self._disconnect_owner == current_thread:
+                raise BackendConnectionError(
+                    "Cannot connect to DynamoDB re-entrantly during disconnect.",
+                    backend_type="dynamodb",
+                )
+            if self._disconnecting:
+                raise BackendConnectionError(
+                    "Cannot connect to DynamoDB while disconnecting.",
+                    backend_type="dynamodb",
+                )
         request_epoch, already_connected = self._capture_connect_intent()
         if already_connected:
             return
@@ -770,6 +832,8 @@ class DynamoDBBackend(Backend, StorageBackend):
                         request_epoch == self._lifecycle_epoch
                         and self._generation is None
                     )
+                    with self._lifecycle_state_lock:
+                        publish = publish and not self._disconnecting
                     if publish:
                         self._publish_generation_locked(candidate)
             except BaseException:
@@ -801,16 +865,70 @@ class DynamoDBBackend(Backend, StorageBackend):
             except BaseException:
                 pass
 
+    @contextmanager
+    def _operation(self, operation: str) -> Iterator[None]:
+        """Serialize one Resource transaction and mark its owning thread."""
+        previous_depth = int(getattr(self._operation_local, "depth", 0))
+        if previous_depth:
+            raise BackendConnectionError(
+                f"Cannot run DynamoDB {operation} re-entrantly.",
+                backend_type="dynamodb",
+            )
+        with self._operation_lock:
+            with self._lifecycle_state_lock:
+                disconnecting = self._disconnecting
+            if disconnecting:
+                raise BackendConnectionError(
+                    f"Cannot run DynamoDB {operation} while disconnecting.",
+                    backend_type="dynamodb",
+                )
+            self._operation_local.depth = previous_depth + 1
+            try:
+                yield
+            finally:
+                self._operation_local.depth = previous_depth
+
+    @contextmanager
+    def _disconnect_barrier(self) -> Iterator[bool]:
+        """Own teardown and make driver close callbacks lifecycle-safe."""
+        current_thread = threading.get_ident()
+        with self._lifecycle_state_lock:
+            if self._disconnect_owner == current_thread:
+                yield False
+                return
+            if int(getattr(self._operation_local, "depth", 0)):
+                raise BackendConnectionError(
+                    "Cannot disconnect DynamoDB re-entrantly from an active operation.",
+                    backend_type="dynamodb",
+                )
+        with self._disconnect_lock:
+            with self._lifecycle_state_lock:
+                if self._disconnect_owner == current_thread:
+                    yield False
+                    return
+                self._disconnect_owner = current_thread
+                self._disconnecting = True
+            try:
+                yield True
+            finally:
+                with self._lifecycle_state_lock:
+                    if self._disconnect_owner == current_thread:
+                        self._disconnect_owner = None
+                        self._disconnecting = False
+
     def disconnect(self) -> None:
         """Fence connect intents, drain operations, and close the retired client."""
         close_failed = False
-        with self._operation_lock:
-            self._lifecycle_epoch += 1
-            generation = self._detach_generation_locked()
-            if generation is not None:
-                close_failed = self._close_resource(generation.resource)
-        if close_failed:
-            self._log_resource_close_diagnostic()
+        with self._disconnect_barrier() as owns_barrier:
+            if not owns_barrier:
+                return
+            with self._operation_lock:
+                self._lifecycle_epoch += 1
+                generation = self._detach_generation_locked()
+                if generation is not None:
+                    close_failed = self._close_resource(generation.resource)
+            if close_failed:
+                self._log_resource_close_diagnostic()
 
     def is_connected(self) -> bool:
         """Return True if a complete generation is currently published."""
@@ -819,7 +937,7 @@ class DynamoDBBackend(Backend, StorageBackend):
 
     def ping(self) -> bool:
         """Health check via table.load()."""
-        with self._operation_lock:
+        with self._operation("ping"):
             generation = self._generation
             if generation is None:
                 return False
@@ -964,7 +1082,7 @@ class DynamoDBBackend(Backend, StorageBackend):
             expire_at = math.ceil(time.time() + ttl)
             item["expire_at"] = expire_at
         _validate_item_size(key, data, expire_at)
-        with self._operation_lock:
+        with self._operation("store"):
             table = self._table_for_operation_locked("store", key)
             try:
                 table.put_item(Item=item)
@@ -1000,7 +1118,7 @@ class DynamoDBBackend(Backend, StorageBackend):
                 swallowed to ``return None``).
         """
         _validate_partition_key(key)
-        with self._operation_lock:
+        with self._operation("retrieve"):
             table = self._table_for_operation_locked("retrieve", key)
             try:
                 resp = table.get_item(Key={"pk": key}, ConsistentRead=True)
@@ -1050,7 +1168,7 @@ class DynamoDBBackend(Backend, StorageBackend):
                 "didn't exist", causing dedup re-emission).
         """
         _validate_partition_key(key)
-        with self._operation_lock:
+        with self._operation("delete"):
             table = self._table_for_operation_locked("delete", key)
             try:
                 resp = table.delete_item(Key={"pk": key}, ReturnValues="ALL_OLD")
@@ -1084,7 +1202,7 @@ class DynamoDBBackend(Backend, StorageBackend):
                 swallowed to ``return False``).
         """
         _validate_partition_key(key)
-        with self._operation_lock:
+        with self._operation("exists"):
             table = self._table_for_operation_locked("exists", key)
             try:
                 resp = table.get_item(Key={"pk": key}, ConsistentRead=True)
@@ -1120,7 +1238,7 @@ class DynamoDBBackend(Backend, StorageBackend):
                 swallowed to ``return None``).
         """
         _validate_partition_key(key)
-        with self._operation_lock:
+        with self._operation("ttl"):
             table = self._table_for_operation_locked("ttl", key)
             try:
                 resp = table.get_item(Key={"pk": key}, ConsistentRead=True)
@@ -1188,7 +1306,7 @@ class DynamoDBBackend(Backend, StorageBackend):
         # snapshot guard. Local storage operations and other clears cannot write into
         # an already-scanned page, and disconnect cannot retire or close this client's
         # generation during any conditional claim or delete RPC.
-        with self._operation_lock:
+        with self._operation("clear_storage"):
             generation = self._generation_for_operation_locked("clear_storage", None)
             table = generation.table
             try:

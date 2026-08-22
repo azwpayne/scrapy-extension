@@ -564,6 +564,18 @@ class TestMemcachedConnect:
         assert b.is_connected() is False
         assert b._connection_snapshot is None
 
+    def test_disconnect_close_callback_is_idempotent_without_double_close(
+        self, mocker
+    ) -> None:
+        backend, client = _connected(mocker)
+        client.close.side_effect = backend.disconnect
+
+        backend.disconnect()
+
+        assert backend.is_connected() is False
+        assert backend._connection_snapshot is None
+        client.close.assert_called_once_with()
+
 
 def test_locked_pymemcache_requires_explicit_reply_confirmation() -> None:
     """Pin the SDK default that makes backend-side opt-out load-bearing."""
@@ -587,6 +599,20 @@ def test_locked_pymemcache_requires_explicit_reply_confirmation() -> None:
 
 
 class TestMemcachedStorageOps:
+    def test_disconnect_reentry_from_storage_call_is_rejected_without_deadlock(
+        self, mocker
+    ) -> None:
+        backend, client = _connected(mocker)
+        client.get.side_effect = backend.disconnect
+
+        with pytest.raises(StorageError):
+            backend.retrieve("key")
+
+        assert backend.is_connected() is True
+        client.close.assert_not_called()
+        backend.disconnect()
+        client.close.assert_called_once_with()
+
     def test_single_socket_operations_do_not_overlap(self, mocker) -> None:
         backend, client = _connected(mocker)
         get_entered = Event()

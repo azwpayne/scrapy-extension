@@ -108,6 +108,18 @@ class TestDynamoDBConnect:
 
         assert exc_info.value.setting_name == "mode"
 
+    def test_mutated_invalid_table_name_fails_before_session_io(self, mocker) -> None:
+        b = _make_backend()
+        b.config.table_name = "table?endpoint-secret"
+        session_factory = mocker.patch.object(boto3.session, "Session")
+
+        with pytest.raises(ConfigurationError) as exc_info:
+            b.connect()
+
+        assert exc_info.value.setting_name == "table_name"
+        assert "endpoint-secret" not in str(exc_info.value)
+        session_factory.assert_not_called()
+
     def test_connect_loads_existing_table(self, mocker) -> None:
         b, table = _connected(mocker)
         table.load.assert_called_once()

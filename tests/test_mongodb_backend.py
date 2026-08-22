@@ -648,6 +648,20 @@ def test_mongodb_connect_rejects_mutated_collection_collision_before_sdk_io(
     client.assert_not_called()
 
 
+def test_mongodb_connect_rejects_reserved_collection_name_before_sdk_io(mocker):
+    config = MongoDBSettings()
+    config.storage_collection = "system.users"
+    backend = MongoDBBackend(config)
+    client = mocker.patch("scrapy_extension.backends.mongodb.MongoClient")
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        backend.connect()
+
+    assert exc_info.value.setting_name == "collection_names"
+    assert "system.users" not in str(exc_info.value)
+    client.assert_not_called()
+
+
 @pytest.mark.parametrize("name_type", [_IdentityString, _UnhashableString])
 def test_mongodb_connect_rejects_non_builtin_collection_names_before_sdk_io(
     mocker,

@@ -718,6 +718,44 @@ def test_clear_refresh_barrier_failure_is_indeterminate(
         assert calls == ["refresh", "delete_by_query", "refresh"]
 
 
+def test_pop_response_loss_after_delete_is_indeterminate_and_not_retried(
+    mocker: Any,
+) -> None:
+    """A lost delete response cannot be reissued against an unknown item."""
+    backend, client = _mock_backend(mocker)
+    client.search.return_value = {
+        "timed_out": False,
+        "_shards": _READ_SHARDS,
+        "hits": {
+            "total": {"value": 1, "relation": "eq"},
+            "hits": [
+                {
+                    "_id": "doc-1",
+                    "_seq_no": 3,
+                    "_primary_term": 2,
+                    "_source": {"item": "cGF5bG9hZA=="},
+                }
+            ],
+        },
+    }
+    client.delete.side_effect = TransportError("response lost with private marker")
+
+    with pytest.raises(QueueOutcomeIndeterminateError) as exc_info:
+        backend.pop("jobs")
+
+    assert type(exc_info.value) is QueueOutcomeIndeterminateError
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert "private marker" not in str(exc_info.value)
+    client.delete.assert_called_once_with(
+        index="scrapy_queue",
+        id="doc-1",
+        if_seq_no=3,
+        if_primary_term=2,
+    )
+    client.search.assert_called_once()
+
+
 @pytest.mark.parametrize(
     ("operation", "response", "expected_error"),
     (

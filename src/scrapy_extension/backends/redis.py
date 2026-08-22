@@ -1298,9 +1298,8 @@ class RedisBackend(Backend, QueueBackend, SetBackend, StorageBackend):
             # script removed it atomically; the next blocking poll can make progress.
             try:
                 logger.debug(
-                    "Orphaned member on %s: ZSET member had no sidecar payload. "
-                    "Discarding the stale member and returning None.",
-                    queue_name,
+                    "Orphaned Redis queue member had no sidecar payload; "
+                    "discarding the stale member and returning None."
                 )
             except BaseException:
                 # The stale member was already removed by the Lua transaction. A

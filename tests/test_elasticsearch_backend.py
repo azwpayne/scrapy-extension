@@ -357,6 +357,20 @@ class TestConnection:
         assert exc_info.value.setting_name == "queue_index"
         client_factory.assert_not_called()
 
+    def test_connect_rejects_mutated_wildcard_index_before_sdk_io(self, mocker):
+        """A wildcard cannot turn one capability operation into a multi-index target."""
+        config = ElasticSearchSettings()
+        config.queue_index = "queue*"
+        client_factory = mocker.patch(
+            "scrapy_extension.backends.elasticsearch.Elasticsearch"
+        )
+
+        with pytest.raises(ConfigurationError) as exc_info:
+            ElasticSearchBackend(config).connect()
+
+        assert exc_info.value.setting_name == "queue_index"
+        client_factory.assert_not_called()
+
     def test_live_client_keeps_original_capability_indices_after_mutation(self, mocker):
         """Live operations use the client generation's immutable index snapshot."""
         client = mocker.MagicMock(ping=mocker.MagicMock(return_value=True))

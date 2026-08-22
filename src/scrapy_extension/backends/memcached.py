@@ -18,8 +18,10 @@ pymemcache API used (stable):
 from __future__ import annotations
 
 import logging
+import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
 from threading import Lock
@@ -95,6 +97,28 @@ _MEMCACHED_CLEAR_STORAGE_CAPABILITY_MESSAGES: frozenset[str] = frozenset(
         _MEMCACHED_CLEAR_STORAGE_DISABLED_MESSAGE,
     }
 )
+
+
+def _memcached_connect_reentry_boundary(
+    function: Callable[..., Any],
+) -> Callable[..., Any]:
+    """Reject callbacks that would recursively take the connect lock."""
+
+    @wraps(function)
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        depth = int(getattr(self._connect_local, "depth", 0))
+        if depth:
+            raise BackendConnectionError(
+                "Cannot connect to Memcached re-entrantly during connect.",
+                backend_type="memcached",
+            )
+        self._connect_local.depth = depth + 1
+        try:
+            return function(self, *args, **kwargs)
+        finally:
+            self._connect_local.depth = depth
+
+    return wrapped
 
 
 def _validate_stats_response(response: object) -> Mapping[object, object]:
@@ -245,6 +269,11 @@ class MemcachedBackend(Backend, StorageBackend):
         # replies cannot cross-wire and teardown cannot race an active operation.
         self._operation_lock = Lock()
         self._connect_lock = Lock()
+        self._disconnect_lock = Lock()
+        self._connect_local = threading.local()
+        self._operation_local = threading.local()
+        self._disconnecting = False
+        self._disconnect_owner: int | None = None
         self._lifecycle_lock = Lock()
         self._lifecycle_generation = 0
 
@@ -287,6 +316,7 @@ class MemcachedBackend(Backend, StorageBackend):
         _MEMCACHED_CONFIGURATION_SETTING_NAMES,
         pass_through_exception_types=(BackendConnectionError,),
     )
+    @_memcached_connect_reentry_boundary
     def connect(self) -> None:
         """Connect to Memcached and verify with a stats() call.
 
@@ -299,6 +329,11 @@ class MemcachedBackend(Backend, StorageBackend):
         """
         with self._connect_lock:
             with self._lifecycle_lock:
+                if self._disconnecting:
+                    raise BackendConnectionError(
+                        "Cannot connect to Memcached while disconnecting.",
+                        backend_type="memcached",
+                    )
                 if self._client is not None:
                     return
                 generation = self._lifecycle_generation
@@ -340,14 +375,31 @@ class MemcachedBackend(Backend, StorageBackend):
                 # Raise outside the driver exception handler so endpoint/credential
                 # text cannot survive through ``__cause__`` or ``__context__``.
                 raise startup_error
-            with self._operation_lock:
-                with self._lifecycle_lock:
-                    # A concurrent disconnect fences this private probe by advancing the
-                    # lifecycle generation. Never resurrect a client after teardown.
-                    publish = generation == self._lifecycle_generation
-                    if publish:
-                        self._client = candidate
-                        self._connection_snapshot = snapshot
+            published = False
+            try:
+                with self._operation_lock:
+                    with self._lifecycle_lock:
+                        # A concurrent disconnect fences this private probe by advancing the
+                        # lifecycle generation. Never resurrect a client after teardown.
+                        publish = (
+                            generation == self._lifecycle_generation
+                            and not self._disconnecting
+                        )
+                        if publish:
+                            # Install the snapshot first; assigning _client last is
+                            # the mirror's ownership commit point.  An interruption
+                            # before that assignment leaves no live client to leak.
+                            self._connection_snapshot = snapshot
+                            self._client = candidate
+                            published = True
+            except BaseException:
+                # Publication is the ownership transfer.  If control flow is
+                # interrupted before that transfer, the private socket still belongs
+                # to this failed connect attempt and must be closed.  Conversely, a
+                # published candidate is live and must not be rolled back here.
+                if not published:
+                    _close_failed_candidate(candidate)
+                raise
             if not publish:
                 cleanup = _swallow()
                 with cleanup:
@@ -370,20 +422,73 @@ class MemcachedBackend(Backend, StorageBackend):
             except BaseException:
                 pass
 
-    def disconnect(self) -> None:
-        """Close the Memcached client."""
+    @contextmanager
+    def _operation(self, operation: str) -> Iterator[None]:
+        """Serialize one socket transaction and mark its owning thread."""
+        previous_depth = int(getattr(self._operation_local, "depth", 0))
+        if previous_depth:
+            raise BackendConnectionError(
+                f"Cannot run Memcached {operation} re-entrantly.",
+                backend_type="memcached",
+            )
         with self._operation_lock:
             with self._lifecycle_lock:
-                self._lifecycle_generation += 1
-                client = self._client
-                self._client = None
-                self._connection_snapshot = None
-            if client is not None:
-                cleanup = _swallow()
-                with cleanup:
-                    client.close()
-                if cleanup.did_suppress:
-                    _log_suppressed_cleanup_error()
+                if self._disconnecting:
+                    raise BackendConnectionError(
+                        f"Cannot run Memcached {operation} while disconnecting.",
+                        backend_type="memcached",
+                    )
+            self._operation_local.depth = previous_depth + 1
+            try:
+                yield
+            finally:
+                self._operation_local.depth = previous_depth
+
+    @contextmanager
+    def _disconnect_barrier(self) -> Iterator[bool]:
+        """Own teardown and make close callbacks idempotent instead of recursive."""
+        current_thread = threading.get_ident()
+        with self._lifecycle_lock:
+            if self._disconnect_owner == current_thread:
+                yield False
+                return
+            if int(getattr(self._operation_local, "depth", 0)):
+                raise BackendConnectionError(
+                    "Cannot disconnect Memcached re-entrantly from an active operation.",
+                    backend_type="memcached",
+                )
+        with self._disconnect_lock:
+            with self._lifecycle_lock:
+                if self._disconnect_owner == current_thread:
+                    yield False
+                    return
+                self._disconnect_owner = current_thread
+                self._disconnecting = True
+            try:
+                yield True
+            finally:
+                with self._lifecycle_lock:
+                    if self._disconnect_owner == current_thread:
+                        self._disconnect_owner = None
+                        self._disconnecting = False
+
+    def disconnect(self) -> None:
+        """Detach, drain, and close the Memcached client."""
+        with self._disconnect_barrier() as owns_barrier:
+            if not owns_barrier:
+                return
+            with self._operation_lock:
+                with self._lifecycle_lock:
+                    self._lifecycle_generation += 1
+                    client = self._client
+                    self._client = None
+                    self._connection_snapshot = None
+                if client is not None:
+                    cleanup = _swallow()
+                    with cleanup:
+                        client.close()
+                    if cleanup.did_suppress:
+                        _log_suppressed_cleanup_error()
 
     def is_connected(self) -> bool:
         """Return True if the client has been created."""
@@ -396,7 +501,7 @@ class MemcachedBackend(Backend, StorageBackend):
         Returns:
             True if stats() succeeds.
         """
-        with self._operation_lock:
+        with self._operation("ping"):
             with self._lifecycle_lock:
                 client = self._client
             if client is None:
@@ -434,7 +539,7 @@ class MemcachedBackend(Backend, StorageBackend):
         """
         _validate_key_name(key, "key")
         _validate_ttl(ttl)
-        with self._operation_lock:
+        with self._operation("store"):
             with self._lifecycle_lock:
                 client = self._client
             try:
@@ -479,7 +584,7 @@ class MemcachedBackend(Backend, StorageBackend):
                 silently swallowed to ``return None``).
         """
         _validate_key_name(key, "key")
-        with self._operation_lock:
+        with self._operation("retrieve"):
             with self._lifecycle_lock:
                 client = self._client
             try:
@@ -509,7 +614,7 @@ class MemcachedBackend(Backend, StorageBackend):
                 silently swallowed to ``return False``).
         """
         _validate_key_name(key, "key")
-        with self._operation_lock:
+        with self._operation("delete"):
             with self._lifecycle_lock:
                 client = self._client
             try:
@@ -539,7 +644,7 @@ class MemcachedBackend(Backend, StorageBackend):
                 silently swallowed to ``return False``).
         """
         _validate_key_name(key, "key")
-        with self._operation_lock:
+        with self._operation("exists"):
             with self._lifecycle_lock:
                 client = self._client
             try:
@@ -590,7 +695,7 @@ class MemcachedBackend(Backend, StorageBackend):
             raise NotImplementedError(
                 _MEMCACHED_CLEAR_STORAGE_PREFIX_UNSUPPORTED_MESSAGE
             )
-        with self._operation_lock:
+        with self._operation("clear_storage"):
             with self._lifecycle_lock:
                 client = self._client
                 snapshot = self._connection_snapshot

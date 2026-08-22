@@ -337,6 +337,52 @@ def test_disconnect_propagates_direct_close_control_after_detach(mocker) -> None
     assert backend.is_connected() is False
 
 
+def test_disconnect_reentry_from_storage_call_is_rejected_without_deadlock(
+    mocker,
+) -> None:
+    backend = _backend()
+    resource, table = _resource(mocker)
+    _patch_resource(mocker, return_value=resource)
+    backend.connect()
+    table.put_item.side_effect = backend.disconnect
+
+    with pytest.raises(StorageError):
+        backend.store("key", b"value")
+
+    assert backend.is_connected() is True
+    resource.meta.client.close.assert_not_called()
+    backend.disconnect()
+    resource.meta.client.close.assert_called_once_with()
+
+
+def test_connect_reentry_from_candidate_table_probe_closes_candidate(
+    mocker,
+) -> None:
+    backend = _backend()
+    resource, table = _resource(mocker)
+    nested_errors: list[BackendConnectionError] = []
+
+    def probe() -> None:
+        try:
+            backend.connect()
+        except BackendConnectionError as error:
+            nested_errors.append(error)
+        raise RuntimeError("table probe aborted")
+
+    _patch_resource(mocker, return_value=resource)
+    table.load.side_effect = probe
+
+    with pytest.raises(BackendConnectionError) as exc_info:
+        backend.connect()
+
+    assert str(exc_info.value) == "Failed to connect to DynamoDB."
+    assert len(nested_errors) == 1
+    assert str(nested_errors[0]) == "Failed to connect to DynamoDB."
+    assert nested_errors[0].__cause__ is None
+    assert backend.is_connected() is False
+    resource.meta.client.close.assert_called_once_with()
+
+
 def test_concurrent_connect_is_single_flight_and_live_connect_is_idempotent(
     mocker,
 ) -> None:
